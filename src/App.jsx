@@ -4,6 +4,7 @@ import DriverDashboard from './pages/DriverDashboard';
 import DispatcherDashboard from './pages/DispatcherDashboard';
 import PublicTracking from './pages/PublicTracking';
 import AdminDashboard from './pages/AdminDashboard';
+import SystemTestPage from './pages/SystemTestPage';
 
 function getStoredUser() {
   try {
@@ -53,7 +54,7 @@ export default function App() {
       <Routes>
         <Route path="/" element={<PublicTracking />} />
         <Route path="/tracking" element={<PublicTracking />} />
-        
+        <Route path="/test-api" element={<SystemTestPage />} />
         <Route path="/login" element={<Login />} />
 
         <Route path="/dashboard" element={<RoleLanding />} />
