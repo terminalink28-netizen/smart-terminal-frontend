@@ -7,7 +7,7 @@ import apiClient from '../api/axios';
 const EMPTY_DATA = {
   stats: { activeTrips: 0, totalTrips: 0, totalVans: 0, totalUsers: 0 },
   staff: [],
-  fleet: [],
+  vans: [],
 };
 
 const EMPTY_STAFF_FORM = { name: '', email: '', role: '', driverId: '', password: '' };
@@ -47,6 +47,29 @@ function toCsvField(value) {
   return str;
 }
 
+// Turns an Axios error into an accurate, human-readable message instead of a
+// generic "something went wrong":
+//  • err.response        → the server responded with a rejection (validation,
+//                           conflict, etc.) — surface its message.
+//  • err.request (no res) → the request went out but nothing came back
+//                           (offline, DNS failure, server down).
+//  • neither              → the request never even left the browser
+//                           (bad config, JS error building it).
+// Every case is also logged so failures are visible in the console, not just
+// swallowed into a toast.
+function describeApiError(err, fallback) {
+  if (err?.code === 'ECONNABORTED') {
+    return 'The request timed out. Please check your connection and try again.';
+  }
+  if (err?.response) {
+    return err.response.data?.error ?? err.response.data?.message ?? fallback;
+  }
+  if (err?.request) {
+    return 'Network error — could not reach the server. Please check your connection and try again.';
+  }
+  return err?.message ?? fallback;
+}
+
 // ─── AdminDashboard ───────────────────────────────────────────────────────────
 
 export default function AdminDashboard() {
@@ -55,6 +78,7 @@ export default function AdminDashboard() {
   const [loading, setLoading]       = useState(true);
   const [fetchError, setFetchError] = useState('');
   const [reloadToken, setReloadToken] = useState(0);
+  const [loggingOut, setLoggingOut] = useState(false);
 
   // ── staff mutation state ──
   const [staffModal, setStaffModal] = useState(null); // { mode: 'add'|'edit', user? }
@@ -116,7 +140,13 @@ export default function AdminDashboard() {
         setData({
           stats: { ...EMPTY_DATA.stats, ...(raw?.stats ?? {}) },
           staff: Array.isArray(raw?.staff) ? raw.staff : [],
-          fleet: Array.isArray(raw?.fleet) ? raw.fleet : [],
+          // Accept `vans` from the API, falling back to the legacy `fleet`
+          // key so this keeps working against an older backend.
+          vans: Array.isArray(raw?.vans)
+            ? raw.vans
+            : Array.isArray(raw?.fleet)
+              ? raw.fleet
+              : [],
         });
       } catch (err) {
         if (err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') return;
@@ -124,7 +154,8 @@ export default function AdminDashboard() {
           navigate('/login', { replace: true });
           return;
         }
-        setFetchError('Failed to load admin data. Please try again.');
+        console.error('Failed to load admin dashboard data:', err);
+        setFetchError(describeApiError(err, 'Failed to load admin data. Please try again.'));
       } finally {
         setLoading(false);
       }
@@ -239,10 +270,25 @@ export default function AdminDashboard() {
   // NOTE: window.location.replace is intentional here — it forces a hard reload
   // on logout, which clears all in-memory state (socket refs, cached responses,
   // etc.). React Router's navigate() would preserve those.
+  //
+  // Logout always completes locally even if the server call fails (expired
+  // session, network blip, etc.) — the error is caught and logged instead of
+  // being left as an unhandled promise rejection. Cached data (the audit
+  // trail history persisted to localStorage) is cleared on the way out so a
+  // different admin logging in on this device never sees the previous
+  // admin's cached data.
   const handleLogout = useCallback(async () => {
+    setLoggingOut(true);
     try {
       await apiClient.post('/auth/logout');
+    } catch (err) {
+      console.error('Logout request failed, logging out locally anyway:', err);
     } finally {
+      try {
+        localStorage.removeItem(AUDIT_STORAGE_KEY);
+      } catch (err) {
+        console.error('Could not clear local cache on logout:', err);
+      }
       window.location.replace('/login');
     }
   }, []); // no navigate dep — not used
@@ -330,16 +376,19 @@ export default function AdminDashboard() {
         setStaffModal(null);
         setReloadToken((n) => n + 1);
       } catch (err) {
+        if (err?.response?.status === 401 || err?.response?.status === 403) {
+          navigate('/login', { replace: true });
+          return;
+        }
+        console.error('Failed to save staff account:', err);
         setMutationError(
-          err?.response?.data?.error ??
-          err?.response?.data?.message ??
-          'Failed to save this account. Please check the details and try again.',
+          describeApiError(err, 'Failed to save this account. Please check the details and try again.'),
         );
       } finally {
         setMutationLoading(false);
       }
     },
-    [staffModal, showToast],
+    [staffModal, showToast, navigate],
   );
 
   // ── Add / edit van ──
@@ -354,21 +403,24 @@ export default function AdminDashboard() {
           showToast('success', `${formData.plateNumber} has been updated.`);
         } else {
           await apiClient.post('/admin/vans', formData);
-          showToast('success', `${formData.plateNumber} has been added to the fleet.`);
+          showToast('success', `${formData.plateNumber} has been added to the vans list.`);
         }
         setVanModal(null);
         setReloadToken((n) => n + 1);
       } catch (err) {
+        if (err?.response?.status === 401 || err?.response?.status === 403) {
+          navigate('/login', { replace: true });
+          return;
+        }
+        console.error('Failed to save van:', err);
         setVanMutationError(
-          err?.response?.data?.error ??
-          err?.response?.data?.message ??
-          'Failed to save this van. Please check the details and try again.',
+          describeApiError(err, 'Failed to save this van. Please check the details and try again.'),
         );
       } finally {
         setVanMutationLoading(false);
       }
     },
-    [vanModal, showToast],
+    [vanModal, showToast, navigate],
   );
 
   // ── Delete (confirmed) — dispatches to the right endpoint by kind ──
@@ -382,25 +434,37 @@ export default function AdminDashboard() {
       await apiClient.delete(
         isVan ? `/admin/vans/${pendingDelete.id}` : `/admin/users/${pendingDelete.id}`,
       );
+      // Clear the deleted record out of the local cache right away instead
+      // of leaving it on screen until the background refetch below lands.
+      setData((prev) =>
+        isVan
+          ? { ...prev, vans: prev.vans.filter((v) => v.id !== pendingDelete.id) }
+          : { ...prev, staff: prev.staff.filter((u) => u.id !== pendingDelete.id) },
+      );
       showToast(
         'success',
         isVan
-          ? `${pendingDelete.label} has been removed from the fleet.`
+          ? `${pendingDelete.label} has been removed from the vans list.`
           : `${pendingDelete.label}'s account has been permanently removed.`,
       );
       setPendingDelete(null);
-      setReloadToken((n) => n + 1);
+      setReloadToken((n) => n + 1); // reconcile with server truth in the background
     } catch (err) {
+      if (err?.response?.status === 401 || err?.response?.status === 403) {
+        navigate('/login', { replace: true });
+        return;
+      }
       // Keep modal open and display the server's rejection reason
-      const message =
-        err?.response?.data?.error ??
-        err?.response?.data?.message ??
-        `Could not delete ${isVan ? 'this van' : 'this account'}. The server rejected the request.`;
+      console.error(`Failed to delete ${isVan ? 'van' : 'user'}:`, err);
+      const message = describeApiError(
+        err,
+        `Could not delete ${isVan ? 'this van' : 'this account'}. The server rejected the request.`,
+      );
       isVan ? setVanMutationError(message) : setMutationError(message);
     } finally {
       isVan ? setVanMutationLoading(false) : setMutationLoading(false);
     }
-  }, [pendingDelete, showToast]);
+  }, [pendingDelete, showToast, navigate]);
 
   // ── Toggle staff active/disabled ──
 
@@ -423,16 +487,20 @@ export default function AdminDashboard() {
           `${user.name ?? 'User'} has been ${next ? 'activated' : 'deactivated'}.`,
         );
       } catch (err) {
+        if (err?.response?.status === 401 || err?.response?.status === 403) {
+          navigate('/login', { replace: true });
+          return;
+        }
+        console.error('Failed to toggle user active status:', err);
         showToast(
           'error',
-          err?.response?.data?.error ??
-            `Could not update ${user.name ?? 'this user'}'s status. Please try again.`,
+          describeApiError(err, `Could not update ${user.name ?? 'this user'}'s status. Please try again.`),
         );
       } finally {
         setTogglingId(null);
       }
     },
-    [togglingId, showToast],
+    [togglingId, showToast, navigate],
   );
 
   // ── Audit trail: derived/filtered view ──────────────────────────────────────
@@ -582,10 +650,12 @@ export default function AdminDashboard() {
           </button>
           <button
             onClick={handleLogout}
+            disabled={loggingOut}
             className="bg-red-50 text-red-600 font-bold px-4 py-2 rounded-lg border
-              border-red-200 hover:bg-red-100 transition text-sm"
+              border-red-200 hover:bg-red-100 transition text-sm disabled:opacity-50
+              disabled:cursor-not-allowed"
           >
-            Secure Logout
+            {loggingOut ? 'Logging out…' : 'Secure Logout'}
           </button>
         </div>
       </div>
@@ -596,16 +666,16 @@ export default function AdminDashboard() {
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
           <StatCard title="Active Trips"       value={data.stats.activeTrips} color="text-green-600" />
           <StatCard title="Total Trips Logged" value={data.stats.totalTrips}  color="text-blue-600" />
-          <StatCard title="Total Fleet Size"   value={data.stats.totalVans}   color="text-purple-600" />
+          <StatCard title="Total Vans"   value={data.stats.totalVans}   color="text-purple-600" />
           <StatCard title="Total Staff"        value={data.stats.totalUsers}  color="text-orange-600" />
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
 
-          {/* ── Fleet Table ── */}
+          {/* ── Vans Table ── */}
           <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-200">
             <div className="flex justify-between items-center mb-4 border-b pb-2">
-              <h2 className="text-lg font-bold text-gray-800">Registered Fleet</h2>
+              <h2 className="text-lg font-bold text-gray-800">Registered Vans</h2>
               <button
                 onClick={openAddVanModal}
                 className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold
@@ -625,10 +695,10 @@ export default function AdminDashboard() {
                   </tr>
                 </thead>
                 <tbody>
-                  {data.fleet.length === 0 ? (
-                    <EmptyTableRow colSpan={4} message="No fleet records found." />
+                  {data.vans.length === 0 ? (
+                    <EmptyTableRow colSpan={4} message="No van records found." />
                   ) : (
-                    data.fleet.map((van) => (
+                    data.vans.map((van) => (
                       <tr key={van.id} className="border-b hover:bg-gray-50">
                         <td className="p-3 font-bold text-gray-800">{van.plateNumber ?? '—'}</td>
                         <td className="p-3 text-gray-600">{van.capacity ?? 0} pax</td>
@@ -647,7 +717,7 @@ export default function AdminDashboard() {
                             </button>
                             <button
                               onClick={() => openDeleteVanModal(van)}
-                              title="Remove this van from the fleet"
+                              title="Remove this van from the vans list"
                               className="text-xs font-semibold px-2 py-1 rounded border
                                 border-red-300 text-red-600 bg-red-50 hover:bg-red-100 transition"
                             >
@@ -1159,7 +1229,7 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
         {/* Header */}
         <div className="flex justify-between items-center p-5 border-b">
           <h2 id="van-modal-title" className="text-lg font-bold text-gray-900">
-            {isEdit ? 'Edit Van' : 'Add Van to Fleet'}
+            {isEdit ? 'Edit Van' : 'Add New Van'}
           </h2>
           <button
             onClick={onClose}
@@ -1231,7 +1301,7 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
   );
 }
 
-// ─── ConfirmDeleteModal (shared by staff + fleet) ─────────────────────────────
+// ─── ConfirmDeleteModal (shared by staff + vans) ──────────────────────────────
 //
 // Security notes:
 //  • Modal stays open on server error so the admin sees the rejection reason
