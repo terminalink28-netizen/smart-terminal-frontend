@@ -11,7 +11,8 @@ const EMPTY_DATA = {
 };
 
 const EMPTY_STAFF_FORM = { name: '', email: '', role: '', driverId: '', password: '' };
-const EMPTY_VAN_FORM   = { plateNumber: '', capacity: '', status: 'IDLE' };
+// Added driver fields for combined registration
+const EMPTY_VAN_FORM   = { plateNumber: '', capacity: '', status: 'IDLE', driverName: '', driverPin: '' };
 
 const VAN_STATUSES = ['IDLE', 'DISPATCHED', 'MAINTENANCE', 'OUT_OF_SERVICE'];
 
@@ -43,7 +44,6 @@ function describeApiError(err, fallback) {
     return 'The request timed out. Please check your connection and try again.';
   }
   if (err?.response) {
-    // If backend uses express-validator or sends an array of errors, format it cleanly
     if (Array.isArray(err.response.data?.errors)) {
       return err.response.data.errors.map(e => e.msg || e.message).join(', ');
     }
@@ -55,10 +55,9 @@ function describeApiError(err, fallback) {
   return err?.message ?? fallback;
 }
 
-// Global Auth Failure handler to prevent the invisible redirect loop
 const handleAuthFailure = (err) => {
   if (err?.response?.status === 401 || err?.response?.status === 403) {
-    localStorage.removeItem('user'); // CRUCIAL: Remove the user so /login doesn't bounce them back
+    localStorage.removeItem('user'); 
     window.location.replace('/login');
     return true;
   }
@@ -115,7 +114,6 @@ export default function AdminDashboard() {
       const { data: raw } = await apiClient.get('/admin/dashboard', { signal });
       setData({
         stats: { ...EMPTY_DATA.stats, ...(raw?.stats ?? {}) },
-        // Added fallback to raw.users in case your backend uses a different key
         staff: Array.isArray(raw?.staff) ? raw.staff : Array.isArray(raw?.users) ? raw.users : [],
         vans: Array.isArray(raw?.vans) ? raw.vans : Array.isArray(raw?.fleet) ? raw.fleet : [],
       });
@@ -196,7 +194,6 @@ export default function AdminDashboard() {
     fetchAuditLogs();
   }, [fetchAuditLogs]);
 
-  // FIX: Added localStorage.removeItem('user') so the logout actually completes.
   const handleLogout = useCallback(async () => {
     setLoggingOut(true);
     try {
@@ -204,7 +201,7 @@ export default function AdminDashboard() {
     } catch (err) {
       console.error('Logout request failed, logging out locally anyway:', err);
     } finally {
-      localStorage.removeItem('user'); // THIS WAS MISSING
+      localStorage.removeItem('user'); 
       try { localStorage.removeItem(AUDIT_STORAGE_KEY); } catch (err) { console.error(err); }
       window.location.replace('/login');
     }
@@ -247,7 +244,7 @@ export default function AdminDashboard() {
       setStaffModal(null);
       setReloadToken((n) => n + 1);
     } catch (err) {
-      if (handleAuthFailure(err)) return; // FIX: Break infinite loop
+      if (handleAuthFailure(err)) return; 
       console.error('Failed to save staff account:', err);
       setMutationError(describeApiError(err, 'Failed to save this account. Please check the details and try again.'));
     } finally {
@@ -264,12 +261,12 @@ export default function AdminDashboard() {
         showToast('success', `${formData.plateNumber} has been updated.`);
       } else {
         await apiClient.post('/admin/vans', formData);
-        showToast('success', `${formData.plateNumber} has been added to the vans list.`);
+        showToast('success', `${formData.plateNumber} and driver have been successfully registered.`);
       }
       setVanModal(null);
       setReloadToken((n) => n + 1);
     } catch (err) {
-      if (handleAuthFailure(err)) return; // FIX: Break infinite loop
+      if (handleAuthFailure(err)) return; 
       console.error('Failed to save van:', err);
       setVanMutationError(describeApiError(err, 'Failed to save this van. Please check the details and try again.'));
     } finally {
@@ -289,7 +286,7 @@ export default function AdminDashboard() {
       setPendingDelete(null);
       setReloadToken((n) => n + 1); 
     } catch (err) {
-      if (handleAuthFailure(err)) return; // FIX: Break infinite loop
+      if (handleAuthFailure(err)) return; 
       console.error(`Failed to delete ${isVan ? 'van' : 'user'}:`, err);
       const message = describeApiError(err, `Could not delete ${isVan ? 'this van' : 'this account'}. The server rejected the request.`);
       isVan ? setVanMutationError(message) : setMutationError(message);
@@ -307,7 +304,7 @@ export default function AdminDashboard() {
       setData((prev) => ({ ...prev, staff: prev.staff.map((u) => u.id === user.id ? { ...u, isActive: next } : u) }));
       showToast('success', `${user.name ?? 'User'} has been ${next ? 'activated' : 'deactivated'}.`);
     } catch (err) {
-      if (handleAuthFailure(err)) return; // FIX: Break infinite loop
+      if (handleAuthFailure(err)) return; 
       console.error('Failed to toggle user active status:', err);
       showToast('error', describeApiError(err, `Could not update ${user.name ?? 'this user'}'s status. Please try again.`));
     } finally {
@@ -418,7 +415,7 @@ export default function AdminDashboard() {
           <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-200">
             <div className="flex justify-between items-center mb-4 border-b pb-2">
               <h2 className="text-lg font-bold text-gray-800">Registered Vans</h2>
-              <button onClick={openAddVanModal} className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-1.5 rounded-lg transition shadow-sm">＋ Add Van</button>
+              <button onClick={openAddVanModal} className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-1.5 rounded-lg transition shadow-sm">＋ Add Fleet Unit</button>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full text-sm text-left">
@@ -504,7 +501,7 @@ export default function AdminDashboard() {
   );
 }
 
-// ─── StaffFormModal ───────────────────────────────────────────────────────────
+// ─── StaffFormModal (Admins & Dispatchers ONLY) ───────────────────────────────
 
 function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onClearError }) {
   const isOpen   = state != null;
@@ -547,7 +544,6 @@ function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onCl
     const e   = {};
     const nm  = form.name.trim();
     const em  = form.email.trim();
-    const did = form.driverId.trim();
 
     if (!nm) e.name = 'Full name is required.';
     else if (nm.length > 100) e.name = 'Name must be 100 characters or fewer.';
@@ -559,15 +555,9 @@ function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onCl
       else if (!EMAIL_RE.test(em)) e.email = 'Enter a valid email address.';
     }
 
-    if (form.role === 'DRIVER') {
-      if (!did) e.driverId = 'Driver ID is required.';
-      else if (!DRIVER_ID_RE.test(did)) e.driverId = 'Must follow the format DRV-001.';
-    }
-
     if (!isEdit) {
-      const minLen = form.role === 'DRIVER' ? 4 : 8;
       if (!form.password) e.password = 'This field is required.';
-      else if (form.password.length < minLen) e.password = `${form.role === 'DRIVER' ? 'PIN' : 'Password'} must be at least ${minLen} characters.`;
+      else if (form.password.length < 8) e.password = 'Password must be at least 8 characters.';
     }
 
     return e;
@@ -582,7 +572,6 @@ function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onCl
       role: form.role,
       ...(!isEdit && { password: form.password }),
       ...(form.role !== 'DRIVER' && { email: form.email.trim() }),
-      ...(form.role === 'DRIVER' && { driverId: form.driverId.trim().toUpperCase() }),
     });
   };
 
@@ -592,7 +581,7 @@ function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onCl
     <div role="dialog" aria-modal="true" aria-labelledby="staff-modal-title" className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" onClick={(e) => { if (e.target === e.currentTarget && !isLoading) onClose(); }}>
       <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md">
         <div className="flex justify-between items-center p-5 border-b">
-          <h2 id="staff-modal-title" className="text-lg font-bold text-gray-900">{isEdit ? 'Edit Account' : 'Create New Account'}</h2>
+          <h2 id="staff-modal-title" className="text-lg font-bold text-gray-900">{isEdit ? 'Edit Account' : 'Create Staff Account'}</h2>
           <button onClick={onClose} disabled={isLoading} className="text-gray-400 hover:text-gray-600 disabled:opacity-40 text-xl leading-none">✕</button>
         </div>
         {serverError && <div className="mx-5 mt-4 p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg text-sm">⚠️ {serverError}</div>}
@@ -600,31 +589,29 @@ function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onCl
           <Field label="Full Name" required error={errors.name}>
             <input ref={nameRef} name="name" type="text" value={form.name} onChange={change} placeholder="e.g. Juan dela Cruz" autoComplete="name" maxLength={100} className={inputCls(errors.name)} />
           </Field>
+          
           <Field label="Role" required error={errors.role}>
             <select name="role" value={form.role} onChange={change} disabled={isEdit} className={`${inputCls(errors.role)} bg-white disabled:opacity-60 disabled:cursor-not-allowed`}>
               <option value="">— Select a role —</option>
               <option value="ADMIN">Admin</option>
               <option value="DISPATCHER">Dispatcher</option>
-              <option value="DRIVER">Driver</option>
+              {isEdit && form.role === 'DRIVER' && <option value="DRIVER">Driver</option>}
             </select>
-            {isEdit && <p className="text-xs text-gray-400 mt-1">Role can't be changed here. Delete and re-create the account to change roles.</p>}
+            {!isEdit && <p className="text-xs text-blue-600 mt-1.5 font-medium">To register a new Driver, please use the "Add Fleet Unit" button instead.</p>}
           </Field>
+          
           {form.role && form.role !== 'DRIVER' && (
             <Field label="Email Address" required error={errors.email}>
               <input name="email" type="email" value={form.email} onChange={change} placeholder="staff@terminal.gov.ph" autoComplete="email" className={inputCls(errors.email)} />
             </Field>
           )}
-          {form.role === 'DRIVER' && (
-            <Field label="Driver ID" required error={errors.driverId} hint="Format: DRV-001, DRV-012, etc.">
-              <input name="driverId" type="text" value={form.driverId} onChange={change} placeholder="DRV-001" autoComplete="off" maxLength={20} className={`${inputCls(errors.driverId)} uppercase`} />
-            </Field>
-          )}
+
           {!isEdit && form.role && (
-            <Field label={form.role === 'DRIVER' ? 'PIN' : 'Password'} required error={errors.password} hint={form.role === 'DRIVER' ? 'Min. 4 characters.' : 'Min. 8 characters.'}>
-              <input name="password" type="password" value={form.password} onChange={change} placeholder={form.role === 'DRIVER' ? 'Min. 4 characters' : 'Min. 8 characters'} autoComplete="new-password" className={inputCls(errors.password)} />
+            <Field label="Password" required error={errors.password} hint="Min. 8 characters.">
+              <input name="password" type="password" value={form.password} onChange={change} placeholder="Min. 8 characters" autoComplete="new-password" className={inputCls(errors.password)} />
             </Field>
           )}
-          {isEdit && <p className="text-xs text-gray-400">To reset this user's password or PIN, use the dedicated reset flow — it isn't changed here.</p>}
+          {isEdit && <p className="text-xs text-gray-400">To reset this user's password, use the dedicated reset flow — it isn't changed here.</p>}
         </div>
         <div className="flex gap-3 p-5 border-t bg-gray-50 rounded-b-2xl">
           <button onClick={onClose} disabled={isLoading} className="flex-1 py-2 border border-gray-300 rounded-lg text-sm font-semibold text-gray-700 hover:bg-gray-100 transition disabled:opacity-40">Cancel</button>
@@ -637,7 +624,7 @@ function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onCl
   );
 }
 
-// ─── VanFormModal ─────────────────────────────────────────────────────────────
+// ─── VanFormModal (Combined Van + Driver) ─────────────────────────────────────
 
 function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClearError }) {
   const isOpen   = state != null;
@@ -650,7 +637,7 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
 
   useEffect(() => {
     if (isOpen) {
-      setForm(isEdit && original ? { plateNumber: original.plateNumber ?? '', capacity: String(original.capacity ?? ''), status: original.status ?? 'IDLE' } : EMPTY_VAN_FORM);
+      setForm(isEdit && original ? { plateNumber: original.plateNumber ?? '', capacity: String(original.capacity ?? ''), status: original.status ?? 'IDLE', driverName: '', driverPin: '' } : EMPTY_VAN_FORM);
       setErrors({});
       onClearError();
       const id = setTimeout(() => plateRef.current?.focus(), 60);
@@ -685,42 +672,88 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
 
     if (!form.status) e.status = 'Status is required.';
 
+    if (!isEdit) {
+      if (!form.driverName.trim()) e.driverName = 'Driver name is required.';
+      if (!form.driverPin) e.driverPin = 'PIN is required.';
+      else if (form.driverPin.length < 4) e.driverPin = 'PIN must be at least 4 characters.';
+    }
+
     return e;
   };
 
   const submit = () => {
     const e = validate();
     if (Object.keys(e).length > 0) { setErrors(e); return; }
-    onSubmit({ plateNumber: form.plateNumber.trim().toUpperCase(), capacity: Number(form.capacity), status: form.status });
+    
+    const payload = { 
+      plateNumber: form.plateNumber.trim().toUpperCase(), 
+      capacity: Number(form.capacity), 
+      status: form.status 
+    };
+
+    if (!isEdit) {
+      payload.driverName = form.driverName.trim();
+      payload.driverPin = form.driverPin;
+    }
+
+    onSubmit(payload);
   };
 
   if (!isOpen) return null;
 
   return (
     <div role="dialog" aria-modal="true" aria-labelledby="van-modal-title" className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" onClick={(e) => { if (e.target === e.currentTarget && !isLoading) onClose(); }}>
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm">
-        <div className="flex justify-between items-center p-5 border-b">
-          <h2 id="van-modal-title" className="text-lg font-bold text-gray-900">{isEdit ? 'Edit Van' : 'Add New Van'}</h2>
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden">
+        <div className="flex justify-between items-center p-5 border-b bg-slate-50">
+          <h2 id="van-modal-title" className="text-lg font-black text-gray-900">{isEdit ? 'Edit Fleet Unit' : 'Register New Fleet Unit'}</h2>
           <button onClick={onClose} disabled={isLoading} className="text-gray-400 hover:text-gray-600 disabled:opacity-40 text-xl leading-none">✕</button>
         </div>
-        {serverError && <div className="mx-5 mt-4 p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg text-sm">⚠️ {serverError}</div>}
-        <div className="p-5 space-y-4">
-          <Field label="Plate Number" required error={errors.plateNumber}>
-            <input ref={plateRef} name="plateNumber" type="text" value={form.plateNumber} onChange={change} placeholder="e.g. ABC-1234" autoComplete="off" maxLength={15} className={`${inputCls(errors.plateNumber)} uppercase`} />
-          </Field>
-          <Field label="Capacity" required error={errors.capacity} hint="Passenger seats, 1–30.">
-            <input name="capacity" type="number" min={1} max={30} value={form.capacity} onChange={change} placeholder="e.g. 12" className={inputCls(errors.capacity)} />
-          </Field>
-          <Field label="Status" required error={errors.status}>
-            <select name="status" value={form.status} onChange={change} className={`${inputCls(errors.status)} bg-white`}>
-              {VAN_STATUSES.map((s) => <option key={s} value={s}>{s.replace('_', ' ')}</option>)}
-            </select>
-          </Field>
+        
+        {serverError && <div className="mx-5 mt-4 p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg text-sm font-medium">⚠️ {serverError}</div>}
+        
+        <div className="p-5 max-h-[70vh] overflow-y-auto space-y-6">
+          {/* VAN DETAILS */}
+          <div>
+            <h3 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-3 border-b pb-1">Van Information</h3>
+            <div className="space-y-4">
+              <Field label="Plate Number" required error={errors.plateNumber}>
+                <input ref={plateRef} name="plateNumber" type="text" value={form.plateNumber} onChange={change} placeholder="e.g. ABC-1234" autoComplete="off" maxLength={15} disabled={isEdit} className={`${inputCls(errors.plateNumber)} uppercase disabled:bg-gray-100 disabled:text-gray-500`} />
+              </Field>
+              
+              <div className="grid grid-cols-2 gap-4">
+                <Field label="Capacity" required error={errors.capacity} hint="Passenger seats (1-30).">
+                  <input name="capacity" type="number" min={1} max={30} value={form.capacity} onChange={change} placeholder="e.g. 14" className={inputCls(errors.capacity)} />
+                </Field>
+                <Field label="Status" required error={errors.status}>
+                  <select name="status" value={form.status} onChange={change} className={`${inputCls(errors.status)} bg-white`}>
+                    {VAN_STATUSES.map((s) => <option key={s} value={s}>{s.replace('_', ' ')}</option>)}
+                  </select>
+                </Field>
+              </div>
+            </div>
+          </div>
+
+          {/* DRIVER DETAILS (Only during creation) */}
+          {!isEdit && (
+            <div>
+              <h3 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-3 border-b pb-1">Assigned Driver</h3>
+              <p className="text-xs text-blue-600 mb-3 font-medium">A new driver account will be generated. They will log in using the Van Plate Number and the PIN below.</p>
+              <div className="space-y-4">
+                <Field label="Driver Full Name" required error={errors.driverName}>
+                  <input name="driverName" type="text" value={form.driverName} onChange={change} placeholder="e.g. Juan dela Cruz" className={inputCls(errors.driverName)} />
+                </Field>
+                <Field label="4-Digit PIN" required error={errors.driverPin} hint="Used for Driver login. Min. 4 characters.">
+                  <input name="driverPin" type="password" value={form.driverPin} onChange={change} placeholder="e.g. 1234" maxLength={8} className={inputCls(errors.driverPin)} />
+                </Field>
+              </div>
+            </div>
+          )}
         </div>
+        
         <div className="flex gap-3 p-5 border-t bg-gray-50 rounded-b-2xl">
           <button onClick={onClose} disabled={isLoading} className="flex-1 py-2 border border-gray-300 rounded-lg text-sm font-semibold text-gray-700 hover:bg-gray-100 transition disabled:opacity-40">Cancel</button>
-          <button onClick={submit} disabled={isLoading} className="flex-1 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-bold transition disabled:opacity-70 disabled:cursor-not-allowed">
-            {isLoading ? (isEdit ? 'Saving…' : 'Adding…') : (isEdit ? 'Save Changes' : 'Add Van')}
+          <button onClick={submit} disabled={isLoading} className="flex-[2] py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-sm font-bold transition disabled:opacity-70 disabled:cursor-not-allowed">
+            {isLoading ? (isEdit ? 'Saving…' : 'Registering…') : (isEdit ? 'Save Changes' : 'Register Van & Driver')}
           </button>
         </div>
       </div>
