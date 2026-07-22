@@ -16,7 +16,7 @@ function normalizeUser(user) {
 }
 
 export default function Login() {
-  const [email, setEmail] = useState('');
+  const [identifier, setIdentifier] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
@@ -48,8 +48,8 @@ export default function Login() {
     e.preventDefault();
     setError('');
 
-    if (!email.trim()) {
-      setError('Email address is required.');
+    if (!identifier.trim()) {
+      setError('Email or Login ID is required.');
       return;
     }
 
@@ -62,7 +62,7 @@ export default function Login() {
 
     try {
       const response = await apiClient.post('/auth/login', {
-        identifier: email.trim(),
+        identifier: identifier.trim(),
         secret: password,
       });
 
@@ -119,15 +119,15 @@ export default function Login() {
         <form onSubmit={handleLogin} className="space-y-5">
           <div>
             <label className="block text-sm font-semibold text-slate-700 mb-2">
-              Email Address
+              Email or Login ID
             </label>
 
             <input
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              autoComplete="email"
-              placeholder="Enter email address"
+              type="text"
+              value={identifier}
+              onChange={(e) => setIdentifier(e.target.value)}
+              autoComplete="username"
+              placeholder="Email address or plate number"
               className="w-full border border-slate-300 rounded-lg px-4 py-3 focus:outline-none focus:ring-2 focus:ring-blue-500"
               disabled={loading}
               required
