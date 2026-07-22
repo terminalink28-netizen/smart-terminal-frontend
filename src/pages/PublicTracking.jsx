@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { MapContainer, TileLayer, Marker, Popup, Polyline, useMap } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Popup, Circle, Polyline, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import apiClient from "../api/axios";
 import { socket } from "../api/socket";
@@ -15,6 +15,13 @@ const BOARDING_STATUSES = ['BOARDING'];
 const DRIVING_STATUSES = ['DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'];
 const MAP_VISIBLE_STATUSES = [...BOARDING_STATUSES, ...DRIVING_STATUSES];
 
+// Speed display tuning — mirrors what consumer trackers like Life360 do:
+// smooth the raw reading so it doesn't flicker, and treat anything under a
+// small noise floor as "stopped" rather than a jittery 1-2 km/h.
+const SPEED_SMOOTHING_ALPHA = 0.4;   // weight given to each new reading
+const STOPPED_THRESHOLD_KMH = 2;
+const LOW_ACCURACY_THRESHOLD_M = 75; // beyond this, flag the fix as imprecise
+
 const STATUS_CONFIG = {
   BOARDING: { label: 'Boarding', cls: 'bg-green-100 text-green-800 border-green-200' },
   DEPARTING: { label: 'Departing', cls: 'bg-amber-100 text-amber-800 border-amber-200' },
@@ -24,7 +31,8 @@ const STATUS_CONFIG = {
 };
 
 function msToKmh(mps) {
-  return Math.round((mps ?? 0) * 3.6);
+  if (typeof mps !== 'number' || Number.isNaN(mps)) return null;
+  return Math.round(mps * 3.6);
 }
 
 function relativeTime(ts) {
@@ -61,6 +69,19 @@ function formatDuration(seconds) {
   const hours = Math.floor(mins / 60);
   const rem = mins % 60;
   return rem > 0 ? `${hours}h ${rem}m` : `${hours}h`;
+}
+
+/**
+ * Renders a "Life360-style" speed label from a smoothed m/s value:
+ *  - null            → "Speed unavailable" (we genuinely don't know)
+ *  - < noise floor    → "Stopped"
+ *  - otherwise        → "NN km/h"
+ */
+function speedLabel(smoothedSpeedMps) {
+  const kmh = msToKmh(smoothedSpeedMps);
+  if (kmh === null) return 'Speed unavailable';
+  if (kmh < STOPPED_THRESHOLD_KMH) return 'Stopped';
+  return `${kmh} km/h`;
 }
 
 const vanIcon = L.divIcon({
@@ -231,11 +252,30 @@ export default function PublicTracking() {
     const onConnect = () => setSocketStatus('connected');
     const onDisconnect = () => setSocketStatus('disconnected');
 
+    // Initial snapshot from the server's in-memory store. Each entry already
+    // carries { lat, lng, speed, accuracy, positionTrusted, timestamp, ... }
+    // from the backend — seed smoothedSpeed from the raw speed so the first
+    // paint isn't blank, and normalize timestamp into a plain ms number.
     const onInitialLocations = (payload = []) => {
       if (!Array.isArray(payload)) return;
 
       try {
-        setLiveData(Object.fromEntries(payload));
+        const seeded = payload.map(([tripId, data]) => {
+          const lastSeenMs = data?.timestamp ? new Date(data.timestamp).getTime() : Date.now();
+          const rawSpeed = typeof data?.speed === 'number' ? data.speed : null;
+          return [
+            tripId,
+            {
+              ...data,
+              speed: rawSpeed,
+              smoothedSpeed: rawSpeed,
+              accuracy: typeof data?.accuracy === 'number' ? data.accuracy : null,
+              positionTrusted: data?.positionTrusted !== false,
+              lastSeen: lastSeenMs,
+            },
+          ];
+        });
+        setLiveData(Object.fromEntries(seeded));
       } catch {
         // ignore malformed payloads
       }
@@ -244,16 +284,36 @@ export default function PublicTracking() {
     const onVanMoved = (data) => {
       if (!data?.tripId || typeof data.lat !== 'number' || typeof data.lng !== 'number') return;
 
-      setLiveData((prev) => ({
-        ...prev,
-        [data.tripId]: {
-          ...(prev[data.tripId] ?? {}),
-          lat: data.lat,
-          lng: data.lng,
-          speed: data.speed ?? 0,
-          lastSeen: Date.now(),
-        },
-      }));
+      setLiveData((prev) => {
+        const prevEntry = prev[data.tripId] ?? {};
+        const rawSpeed = typeof data.speed === 'number' ? data.speed : null;
+
+        // Exponential moving average so the km/h reading doesn't jitter
+        // frame-to-frame the way a raw instantaneous GPS speed does.
+        // If this fix has no speed (unknown), hold the last smoothed value
+        // rather than snapping to 0 — matches how consumer trackers avoid
+        // flashing "stopped" every time a single fix comes back speed-less.
+        const smoothedSpeed =
+          rawSpeed === null
+            ? prevEntry.smoothedSpeed ?? null
+            : prevEntry.smoothedSpeed == null
+            ? rawSpeed
+            : prevEntry.smoothedSpeed * (1 - SPEED_SMOOTHING_ALPHA) + rawSpeed * SPEED_SMOOTHING_ALPHA;
+
+        return {
+          ...prev,
+          [data.tripId]: {
+            ...prevEntry,
+            lat: data.lat,
+            lng: data.lng,
+            speed: rawSpeed,
+            smoothedSpeed,
+            accuracy: typeof data.accuracy === 'number' ? data.accuracy : null,
+            positionTrusted: data.positionTrusted !== false,
+            lastSeen: Date.now(),
+          },
+        };
+      });
     };
 
     const onSeatUpdate = (data) => {
@@ -351,16 +411,13 @@ export default function PublicTracking() {
     [activeTrips]
   );
 
-  // Updated to include boarding vans at their terminals
   const activeVanPositions = useMemo(() => {
     return mapTrips
       .map((trip) => {
         const data = liveData[trip.id];
-        // 1. Use live GPS if we have it
         if (typeof data?.lat === 'number' && typeof data?.lng === 'number') {
           return [data.lat, data.lng];
         }
-        // 2. Fallback to the terminal's coordinates if they are boarding
         if (trip.status === 'BOARDING') {
           const originName = trip.route?.origin;
           return getCoordinatesForDestination(originName) ?? 
@@ -601,7 +658,6 @@ export default function PublicTracking() {
               const hasGps = typeof data?.lat === 'number' && typeof data?.lng === 'number';
               const isSelected = selectedTripId === trip.id;
 
-              // Updated to pin boarding vans if GPS isn't live
               let position = null;
               if (hasGps) {
                 position = [data.lat, data.lng];
@@ -613,47 +669,75 @@ export default function PublicTracking() {
 
               if (!position) return null;
 
+              // Only draw an accuracy circle for real GPS fixes, not the
+              // terminal-coordinate fallback used while boarding.
+              const showAccuracyCircle =
+                hasGps && typeof data?.accuracy === 'number' && data.accuracy > 0;
+
               return (
-                <Marker
-                  key={trip.id}
-                  position={position}
-                  icon={vanIcon}
-                  eventHandlers={{
-                    click: () => setSelectedTripId(trip.id),
-                  }}
-                >
-                  <Popup minWidth={200}>
-                    <div className="space-y-1.5 py-0.5">
-                      <div className="font-bold text-gray-900 text-sm leading-snug">
-                        {trip.driver?.name || 'Assigned Driver'}
+                <div key={trip.id}>
+                  {showAccuracyCircle && (
+                    <Circle
+                      center={position}
+                      radius={data.accuracy}
+                      pathOptions={{
+                        color: data.accuracy > LOW_ACCURACY_THRESHOLD_M ? '#f59e0b' : '#16a34a',
+                        fillColor: data.accuracy > LOW_ACCURACY_THRESHOLD_M ? '#f59e0b' : '#16a34a',
+                        fillOpacity: 0.08,
+                        weight: 1,
+                      }}
+                    />
+                  )}
+                  <Marker
+                    position={position}
+                    icon={vanIcon}
+                    eventHandlers={{
+                      click: () => setSelectedTripId(trip.id),
+                    }}
+                  >
+                    <Popup minWidth={200}>
+                      <div className="space-y-1.5 py-0.5">
+                        <div className="font-bold text-gray-900 text-sm leading-snug">
+                          {trip.driver?.name || 'Assigned Driver'}
+                        </div>
+                        <div className="text-xs text-gray-500 font-semibold uppercase tracking-wide truncate">
+                          <span className="text-emerald-700">{trip.van?.plateNumber ?? '—'}</span>
+                          {trip.status === 'BOARDING'
+                            ? ' · Loading passengers'
+                            : trip.status === 'DEPARTED'
+                            ? ' · En route'
+                            : ` · ${STATUS_CONFIG[trip.status]?.label ?? trip.status}`}
+                        </div>
+                        {hasGps && (
+                          <div className="text-xs font-semibold text-gray-700">
+                            {speedLabel(data?.smoothedSpeed)}
+                            {typeof data?.accuracy === 'number' && (
+                              <span className="text-gray-400 font-normal ml-1">
+                                (±{Math.round(data.accuracy)}m)
+                              </span>
+                            )}
+                          </div>
+                        )}
+                        <div className="flex items-center justify-between gap-2">
+                          <span className={`text-xs font-bold px-2 py-0.5 rounded border ${STATUS_CONFIG[trip.status]?.cls ?? STATUS_CONFIG.DEPARTED.cls}`}>
+                            {STATUS_CONFIG[trip.status]?.label ?? trip.status}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => setSelectedTripId(trip.id)}
+                            className={`text-xs font-bold px-2 py-0.5 rounded border transition ${
+                              isSelected
+                                ? 'bg-emerald-600 text-white border-emerald-600'
+                                : 'bg-white text-emerald-700 border-emerald-200 hover:bg-emerald-50'
+                            }`}
+                          >
+                            View details
+                          </button>
+                        </div>
                       </div>
-                      <div className="text-xs text-gray-500 font-semibold uppercase tracking-wide truncate">
-                        <span className="text-emerald-700">{trip.van?.plateNumber ?? '—'}</span>
-                        {trip.status === 'BOARDING'
-                          ? ' · Loading passengers'
-                          : trip.status === 'DEPARTED'
-                          ? ' · En route'
-                          : ` · ${STATUS_CONFIG[trip.status]?.label ?? trip.status}`}
-                      </div>
-                      <div className="flex items-center justify-between gap-2">
-                        <span className={`text-xs font-bold px-2 py-0.5 rounded border ${STATUS_CONFIG[trip.status]?.cls ?? STATUS_CONFIG.DEPARTED.cls}`}>
-                          {STATUS_CONFIG[trip.status]?.label ?? trip.status}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() => setSelectedTripId(trip.id)}
-                          className={`text-xs font-bold px-2 py-0.5 rounded border transition ${
-                            isSelected
-                              ? 'bg-emerald-600 text-white border-emerald-600'
-                              : 'bg-white text-emerald-700 border-emerald-200 hover:bg-emerald-50'
-                          }`}
-                        >
-                          View details
-                        </button>
-                      </div>
-                    </div>
-                  </Popup>
-                </Marker>
+                    </Popup>
+                  </Marker>
+                </div>
               );
             })}
 
@@ -783,6 +867,7 @@ export default function PublicTracking() {
                     const data = liveData[trip.id];
                     const hasGps = typeof data?.lat === 'number' && typeof data?.lng === 'number';
                     const isStale = hasGps && data?.lastSeen && Date.now() - data.lastSeen > GPS_STALE_THRESHOLD_MS;
+                    const isLowAccuracy = hasGps && typeof data?.accuracy === 'number' && data.accuracy > LOW_ACCURACY_THRESHOLD_M;
                     const isSelected = selectedTripId === trip.id;
 
                     return (
@@ -818,7 +903,10 @@ export default function PublicTracking() {
                                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
                                 <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-blue-500" />
                               </span>
-                              {msToKmh(data?.speed) > 0 ? `${msToKmh(data.speed)} km/h` : 'Stopped'}
+                              {speedLabel(data?.smoothedSpeed)}
+                              {isLowAccuracy && (
+                                <span className="text-amber-600 font-normal">· weak GPS fix</span>
+                              )}
                             </span>
                             {data?.lastSeen && (
                               <span className="text-[10px] text-blue-400 font-normal" key={tick}>
@@ -894,11 +982,22 @@ export default function PublicTracking() {
                         ? 'Returning to Virac'
                         : 'Heading out'}
                     </p>
-                    {selectedTripLive?.lat === undefined || selectedTripLive?.lng === undefined ? null : (
-                      <p>
-                        <span className="font-semibold text-gray-900">Current speed:</span>{' '}
-                        {msToKmh(selectedTripLive.speed)} km/h
-                      </p>
+                    {typeof selectedTripLive?.lat === 'number' && typeof selectedTripLive?.lng === 'number' && (
+                      <>
+                        <p>
+                          <span className="font-semibold text-gray-900">Current speed:</span>{' '}
+                          {speedLabel(selectedTripLive.smoothedSpeed)}
+                        </p>
+                        {typeof selectedTripLive.accuracy === 'number' && (
+                          <p>
+                            <span className="font-semibold text-gray-900">GPS accuracy:</span>{' '}
+                            ±{Math.round(selectedTripLive.accuracy)}m
+                            {selectedTripLive.accuracy > LOW_ACCURACY_THRESHOLD_M && (
+                              <span className="text-amber-600 font-semibold ml-1">(weak signal)</span>
+                            )}
+                          </p>
+                        )}
+                      </>
                     )}
                     {selectedTripLive?.availableSeats !== undefined && (
                       <p>

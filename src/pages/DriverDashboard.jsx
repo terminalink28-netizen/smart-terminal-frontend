@@ -42,6 +42,12 @@ const ETA_ACTIVE_STATUSES = ['BOARDING', 'DEPARTING', 'DEPARTED', 'ARRIVING', 'D
 
 const GPS_STATE = { IDLE: 'IDLE', ACQUIRING: 'ACQUIRING', LIVE: 'LIVE', ERROR: 'ERROR' };
 
+// Speed/position trust thresholds — mirrors the backend's gating so the
+// driver sees an honest reading of what will actually be broadcast.
+const MAX_PLAUSIBLE_SPEED_MPS = 55;      // ~198 km/h ceiling
+const MIN_DT_FOR_FALLBACK_SECONDS = 2;    // don't compute speed from fixes closer than this
+const MIN_DISTANCE_FOR_FALLBACK_M = 3;    // ignore GPS jitter smaller than this
+
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
 function geolocationErrorMessage(err) {
@@ -52,6 +58,23 @@ function geolocationErrorMessage(err) {
     case 3: return 'GPS timed out acquiring a fix. Try again.';
     default: return `GPS error (code ${err.code}). Please try again.`;
   }
+}
+
+/** Great-circle distance between two lat/lng points, in meters. */
+function haversineMeters(lat1, lng1, lat2, lng2) {
+  const R = 6371000;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function msToKmh(mps) {
+  if (typeof mps !== 'number' || Number.isNaN(mps)) return null;
+  return Math.round(mps * 3.6);
 }
 
 // ─── sub-components ───────────────────────────────────────────────────────────
@@ -177,6 +200,7 @@ function GpsButton({ trip, gpsState, lastCoords, onStart, onStop }) {
   }
 
   if (gpsState === GPS_STATE.LIVE) {
+    const kmh = msToKmh(lastCoords?.speed);
     return (
       <div className="flex flex-col gap-2">
         <button onClick={onStop} aria-label="Stop sharing GPS location"
@@ -189,6 +213,12 @@ function GpsButton({ trip, gpsState, lastCoords, onStart, onStop }) {
             📡 Live · {lastCoords.lat.toFixed(5)}, {lastCoords.lng.toFixed(5)}
             {lastCoords.accuracy != null && (
               <span className="text-gray-400 ml-1">(±{Math.round(lastCoords.accuracy)}m)</span>
+            )}
+            {' · '}
+            {kmh === null ? (
+              <span className="text-gray-400">speed unavailable</span>
+            ) : (
+              <span className="font-bold">{kmh} km/h</span>
             )}
           </p>
         )}
@@ -231,19 +261,13 @@ function ETACountdown({ eta }) {
 }
 
 // ─── ETAPanel ─────────────────────────────────────────────────────────────────
-//
-// Shows for any en-route status (BOARDING → ARRIVING).
-// "I've Departed" button advances the trip to DEPARTING on the backend AND
-// starts the local ETA countdown — both must happen together.
 
 function ETAPanel({ trip, routeMinutes, departureTime, delayMinutes, eta, onMarkDeparted, onAddDelay }) {
   if (!trip || !ETA_ACTIVE_STATUSES.includes(trip.status)) return null;
 
-  // Once the van is past BOARDING the departure is confirmed — show countdown only
   const isEnRoute = ['DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'].includes(trip.status);
 
   if (!departureTime && !isEnRoute) {
-    // Still boarding — offer the "I've Departed" button
     return (
       <section className="bg-indigo-50 p-4 rounded-xl border border-indigo-200" aria-label="Departure control">
         <h2 className="text-sm font-bold text-indigo-900 uppercase tracking-wider mb-2 text-center">Ready to Depart?</h2>
@@ -443,6 +467,9 @@ export default function DriverDashboard() {
   const seatSyncedRef = useRef(false);
   const watchIdRef    = useRef(null);
   const tripIdRef     = useRef(null);
+  // Tracks the last accepted GPS fix so we can derive speed from position
+  // deltas when the device itself doesn't report coords.speed.
+  const lastFixRef    = useRef(null); // { lat, lng, timestamp }
 
   // ── Derived ────────────────────────────────────────────────────────────────
 
@@ -493,6 +520,7 @@ export default function DriverDashboard() {
 
   const stopLocationSharing = useCallback(() => {
     clearWatch();
+    lastFixRef.current = null;
     setGpsState(GPS_STATE.IDLE);
     setLastCoords(null);
     socket.disconnect();
@@ -514,20 +542,53 @@ export default function DriverDashboard() {
 
     setGpsError('');
     setGpsState(GPS_STATE.ACQUIRING);
+    lastFixRef.current = null;
     socket.connect();
 
     watchIdRef.current = navigator.geolocation.watchPosition(
       (position) => {
         const { latitude: lat, longitude: lng, speed, accuracy } = position.coords;
+        const timestamp = position.timestamp;
+
+        // 1. Prefer the device's own speed reading when it's a real, sane number.
+        let resolvedSpeed =
+          typeof speed === 'number' && speed >= 0 && speed <= MAX_PLAUSIBLE_SPEED_MPS
+            ? speed
+            : null;
+
+        // 2. Fall back to computing speed from the distance/time between the
+        //    last two accepted fixes, when the device doesn't give us one.
+        //    This is the same approach consumer trackers like Life360 use
+        //    when raw speed isn't available from the OS.
+        if (resolvedSpeed === null && lastFixRef.current) {
+          const dtSeconds = (timestamp - lastFixRef.current.timestamp) / 1000;
+          if (dtSeconds >= MIN_DT_FOR_FALLBACK_SECONDS) {
+            const distanceMeters = haversineMeters(
+              lastFixRef.current.lat, lastFixRef.current.lng, lat, lng
+            );
+            if (distanceMeters >= MIN_DISTANCE_FOR_FALLBACK_M) {
+              const derivedSpeed = distanceMeters / dtSeconds;
+              resolvedSpeed = derivedSpeed <= MAX_PLAUSIBLE_SPEED_MPS ? derivedSpeed : null;
+            } else {
+              // Van hasn't moved meaningfully in this window — treat as stopped.
+              resolvedSpeed = 0;
+            }
+          }
+        }
+
+        lastFixRef.current = { lat, lng, timestamp };
+
         socket.emit('driver_gps_update', {
           tripId: tripIdRef.current,
-          lat, lng,
-          speed:     speed    ?? 0,
-          accuracy:  accuracy ?? null,
-          heading:   position.coords.heading ?? null,
-          timestamp: position.timestamp,
+          lat,
+          lng,
+          speed: resolvedSpeed,          // may legitimately be null (unknown)
+          accuracy: typeof accuracy === 'number' ? accuracy : null,
+          heading: typeof position.coords.heading === 'number' ? position.coords.heading : null,
+          timestamp,
         });
-        setLastCoords({ lat, lng, accuracy, speed });
+
+        setLastCoords({ lat, lng, accuracy, speed: resolvedSpeed });
         setGpsState(GPS_STATE.LIVE);
         setGpsError('');
       },
@@ -543,15 +604,6 @@ export default function DriverDashboard() {
   }, [clearWatch]);
 
   // ── Departure: advance status + start local ETA ────────────────────────────
-  //
-  // This is the critical fix: "I've Departed" must do TWO things atomically
-  // from the driver's perspective:
-  //   1. PATCH /trips/:id/status  → newStatus: 'DEPARTING'  (backend state machine)
-  //   2. setDepartureTime(new Date())                        (local ETA countdown)
-  //
-  // Without #1, the trip stays BOARDING forever on the backend, the public
-  // tracking page never moves the van into "On the Road", and the map dot
-  // never appears in the drivingTrips list.
 
   const handleMarkDeparted = useCallback(async () => {
     if (!tripIdRef.current || statusUpdating) return;
@@ -560,13 +612,10 @@ export default function DriverDashboard() {
       const response = await apiClient.patch(`/trips/${tripIdRef.current}/status`, {
         newStatus: 'DEPARTING',
       });
-      // Update local trip object with the freshly returned trip so StatusBadge
-      // reflects DEPARTING immediately without a full refetch.
       const updatedTrip = response.data?.trip ?? response.data;
       if (updatedTrip?.id) {
         setTrip(updatedTrip);
       } else {
-        // Optimistic update if server didn't return the trip
         setTrip((prev) => prev ? { ...prev, status: 'DEPARTING' } : prev);
       }
       setDepartureTime(new Date());
@@ -574,7 +623,7 @@ export default function DriverDashboard() {
     } catch (err) {
       console.error('[DriverDashboard] mark departed error:', err);
       const msg = err?.response?.data?.error ?? err?.response?.data?.message ?? 'Could not update trip status. Try again.';
-      setGpsError(msg); // reuse gpsError banner for status errors
+      setGpsError(msg);
     } finally {
       setStatusUpdating(false);
     }
@@ -617,6 +666,7 @@ export default function DriverDashboard() {
     setGpsState(GPS_STATE.IDLE);
     setGpsError('');
     setLastCoords(null);
+    lastFixRef.current = null;
     const capacity = newTrip?.van?.capacity ?? 14;
     setSeatCounts({ total: capacity, available: capacity });
   }, []);
@@ -629,7 +679,6 @@ export default function DriverDashboard() {
     return () => { controller.abort(); stopLocationSharing(); };
   }, [fetchMyTrip, stopLocationSharing]);
 
-  // Broadcast seat update whenever counts change during BOARDING
   useEffect(() => {
     const tripId     = trip?.id;
     const tripStatus = trip?.status;
@@ -643,7 +692,6 @@ export default function DriverDashboard() {
     seatSyncedRef.current = true;
   }, [trip?.id, trip?.status, seatCounts.available, seatCounts.total]);
 
-  // Broadcast ETA whenever it changes
   useEffect(() => {
     if (!trip?.id || !eta) return;
     socket.emit('eta_update', {
@@ -654,7 +702,6 @@ export default function DriverDashboard() {
     });
   }, [trip?.id, eta, departureTime, delayMinutes]);
 
-  // Auto-reconnect socket if it drops while GPS is live
   useEffect(() => {
     if (gpsState !== GPS_STATE.LIVE) return;
     const handleDisconnect = (reason) => {
@@ -740,7 +787,6 @@ export default function DriverDashboard() {
               onAddDelay={handleAddDelay}
             />
 
-            {/* Status-update spinner overlay on the depart button */}
             {statusUpdating && (
               <div className="flex items-center gap-2 text-xs text-indigo-600 font-medium justify-center">
                 <span className="w-3 h-3 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin" />
