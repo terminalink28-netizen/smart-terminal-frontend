@@ -1,8 +1,5 @@
 {
   "rewrites": [
-    {
-      "source": "/(.*)",
-      "destination": "/"
-    }
+    { "source": "/api/:path*", "destination": "https://smart-terminal-backend.onrender.com/api/:path*" }
   ]
 }
