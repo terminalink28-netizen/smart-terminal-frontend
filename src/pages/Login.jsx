@@ -8,6 +8,13 @@ const roleRoutes = {
   DRIVER: '/driver',
 };
 
+// Always store (and read) the role in one normalized form so every
+// consumer of localStorage — route guards, headers, etc. — agrees on it.
+function normalizeUser(user) {
+  if (!user?.role) return null;
+  return { ...user, role: user.role.toUpperCase() };
+}
+
 export default function Login() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -24,11 +31,13 @@ export default function Login() {
 
     try {
       const user = JSON.parse(savedUser);
-      // Ensure case-insensitivity when matching database roles to the route map
       const nextPath = roleRoutes[user?.role?.toUpperCase()];
 
       if (nextPath) {
         navigate(nextPath, { replace: true });
+      } else {
+        // Unknown/garbled role — don't leave a bad value sitting around
+        localStorage.removeItem('user');
       }
     } catch {
       localStorage.removeItem('user');
@@ -52,24 +61,31 @@ export default function Login() {
     setLoading(true);
 
     try {
-      // Mapping the frontend states back to the API's expected keys
       const response = await apiClient.post('/auth/login', {
         identifier: email.trim(),
         secret: password,
       });
 
-      const user = response.data?.user;
+      // Be tolerant of slightly different response shapes
+      // (e.g. { user } vs { data: { user } })
+      const rawUser = response.data?.user ?? response.data?.data?.user;
+      const user = normalizeUser(rawUser);
 
-      if (!user?.role) {
+      if (!user) {
         throw new Error('Invalid login response.');
       }
 
+      const nextPath = roleRoutes[user.role];
+
+      if (!nextPath) {
+        throw new Error(`Unrecognized role: ${user.role}`);
+      }
+
+      // Store the normalized role so ProtectedRoute (or anything else
+      // reading localStorage) sees the same casing this component uses.
       localStorage.setItem('user', JSON.stringify(user));
 
-      // Route the user based on their normalized role
-      navigate(roleRoutes[user.role.toUpperCase()] || '/', {
-        replace: true,
-      });
+      navigate(nextPath, { replace: true });
     } catch (err) {
       setError(
         err?.response?.data?.error ||
