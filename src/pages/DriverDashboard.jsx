@@ -651,21 +651,18 @@ export default function DriverDashboard() {
   const handleLogout = useCallback(async () => {
   stopLocationSharing();
 
-  // Fire the logout request but never let it block clearing local
-  // credentials or redirecting — a slow/failed request shouldn't
-  // trap the user in a logged-in-looking state.
   try {
     await apiClient.post('/auth/logout');
   } catch (err) {
     console.warn('[DriverDashboard] logout request failed:', err);
   }
 
-  // This is the actual fix: the Bearer token in localStorage is a
-  // second, independent credential from the cookie. Clearing only
-  // the cookie (server-side) is not enough — this token must be
-  // removed too, or the app will treat the user as still logged in.
+  // Both keys must go — ProtectedRoute and Login's redirect-if-logged-in
+  // effect both key off localStorage 'user', not just 'token'. Clearing
+  // only one leaves the app thinking you're still authenticated.
   try {
     localStorage.removeItem('token');
+    localStorage.removeItem('user');
   } catch {
     // ignore storage access errors (e.g. private browsing restrictions)
   }
