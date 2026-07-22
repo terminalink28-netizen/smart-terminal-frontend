@@ -64,6 +64,20 @@ const handleAuthFailure = (err) => {
   return false;
 };
 
+// Pulls a driver login ID out of whatever shape the backend returns.
+// Covers common variants so this keeps working even if field naming shifts.
+function extractDriverId(responseData) {
+  return (
+    responseData?.driver?.driverId ??
+    responseData?.driver?.driver_id_string ??
+    responseData?.driverId ??
+    responseData?.driver_id_string ??
+    responseData?.van?.driver?.driverId ??
+    responseData?.van?.driver?.driver_id_string ??
+    null
+  );
+}
+
 // ─── AdminDashboard ───────────────────────────────────────────────────────────
 
 export default function AdminDashboard() {
@@ -81,6 +95,10 @@ export default function AdminDashboard() {
   const [vanModal, setVanModal]         = useState(null); 
   const [vanMutationLoading, setVanMutationLoading] = useState(false);
   const [vanMutationError, setVanMutationError]     = useState('');
+
+  // Shown right after a van + driver is created, so the admin can copy
+  // down the driver's login ID and PIN before it's gone for good.
+  const [driverCredentials, setDriverCredentials] = useState(null);
 
   const [pendingDelete, setPendingDelete] = useState(null);
 
@@ -259,11 +277,23 @@ export default function AdminDashboard() {
       if (vanModal?.mode === 'edit') {
         await apiClient.patch(`/admin/vans/${vanModal.van.id}`, formData);
         showToast('success', `${formData.plateNumber} has been updated.`);
+        setVanModal(null);
       } else {
-        await apiClient.post('/admin/vans', formData);
+        const { data: res } = await apiClient.post('/admin/vans', formData);
+        const driverId = extractDriverId(res);
+
         showToast('success', `${formData.plateNumber} and driver have been successfully registered.`);
+        setVanModal(null);
+
+        // Surface the driver's login credentials right away — the PIN is
+        // hashed on the server after this and can't be recovered later.
+        setDriverCredentials({
+          plateNumber: formData.plateNumber,
+          driverName: formData.driverName,
+          driverId,
+          pin: formData.driverPin,
+        });
       }
-      setVanModal(null);
       setReloadToken((n) => n + 1);
     } catch (err) {
       if (handleAuthFailure(err)) return; 
@@ -415,7 +445,7 @@ export default function AdminDashboard() {
           <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-200">
             <div className="flex justify-between items-center mb-4 border-b pb-2">
               <h2 className="text-lg font-bold text-gray-800">Registered Vans</h2>
-              <button onClick={openAddVanModal} className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-1.5 rounded-lg transition shadow-sm">＋ Add Fleet Unit</button>
+              <button onClick={openAddVanModal} className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-1.5 rounded-lg transition shadow-sm">＋ Add Van &amp; Driver</button>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full text-sm text-left">
@@ -444,7 +474,7 @@ export default function AdminDashboard() {
           <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-200">
             <div className="flex justify-between items-center mb-4 border-b pb-2">
               <h2 className="text-lg font-bold text-gray-800">System Users &amp; Drivers</h2>
-              <button onClick={openAddStaffModal} className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-1.5 rounded-lg transition shadow-sm">＋ Add Account</button>
+              <button onClick={openAddStaffModal} className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-1.5 rounded-lg transition shadow-sm">＋ Add Staff Account</button>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full text-sm text-left">
@@ -496,6 +526,7 @@ export default function AdminDashboard() {
       />
       <StaffFormModal state={staffModal} onClose={closeStaffModal} onSubmit={handleSubmitStaff} isLoading={mutationLoading} serverError={mutationError} onClearError={() => setMutationError('')} />
       <VanFormModal state={vanModal} onClose={closeVanModal} onSubmit={handleSubmitVan} isLoading={vanMutationLoading} serverError={vanMutationError} onClearError={() => setVanMutationError('')} />
+      <DriverCredentialsModal credentials={driverCredentials} onClose={() => setDriverCredentials(null)} />
       <ConfirmDeleteModal target={pendingDelete} onClose={closeDeleteModal} onConfirm={handleConfirmDelete} isLoading={anyMutationBusy} serverError={pendingDelete?.kind === 'van' ? vanMutationError : mutationError} />
     </div>
   );
@@ -581,7 +612,7 @@ function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onCl
     <div role="dialog" aria-modal="true" aria-labelledby="staff-modal-title" className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" onClick={(e) => { if (e.target === e.currentTarget && !isLoading) onClose(); }}>
       <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md">
         <div className="flex justify-between items-center p-5 border-b">
-          <h2 id="staff-modal-title" className="text-lg font-bold text-gray-900">{isEdit ? 'Edit Account' : 'Create Staff Account'}</h2>
+          <h2 id="staff-modal-title" className="text-lg font-bold text-gray-900">{isEdit ? 'Edit Account' : 'Add Staff Account'}</h2>
           <button onClick={onClose} disabled={isLoading} className="text-gray-400 hover:text-gray-600 disabled:opacity-40 text-xl leading-none">✕</button>
         </div>
         {serverError && <div className="mx-5 mt-4 p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg text-sm">⚠️ {serverError}</div>}
@@ -597,7 +628,7 @@ function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onCl
               <option value="DISPATCHER">Dispatcher</option>
               {isEdit && form.role === 'DRIVER' && <option value="DRIVER">Driver</option>}
             </select>
-            {!isEdit && <p className="text-xs text-blue-600 mt-1.5 font-medium">To register a new Driver, please use the "Add Fleet Unit" button instead.</p>}
+            {!isEdit && <p className="text-xs text-blue-600 mt-1.5 font-medium">To add a Driver, use "Add Van &amp; Driver" instead — drivers log in with a van and a PIN, not an email.</p>}
           </Field>
           
           {form.role && form.role !== 'DRIVER' && (
@@ -705,7 +736,7 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
     <div role="dialog" aria-modal="true" aria-labelledby="van-modal-title" className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" onClick={(e) => { if (e.target === e.currentTarget && !isLoading) onClose(); }}>
       <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden">
         <div className="flex justify-between items-center p-5 border-b bg-slate-50">
-          <h2 id="van-modal-title" className="text-lg font-black text-gray-900">{isEdit ? 'Edit Fleet Unit' : 'Register New Fleet Unit'}</h2>
+          <h2 id="van-modal-title" className="text-lg font-black text-gray-900">{isEdit ? 'Edit Van' : 'Add Van & Driver'}</h2>
           <button onClick={onClose} disabled={isLoading} className="text-gray-400 hover:text-gray-600 disabled:opacity-40 text-xl leading-none">✕</button>
         </div>
         
@@ -737,12 +768,16 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
           {!isEdit && (
             <div>
               <h3 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-3 border-b pb-1">Assigned Driver</h3>
-              <p className="text-xs text-blue-600 mb-3 font-medium">A new driver account will be generated. They will log in using the Van Plate Number and the PIN below.</p>
+              <p className="text-xs text-blue-600 mb-3 font-medium">
+                A new driver account will be created — not by email, but with a login ID the system generates
+                automatically. You'll see that ID right after you submit this form, so you can pass it to the driver
+                along with the PIN below.
+              </p>
               <div className="space-y-4">
                 <Field label="Driver Full Name" required error={errors.driverName}>
                   <input name="driverName" type="text" value={form.driverName} onChange={change} placeholder="e.g. Juan dela Cruz" className={inputCls(errors.driverName)} />
                 </Field>
-                <Field label="4-Digit PIN" required error={errors.driverPin} hint="Used for Driver login. Min. 4 characters.">
+                <Field label="Login PIN" required error={errors.driverPin} hint="What the driver will type in as their password. Min. 4 characters.">
                   <input name="driverPin" type="password" value={form.driverPin} onChange={change} placeholder="e.g. 1234" maxLength={8} className={inputCls(errors.driverPin)} />
                 </Field>
               </div>
@@ -753,7 +788,70 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
         <div className="flex gap-3 p-5 border-t bg-gray-50 rounded-b-2xl">
           <button onClick={onClose} disabled={isLoading} className="flex-1 py-2 border border-gray-300 rounded-lg text-sm font-semibold text-gray-700 hover:bg-gray-100 transition disabled:opacity-40">Cancel</button>
           <button onClick={submit} disabled={isLoading} className="flex-[2] py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-sm font-bold transition disabled:opacity-70 disabled:cursor-not-allowed">
-            {isLoading ? (isEdit ? 'Saving…' : 'Registering…') : (isEdit ? 'Save Changes' : 'Register Van & Driver')}
+            {isLoading ? (isEdit ? 'Saving…' : 'Creating…') : (isEdit ? 'Save Changes' : 'Add Van & Driver')}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── DriverCredentialsModal ────────────────────────────────────────────────────
+// Shown once, immediately after a van + driver is created. This is the only
+// moment the PIN is visible on screen — after this it only exists as a hash
+// on the server, so make sure the admin has a chance to write it down.
+
+function DriverCredentialsModal({ credentials, onClose }) {
+  useEffect(() => {
+    if (!credentials) return;
+    const fn = (e) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', fn);
+    return () => document.removeEventListener('keydown', fn);
+  }, [credentials, onClose]);
+
+  if (!credentials) return null;
+
+  const { plateNumber, driverName, driverId, pin } = credentials;
+  const missingId = !driverId;
+
+  return (
+    <div role="dialog" aria-modal="true" aria-labelledby="driver-creds-title" className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm">
+        <div className="p-6 space-y-4 text-center">
+          <div className="text-4xl" aria-hidden="true">✅</div>
+          <h2 id="driver-creds-title" className="text-lg font-black text-gray-900">Driver Account Created</h2>
+          <p className="text-sm text-gray-500">
+            Give <strong>{driverName}</strong> these details — this is the only time the PIN will be shown.
+          </p>
+
+          <div className="bg-gray-50 border border-gray-200 rounded-xl p-4 text-left space-y-3">
+            <div>
+              <div className="text-xs font-bold text-gray-400 uppercase tracking-wide">Van</div>
+              <div className="font-bold text-gray-900">{plateNumber}</div>
+            </div>
+            <div>
+              <div className="text-xs font-bold text-gray-400 uppercase tracking-wide">Login ID</div>
+              {missingId ? (
+                <div className="text-sm text-amber-700">
+                  Not returned by the server. Check the vans list or your database for this driver's ID.
+                </div>
+              ) : (
+                <div className="font-mono font-bold text-gray-900 text-base">{driverId}</div>
+              )}
+            </div>
+            <div>
+              <div className="text-xs font-bold text-gray-400 uppercase tracking-wide">PIN</div>
+              <div className="font-mono font-bold text-gray-900 text-base">{pin}</div>
+            </div>
+          </div>
+
+          <p className="text-xs text-gray-400">
+            The driver enters the Login ID and PIN above on the driver sign-in screen — no email needed.
+          </p>
+        </div>
+        <div className="p-5 border-t bg-gray-50 rounded-b-2xl">
+          <button onClick={onClose} className="w-full py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-bold transition">
+            Got it, close
           </button>
         </div>
       </div>
