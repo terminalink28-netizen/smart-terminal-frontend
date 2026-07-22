@@ -83,6 +83,7 @@ export default function Login() {
 
       // Store the normalized role so ProtectedRoute (or anything else
       // reading localStorage) sees the same casing this component uses.
+      localStorage.setItem('token', response.data.token);
       localStorage.setItem('user', JSON.stringify(user));
 
       navigate(nextPath, { replace: true });
