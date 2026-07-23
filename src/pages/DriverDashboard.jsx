@@ -649,30 +649,35 @@ export default function DriverDashboard() {
   }, [departureTime, routeDurationMinutes, delayMinutes]);
 
   // ── data fetching ──────────────────────────────────────────────────────────
+  //
+  // `silent` lets background reconciliation (e.g. after a QR-completion
+  // socket event) refresh state without hijacking the screen with the
+  // full-page loading spinner — that spinner should only ever appear on
+  // first mount or when the user explicitly taps "Refresh."
 
   const fetchMyTrip = useCallback(async (signal, { silent = false } = {}) => {
-  if (!silent) setLoading(true);
-  setError('');
-  try {
-    const response    = await apiClient.get('/trips/my-trips', { signal });
-    const currentTrip = response.data?.[0] ?? null;
-    tripIdRef.current     = currentTrip?.id ?? null;
-    seatSyncedRef.current = false;
-    setTrip(currentTrip);
-    setDepartureTime(null);
-    setDelayMinutes(0);
-    const capacity = currentTrip?.van?.capacity ?? 14;
-    setSeatCounts({ total: capacity, available: capacity });
-  } catch (err) {
-    if (err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') return;
-    if (!silent) {
-      setError('Failed to load your trip. Please check your connection and try again.');
+    if (!silent) setLoading(true);
+    if (!silent) setError('');
+    try {
+      const response    = await apiClient.get('/trips/my-trips', { signal });
+      const currentTrip = response.data?.[0] ?? null;
+      tripIdRef.current     = currentTrip?.id ?? null;
+      seatSyncedRef.current = false;
+      setTrip(currentTrip);
+      setDepartureTime(null);
+      setDelayMinutes(0);
+      const capacity = currentTrip?.van?.capacity ?? 14;
+      setSeatCounts({ total: capacity, available: capacity });
+    } catch (err) {
+      if (err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') return;
+      if (!silent) {
+        setError('Failed to load your trip. Please check your connection and try again.');
+      }
+      console.error('[DriverDashboard] fetchMyTrip error:', err);
+    } finally {
+      if (!silent) setLoading(false);
     }
-    console.error('[DriverDashboard] fetchMyTrip error:', err);
-  } finally {
-    if (!silent) setLoading(false);
-  }
-}, []);
+  }, []);
 
   // ── GPS helpers ────────────────────────────────────────────────────────────
 
@@ -688,7 +693,12 @@ export default function DriverDashboard() {
     lastFixRef.current = null;
     setGpsState(GPS_STATE.IDLE);
     setLastCoords(null);
-    socket.disconnect();
+    // Deliberately NOT calling socket.disconnect() here. This socket is also
+    // used to listen for trip_status_changed (the dispatcher's completion
+    // QR scan) — disconnecting it just because GPS broadcasting stopped
+    // would silently break that listener until the driver starts sharing
+    // location again. The socket now only fully disconnects on unmount or
+    // explicit logout (see handleLogout).
   }, [clearWatch]);
 
   const startLocationSharing = useCallback(() => {
@@ -765,7 +775,6 @@ export default function DriverDashboard() {
         setGpsError(geolocationErrorMessage(err));
         setGpsState(GPS_STATE.ERROR);
         clearWatch();
-        socket.disconnect();
       },
       GPS_OPTIONS,
     );
@@ -820,6 +829,7 @@ export default function DriverDashboard() {
 
   const handleLogout = useCallback(async () => {
     stopLocationSharing();
+    socket.disconnect(); // explicit now — stopLocationSharing no longer disconnects
 
     try {
       await apiClient.post('/auth/logout');
@@ -859,8 +869,31 @@ export default function DriverDashboard() {
   useEffect(() => {
     const controller = new AbortController();
     fetchMyTrip(controller.signal);
-    return () => { controller.abort(); stopLocationSharing(); };
+    return () => { controller.abort(); stopLocationSharing(); socket.disconnect(); };
   }, [fetchMyTrip, stopLocationSharing]);
+
+  // Always join the 'active_trips' room and listen for trip status updates
+  // — independent of GPS sharing. Without this, this socket never joins the
+  // room the backend broadcasts trip_status_changed to (see socket.js's
+  // subscribe_to_map handler), so a dispatcher's QR scan completing this
+  // trip would never reach this screen at all, regardless of whether the
+  // driver is currently sharing live location.
+  useEffect(() => {
+    socket.connect();
+    socket.emit('subscribe_to_map');
+
+    const handleConnect = () => {
+      // Re-join after any reconnect (dropped connection, server restart,
+      // Render cold-start, etc.) — subscriptions don't survive a reconnect
+      // automatically.
+      socket.emit('subscribe_to_map');
+    };
+    socket.on('connect', handleConnect);
+
+    return () => {
+      socket.off('connect', handleConnect);
+    };
+  }, []);
 
   useEffect(() => {
     const tripId     = trip?.id;
@@ -900,47 +933,36 @@ export default function DriverDashboard() {
     return () => socket.off('disconnect', handleDisconnect);
   }, [gpsState, clearWatch]);
 
-  // Keep the socket connected while waiting for the dispatcher's completion
-  // scan, even if the driver isn't broadcasting GPS at that moment — this
-  // is what lets the "arrived" screen update itself the instant the QR
-  // code is scanned, with no manual refresh needed.
-  useEffect(() => {
-    if (trip?.status !== 'ARRIVING') return;
-    socket.connect();
-  }, [trip?.status]);
-
   // Listen for the dispatcher's QR scan completing this trip in real time.
   useEffect(() => {
-  const handleRemoteStatusChange = (payload) => {
-    if (!payload?.tripId || payload.tripId !== tripIdRef.current) return;
-    const updatedTrip = payload.trip;
-    if (!updatedTrip) return;
+    const handleRemoteStatusChange = (payload) => {
+      if (!payload?.tripId || payload.tripId !== tripIdRef.current) return;
+      const updatedTrip = payload.trip;
+      if (!updatedTrip) return;
 
-    if (updatedTrip.status === 'COMPLETED') {
-      // The dispatcher just scanned this van's QR and closed out the trip.
-      // Go straight to the "ready to load again at the terminal" screen
-      // instead of rendering a dead-end COMPLETED state (StatusControlPanel
-      // has no button or action for it) or flashing a full-page spinner —
-      // fetchMyTrip's loading state would otherwise briefly replace this
-      // screen entirely before settling back on the same TripSetupScreen.
-      stopLocationSharing();
-      tripIdRef.current = null;
-      setTrip(null);
-      setDepartureTime(null);
-      setDelayMinutes(0);
-      setMaxSpeedKmh(0);
+      if (updatedTrip.status === 'COMPLETED') {
+        // The dispatcher just scanned this van's QR and closed out the trip.
+        // Jump straight to the "ready to load again at the terminal" screen
+        // instead of rendering a dead-end COMPLETED state (StatusControlPanel
+        // has no button/action for it) or flashing a full-page spinner.
+        stopLocationSharing();
+        tripIdRef.current = null;
+        setTrip(null);
+        setDepartureTime(null);
+        setDelayMinutes(0);
+        setMaxSpeedKmh(0);
 
-      // Reconcile with the server in the background in case anything else
-      // changed — but don't block or replace the UI while doing it.
-      fetchMyTrip(undefined, { silent: true });
-      return;
-    }
+        // Reconcile with the server in the background in case anything else
+        // changed — but don't block or replace the UI while doing it.
+        fetchMyTrip(undefined, { silent: true });
+        return;
+      }
 
-    setTrip(updatedTrip);
-  };
-  socket.on('trip_status_changed', handleRemoteStatusChange);
-  return () => socket.off('trip_status_changed', handleRemoteStatusChange);
-}, [stopLocationSharing, fetchMyTrip]);
+      setTrip(updatedTrip);
+    };
+    socket.on('trip_status_changed', handleRemoteStatusChange);
+    return () => socket.off('trip_status_changed', handleRemoteStatusChange);
+  }, [stopLocationSharing, fetchMyTrip]);
 
   // ── render: loading ────────────────────────────────────────────────────────
 
