@@ -650,27 +650,29 @@ export default function DriverDashboard() {
 
   // ── data fetching ──────────────────────────────────────────────────────────
 
-  const fetchMyTrip = useCallback(async (signal) => {
-    setLoading(true);
-    setError('');
-    try {
-      const response    = await apiClient.get('/trips/my-trips', { signal });
-      const currentTrip = response.data?.[0] ?? null;
-      tripIdRef.current     = currentTrip?.id ?? null;
-      seatSyncedRef.current = false;
-      setTrip(currentTrip);
-      setDepartureTime(null);
-      setDelayMinutes(0);
-      const capacity = currentTrip?.van?.capacity ?? 14;
-      setSeatCounts({ total: capacity, available: capacity });
-    } catch (err) {
-      if (err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') return;
+  const fetchMyTrip = useCallback(async (signal, { silent = false } = {}) => {
+  if (!silent) setLoading(true);
+  setError('');
+  try {
+    const response    = await apiClient.get('/trips/my-trips', { signal });
+    const currentTrip = response.data?.[0] ?? null;
+    tripIdRef.current     = currentTrip?.id ?? null;
+    seatSyncedRef.current = false;
+    setTrip(currentTrip);
+    setDepartureTime(null);
+    setDelayMinutes(0);
+    const capacity = currentTrip?.van?.capacity ?? 14;
+    setSeatCounts({ total: capacity, available: capacity });
+  } catch (err) {
+    if (err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') return;
+    if (!silent) {
       setError('Failed to load your trip. Please check your connection and try again.');
-      console.error('[DriverDashboard] fetchMyTrip error:', err);
-    } finally {
-      setLoading(false);
     }
-  }, []);
+    console.error('[DriverDashboard] fetchMyTrip error:', err);
+  } finally {
+    if (!silent) setLoading(false);
+  }
+}, []);
 
   // ── GPS helpers ────────────────────────────────────────────────────────────
 
@@ -909,21 +911,36 @@ export default function DriverDashboard() {
 
   // Listen for the dispatcher's QR scan completing this trip in real time.
   useEffect(() => {
-    const handleRemoteStatusChange = (payload) => {
-      if (!payload?.tripId || payload.tripId !== tripIdRef.current) return;
-      const updatedTrip = payload.trip;
-      if (!updatedTrip) return;
+  const handleRemoteStatusChange = (payload) => {
+    if (!payload?.tripId || payload.tripId !== tripIdRef.current) return;
+    const updatedTrip = payload.trip;
+    if (!updatedTrip) return;
 
-      setTrip(updatedTrip);
+    if (updatedTrip.status === 'COMPLETED') {
+      // The dispatcher just scanned this van's QR and closed out the trip.
+      // Go straight to the "ready to load again at the terminal" screen
+      // instead of rendering a dead-end COMPLETED state (StatusControlPanel
+      // has no button or action for it) or flashing a full-page spinner —
+      // fetchMyTrip's loading state would otherwise briefly replace this
+      // screen entirely before settling back on the same TripSetupScreen.
+      stopLocationSharing();
+      tripIdRef.current = null;
+      setTrip(null);
+      setDepartureTime(null);
+      setDelayMinutes(0);
+      setMaxSpeedKmh(0);
 
-      if (updatedTrip.status === 'COMPLETED') {
-        stopLocationSharing();
-        fetchMyTrip();
-      }
-    };
-    socket.on('trip_status_changed', handleRemoteStatusChange);
-    return () => socket.off('trip_status_changed', handleRemoteStatusChange);
-  }, [stopLocationSharing, fetchMyTrip]);
+      // Reconcile with the server in the background in case anything else
+      // changed — but don't block or replace the UI while doing it.
+      fetchMyTrip(undefined, { silent: true });
+      return;
+    }
+
+    setTrip(updatedTrip);
+  };
+  socket.on('trip_status_changed', handleRemoteStatusChange);
+  return () => socket.off('trip_status_changed', handleRemoteStatusChange);
+}, [stopLocationSharing, fetchMyTrip]);
 
   // ── render: loading ────────────────────────────────────────────────────────
 
