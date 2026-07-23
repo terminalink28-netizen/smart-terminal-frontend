@@ -351,18 +351,9 @@ export default function DispatcherDashboard() {
   }, []);
 
   const handleScanSuccess = useCallback((result) => {
-    if (result?.status === 'ARRIVED' || result?.arrivedStatus === true) {
-      setDepartureScan({
-        tripId:        result.tripId,
-        passengerName: result.passengerName,
-        plateNumber:   result.plateNumber,
-        routeName:     result.routeName,
-      });
-    } else {
-      showSuccess(typeof result === 'string' ? result : result?.message ?? 'QR scan successful.');
-    }
-    fetchActiveTrips();
-  }, [fetchActiveTrips, showSuccess]);
+  showSuccess(typeof result === 'string' ? result : 'QR scan successful.');
+  fetchActiveTrips();
+}, [fetchActiveTrips, showSuccess]);
 
   const handleDepartureConfirm = useCallback(async ({ tripId, departureTime }) => {
     setIsDepartureSubmitting(true);

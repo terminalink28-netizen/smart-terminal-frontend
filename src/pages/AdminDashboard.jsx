@@ -97,8 +97,12 @@ export default function AdminDashboard() {
   const [vanMutationError, setVanMutationError]     = useState('');
 
   // Shown right after a van + driver is created, so the admin can copy
-  // down the driver's login ID and PIN before it's gone for good.
+  // down the driver's login ID, PIN, and van QR token before it's gone.
   const [driverCredentials, setDriverCredentials] = useState(null);
+
+  // Lets the admin re-open an existing van's QR token later, not just
+  // right after creation.
+  const [viewingQrVan, setViewingQrVan] = useState(null);
 
   const [pendingDelete, setPendingDelete] = useState(null);
 
@@ -219,6 +223,7 @@ export default function AdminDashboard() {
     } catch (err) {
       console.error('Logout request failed, logging out locally anyway:', err);
     } finally {
+      localStorage.removeItem('token');
       localStorage.removeItem('user'); 
       try { localStorage.removeItem(AUDIT_STORAGE_KEY); } catch (err) { console.error(err); }
       window.location.replace('/login');
@@ -285,13 +290,17 @@ export default function AdminDashboard() {
         showToast('success', `${formData.plateNumber} and driver have been successfully registered.`);
         setVanModal(null);
 
-        // Surface the driver's login credentials right away — the PIN is
-        // hashed on the server after this and can't be recovered later.
+        // Surface the driver's login credentials AND the van's QR token
+        // right away — the PIN is hashed server-side after this and can't
+        // be recovered later, and this is the most convenient moment to
+        // grab the QR too (though it can also be viewed later from the
+        // vans table via the "QR" button).
         setDriverCredentials({
           plateNumber: formData.plateNumber,
           driverName: formData.driverName,
           driverId,
           pin: formData.driverPin,
+          qrToken: res?.qrToken ?? null,
         });
       }
       setReloadToken((n) => n + 1);
@@ -460,6 +469,7 @@ export default function AdminDashboard() {
                       <td className="p-3"><VanStatusBadge status={van.status} /></td>
                       <td className="p-3">
                         <div className="flex gap-1.5 justify-end">
+                          <button onClick={() => setViewingQrVan(van)} title="View this van's scan QR" className="text-xs font-semibold px-2 py-1 rounded border border-purple-300 text-purple-700 bg-purple-50 hover:bg-purple-100 transition">QR</button>
                           <button onClick={() => openEditVanModal(van)} className="text-xs font-semibold px-2 py-1 rounded border border-blue-300 text-blue-700 bg-blue-50 hover:bg-blue-100 transition">Edit</button>
                           <button onClick={() => openDeleteVanModal(van)} className="text-xs font-semibold px-2 py-1 rounded border border-red-300 text-red-600 bg-red-50 hover:bg-red-100 transition">Delete</button>
                         </div>
@@ -527,6 +537,7 @@ export default function AdminDashboard() {
       <StaffFormModal state={staffModal} onClose={closeStaffModal} onSubmit={handleSubmitStaff} isLoading={mutationLoading} serverError={mutationError} onClearError={() => setMutationError('')} />
       <VanFormModal state={vanModal} onClose={closeVanModal} onSubmit={handleSubmitVan} isLoading={vanMutationLoading} serverError={vanMutationError} onClearError={() => setVanMutationError('')} />
       <DriverCredentialsModal credentials={driverCredentials} onClose={() => setDriverCredentials(null)} />
+      <QrOnlyModal van={viewingQrVan} onClose={() => setViewingQrVan(null)} />
       <ConfirmDeleteModal target={pendingDelete} onClose={closeDeleteModal} onConfirm={handleConfirmDelete} isLoading={anyMutationBusy} serverError={pendingDelete?.kind === 'van' ? vanMutationError : mutationError} />
     </div>
   );
@@ -771,7 +782,7 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
               <p className="text-xs text-blue-600 mb-3 font-medium">
                 A new driver account will be created — not by email, but with a login ID the system generates
                 automatically. You'll see that ID right after you submit this form, so you can pass it to the driver
-                along with the PIN below.
+                along with the PIN below. You'll also get a scannable QR code for this van at the same time.
               </p>
               <div className="space-y-4">
                 <Field label="Driver Full Name" required error={errors.driverName}>
@@ -800,6 +811,8 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
 // Shown once, immediately after a van + driver is created. This is the only
 // moment the PIN is visible on screen — after this it only exists as a hash
 // on the server, so make sure the admin has a chance to write it down.
+// The QR token, unlike the PIN, is NOT one-time-only — it can be re-viewed
+// any time later via the "QR" button in the vans table (see QrOnlyModal).
 
 function DriverCredentialsModal({ credentials, onClose }) {
   useEffect(() => {
@@ -811,13 +824,13 @@ function DriverCredentialsModal({ credentials, onClose }) {
 
   if (!credentials) return null;
 
-  const { plateNumber, driverName, driverId, pin } = credentials;
+  const { plateNumber, driverName, driverId, pin, qrToken } = credentials;
   const missingId = !driverId;
 
   return (
     <div role="dialog" aria-modal="true" aria-labelledby="driver-creds-title" className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
       <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm">
-        <div className="p-6 space-y-4 text-center">
+        <div className="p-6 space-y-4 text-center max-h-[85vh] overflow-y-auto">
           <div className="text-4xl" aria-hidden="true">✅</div>
           <h2 id="driver-creds-title" className="text-lg font-black text-gray-900">Driver Account Created</h2>
           <p className="text-sm text-gray-500">
@@ -843,6 +856,33 @@ function DriverCredentialsModal({ credentials, onClose }) {
               <div className="text-xs font-bold text-gray-400 uppercase tracking-wide">PIN</div>
               <div className="font-mono font-bold text-gray-900 text-base">{pin}</div>
             </div>
+
+            {qrToken && (
+              <div className="pt-3 border-t border-gray-200">
+                <div className="text-xs font-bold text-gray-400 uppercase tracking-wide mb-1">
+                  Van QR Code — print once, works for every future trip
+                </div>
+                <div className="flex items-center gap-2">
+                  <code className="flex-1 text-[11px] bg-white border border-gray-200 rounded px-2 py-1.5 break-all font-mono">
+                    {qrToken}
+                  </code>
+                  <button
+                    onClick={() => navigator.clipboard.writeText(qrToken)}
+                    className="shrink-0 text-xs font-bold px-2 py-1.5 rounded border border-blue-300 text-blue-700 bg-blue-50 hover:bg-blue-100 transition"
+                  >
+                    Copy
+                  </button>
+                </div>
+                <img
+                  src={`https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=${encodeURIComponent(qrToken)}`}
+                  alt="Van QR preview"
+                  className="mt-3 mx-auto rounded-lg border border-gray-200"
+                />
+                <p className="text-xs text-gray-400 mt-2">
+                  Paste the text above into any QR generator, or right-click the preview image to save it directly.
+                </p>
+              </div>
+            )}
           </div>
 
           <p className="text-xs text-gray-400">
@@ -852,6 +892,68 @@ function DriverCredentialsModal({ credentials, onClose }) {
         <div className="p-5 border-t bg-gray-50 rounded-b-2xl">
           <button onClick={onClose} className="w-full py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-bold transition">
             Got it, close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── QrOnlyModal ────────────────────────────────────────────────────────────
+// Re-opens an existing van's QR (from the vans table "QR" button) without
+// showing any driver/PIN fields — those are one-time-only and unrelated
+// to viewing a van's permanent scan code later.
+
+function QrOnlyModal({ van, onClose }) {
+  useEffect(() => {
+    if (!van) return;
+    const fn = (e) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', fn);
+    return () => document.removeEventListener('keydown', fn);
+  }, [van, onClose]);
+
+  if (!van) return null;
+
+  const qrToken = van.qrToken;
+
+  return (
+    <div role="dialog" aria-modal="true" aria-labelledby="qr-only-title" className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm">
+        <div className="p-6 space-y-4 text-center">
+          <div className="text-4xl" aria-hidden="true">📱</div>
+          <h2 id="qr-only-title" className="text-lg font-black text-gray-900">{van.plateNumber} — Scan QR</h2>
+
+          {!qrToken ? (
+            <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-sm text-amber-800">
+              No QR token was returned for this van by the server.
+            </div>
+          ) : (
+            <div className="bg-gray-50 border border-gray-200 rounded-xl p-4 text-left space-y-3">
+              <div className="flex items-center gap-2">
+                <code className="flex-1 text-[11px] bg-white border border-gray-200 rounded px-2 py-1.5 break-all font-mono">
+                  {qrToken}
+                </code>
+                <button
+                  onClick={() => navigator.clipboard.writeText(qrToken)}
+                  className="shrink-0 text-xs font-bold px-2 py-1.5 rounded border border-blue-300 text-blue-700 bg-blue-50 hover:bg-blue-100 transition"
+                >
+                  Copy
+                </button>
+              </div>
+              <img
+                src={`https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(qrToken)}`}
+                alt="Van QR preview"
+                className="mx-auto rounded-lg border border-gray-200"
+              />
+              <p className="text-xs text-gray-400">
+                Reprint this if the sticker is lost or damaged — it's the same code every time.
+              </p>
+            </div>
+          )}
+        </div>
+        <div className="p-5 border-t bg-gray-50 rounded-b-2xl">
+          <button onClick={onClose} className="w-full py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-bold transition">
+            Close
           </button>
         </div>
       </div>
