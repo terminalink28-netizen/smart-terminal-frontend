@@ -649,26 +649,33 @@ export default function DriverDashboard() {
   // ── auth ───────────────────────────────────────────────────────────────────
 
   const handleLogout = useCallback(async () => {
-  stopLocationSharing();
+    stopLocationSharing();
 
-  try {
-    await apiClient.post('/auth/logout');
-  } catch (err) {
-    console.warn('[DriverDashboard] logout request failed:', err);
-  }
+    // Fire the logout request but never let it block clearing local
+    // credentials or redirecting — a slow/failed request shouldn't
+    // trap the user in a logged-in-looking state.
+    try {
+      await apiClient.post('/auth/logout');
+    } catch (err) {
+      console.warn('[DriverDashboard] logout request failed:', err);
+    }
 
-  // Both keys must go — ProtectedRoute and Login's redirect-if-logged-in
-  // effect both key off localStorage 'user', not just 'token'. Clearing
-  // only one leaves the app thinking you're still authenticated.
-  try {
-    localStorage.removeItem('token');
-    localStorage.removeItem('user');
-  } catch {
-    // ignore storage access errors (e.g. private browsing restrictions)
-  }
+    // Both keys must go. The Bearer token in localStorage is a second,
+    // independent credential from the cookie — clearing only the cookie
+    // isn't enough. And if `user` is left behind, Login.jsx's mount
+    // effect sees a stale saved user and immediately redirects straight
+    // back to /driver, which then fails to fetch (token is gone) and
+    // shows the "Failed to load your trip" error instead of the login
+    // screen.
+    try {
+      localStorage.removeItem('token');
+      localStorage.removeItem('user');
+    } catch {
+      // ignore storage access errors (e.g. private browsing restrictions)
+    }
 
-  window.location.replace('/login');
-}, [stopLocationSharing]);
+    window.location.replace('/login');
+  }, [stopLocationSharing]);
 
   // ── self-start callback ────────────────────────────────────────────────────
 
