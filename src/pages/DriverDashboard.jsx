@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { QRCodeSVG } from 'qrcode.react';
 import apiClient from '../api/axios';
 import { socket } from '../api/socket';
 
@@ -35,11 +36,13 @@ const STATUS_STYLES = {
 
 // The forward-moving trip lifecycle a driver walks through manually.
 // Each entry knows what button to show to advance to the *next* step.
+// ARRIVING is handled separately (see CompletionQrPanel) — that final
+// step is confirmed by the dispatcher scanning the van's QR code rather
+// than a driver self-tap button.
 const STATUS_FLOW = [
   { key: 'BOARDING',  next: 'DEPARTING', actionLabel: '🚦 Ready to Depart',      actionHint: 'Tap once all passengers are seated.' },
   { key: 'DEPARTING', next: 'DEPARTED',  actionLabel: '🚐 Confirm Departure',    actionHint: "Tap the moment you actually pull out." },
   { key: 'DEPARTED',  next: 'ARRIVING',  actionLabel: '📍 Approaching Terminal', actionHint: "Tap when you're close to Virac Terminal." },
-  { key: 'ARRIVING',  next: 'COMPLETED', actionLabel: '✅ Complete Trip',        actionHint: 'Tap once everyone has disembarked.' },
 ];
 
 const MUNICIPALITIES = [
@@ -60,6 +63,10 @@ const DELAY_OPTIONS = [5, 10, 15, 30];
 
 // Statuses where the ETA panel is relevant (boarding + all en-route states)
 const ETA_ACTIVE_STATUSES = ['BOARDING', 'DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'];
+
+// Used to build the visual step tracker (includes the final COMPLETED dot,
+// even though there's no button for it — it's confirmed by QR scan).
+const STEPPER_KEYS = ['BOARDING', 'DEPARTING', 'DEPARTED', 'ARRIVING', 'COMPLETED'];
 
 const GPS_STATE = { IDLE: 'IDLE', ACQUIRING: 'ACQUIRING', LIVE: 'LIVE', ERROR: 'ERROR' };
 
@@ -115,22 +122,19 @@ function StatusBadge({ status }) {
 }
 
 // A simple horizontal progress tracker so the driver can see, at a glance,
-// where they are in the trip and what's still ahead — like a delivery
-// tracking strip.
+// where they are in the trip and what's still ahead.
 function TripProgressStepper({ status }) {
-  const idx = STATUS_FLOW.findIndex((s) => s.key === status);
-  // While DELAYED, we don't know which leg they were on, so just show the
-  // stepper collapsed with a delay note instead of guessing a position.
+  const idx = STEPPER_KEYS.indexOf(status);
   if (idx === -1) return null;
 
   return (
     <div className="flex items-center" aria-label="Trip progress">
-      {STATUS_FLOW.map((step, i) => {
+      {STEPPER_KEYS.map((key, i) => {
         const isDone    = i < idx;
         const isCurrent = i === idx;
-        const { icon } = friendlyStatus(step.key);
+        const { icon } = friendlyStatus(key);
         return (
-          <div key={step.key} className="flex items-center flex-1 last:flex-none">
+          <div key={key} className="flex items-center flex-1 last:flex-none">
             <div className="flex flex-col items-center gap-1">
               <div
                 className={`w-8 h-8 rounded-full flex items-center justify-center text-sm border-2 transition-colors ${
@@ -145,7 +149,7 @@ function TripProgressStepper({ status }) {
                 {isDone ? '✓' : icon}
               </div>
             </div>
-            {i < STATUS_FLOW.length - 1 && (
+            {i < STEPPER_KEYS.length - 1 && (
               <div className={`flex-1 h-1 mx-1 rounded-full ${isDone ? 'bg-green-500' : 'bg-gray-200'}`} />
             )}
           </div>
@@ -364,16 +368,55 @@ function ETACountdown({ eta }) {
   );
 }
 
-// ── StatusControlPanel ──────────────────────────────────────────────────────
-// Replaces the old single-purpose "I've departed" button with a generic
-// step-forward control that works for every leg of the trip: Boarding →
-// Departing → Departed → Arriving → Completed.
+// ── CompletionQrPanel ───────────────────────────────────────────────────────
+// Shown instead of a self-tap button once the trip reaches ARRIVING. The
+// driver hands their phone (or holds it up) to the dispatcher, who scans
+// this code with the existing QRScannerModal to confirm the trip is done.
+// The token is the van's permanent scan token — the same one printed on
+// the van's physical sticker — so the dispatcher's scanner needs no
+// special-casing to handle it.
 
-function StatusControlPanel({ trip, routeMinutes, departureTime, delayMinutes, eta, statusUpdating, onAdvance, onAddDelay }) {
+function CompletionQrPanel({ van, onRefresh }) {
+  if (!van?.qrToken) {
+    return (
+      <section className="bg-amber-50 border border-amber-200 rounded-xl p-5 text-center">
+        <p className="text-sm font-semibold text-amber-800">QR code unavailable</p>
+        <p className="text-xs text-amber-600 mt-1">Ask your dispatcher to complete this trip manually.</p>
+      </section>
+    );
+  }
+
+  return (
+    <section className="bg-white border-2 border-indigo-200 rounded-2xl p-6 text-center" aria-label="Trip completion QR code">
+      <p className="text-sm font-bold text-indigo-900 mb-1">You've arrived 🎉</p>
+      <p className="text-xs text-indigo-500 mb-4">
+        Show this code to your dispatcher — they'll scan it to confirm the trip is complete.
+      </p>
+      <div className="flex justify-center mb-4">
+        <div className="p-4 bg-white rounded-xl border-2 border-indigo-100 shadow-sm">
+          <QRCodeSVG value={van.qrToken} size={180} />
+        </div>
+      </div>
+      <p className="text-xs font-mono text-gray-400 mb-3">{van.plateNumber}</p>
+      <button onClick={onRefresh} className="text-xs text-indigo-500 hover:text-indigo-700 underline underline-offset-2">
+        Already scanned? Tap to refresh
+      </button>
+    </section>
+  );
+}
+
+// ── StatusControlPanel ──────────────────────────────────────────────────────
+// Boarding → Departing → Departed are self-tap steps. Arriving → Completed
+// is confirmed by the dispatcher scanning the van's QR code instead (see
+// CompletionQrPanel above), since that's the moment a second person should
+// verify the trip actually happened.
+
+function StatusControlPanel({ trip, delayMinutes, eta, statusUpdating, onAdvance, onAddDelay, onRefresh }) {
   if (!trip) return null;
 
   const step = STATUS_FLOW.find((s) => s.key === trip.status);
-  const showEta = ETA_ACTIVE_STATUSES.includes(trip.status) && (departureTime || ['DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'].includes(trip.status));
+  const isArriving = trip.status === 'ARRIVING';
+  const showEta = ETA_ACTIVE_STATUSES.includes(trip.status) && ['DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'].includes(trip.status);
 
   return (
     <section className="bg-indigo-50 p-4 rounded-xl border-2 border-indigo-200" aria-label="Trip status control">
@@ -417,6 +460,8 @@ function StatusControlPanel({ trip, routeMinutes, departureTime, delayMinutes, e
           <p className="text-xs text-indigo-400 text-center mt-2">{step.actionHint}</p>
         </div>
       )}
+
+      {isArriving && <CompletionQrPanel van={trip.van} onRefresh={onRefresh} />}
 
       {ETA_ACTIVE_STATUSES.includes(trip.status) && trip.status !== 'BOARDING' && (
         <>
@@ -677,8 +722,6 @@ export default function DriverDashboard() {
 
         // 2. Fall back to computing speed from the distance/time between the
         //    last two accepted fixes, when the device doesn't give us one.
-        //    This is the same approach consumer trackers like Life360 use
-        //    when raw speed isn't available from the OS.
         if (resolvedSpeed === null && lastFixRef.current) {
           const dtSeconds = (timestamp - lastFixRef.current.timestamp) / 1000;
           if (dtSeconds >= MIN_DT_FOR_FALLBACK_SECONDS) {
@@ -689,7 +732,6 @@ export default function DriverDashboard() {
               const derivedSpeed = distanceMeters / dtSeconds;
               resolvedSpeed = derivedSpeed <= MAX_PLAUSIBLE_SPEED_MPS ? derivedSpeed : null;
             } else {
-              // Van hasn't moved meaningfully in this window — treat as stopped.
               resolvedSpeed = 0;
             }
           }
@@ -701,7 +743,7 @@ export default function DriverDashboard() {
           tripId: tripIdRef.current,
           lat,
           lng,
-          speed: resolvedSpeed,          // may legitimately be null (unknown)
+          speed: resolvedSpeed,
           accuracy: typeof accuracy === 'number' ? accuracy : null,
           heading: typeof position.coords.heading === 'number' ? position.coords.heading : null,
           timestamp,
@@ -727,7 +769,8 @@ export default function DriverDashboard() {
     );
   }, [clearWatch]);
 
-  // ── Status control: generic step-forward for the whole trip lifecycle ─────
+  // ── Status control: generic step-forward for Boarding/Departing/Departed ──
+  // (ARRIVING → COMPLETED happens via dispatcher QR scan, not this function.)
 
   const handleAdvanceStatus = useCallback(async (newStatus) => {
     if (!tripIdRef.current || !newStatus || statusUpdating) return;
@@ -741,17 +784,9 @@ export default function DriverDashboard() {
         setTrip((prev) => prev ? { ...prev, status: newStatus } : prev);
       }
 
-      // Start the ETA clock the first time the trip leaves Boarding.
       if (newStatus === 'DEPARTING' && !departureTime) {
         setDepartureTime(new Date());
         setDelayMinutes(0);
-      }
-
-      // Wrapping up: stop broadcasting location and pull a fresh trip list
-      // so the driver lands back on "ready for next trip" automatically.
-      if (newStatus === 'COMPLETED') {
-        stopLocationSharing();
-        fetchMyTrip();
       }
     } catch (err) {
       console.error('[DriverDashboard] status update error:', err);
@@ -760,7 +795,7 @@ export default function DriverDashboard() {
     } finally {
       setStatusUpdating(false);
     }
-  }, [statusUpdating, departureTime, stopLocationSharing, fetchMyTrip]);
+  }, [statusUpdating, departureTime]);
 
   const handleAddDelay = useCallback((minutes) => {
     setDelayMinutes((prev) => prev + minutes);
@@ -784,22 +819,12 @@ export default function DriverDashboard() {
   const handleLogout = useCallback(async () => {
     stopLocationSharing();
 
-    // Fire the logout request but never let it block clearing local
-    // credentials or redirecting — a slow/failed request shouldn't
-    // trap the user in a logged-in-looking state.
     try {
       await apiClient.post('/auth/logout');
     } catch (err) {
       console.warn('[DriverDashboard] logout request failed:', err);
     }
 
-    // Both keys must go. The Bearer token in localStorage is a second,
-    // independent credential from the cookie — clearing only the cookie
-    // isn't enough. And if `user` is left behind, Login.jsx's mount
-    // effect sees a stale saved user and immediately redirects straight
-    // back to /driver, which then fails to fetch (token is gone) and
-    // shows the "Failed to load your trip" error instead of the login
-    // screen.
     try {
       localStorage.removeItem('token');
       localStorage.removeItem('user');
@@ -873,6 +898,33 @@ export default function DriverDashboard() {
     return () => socket.off('disconnect', handleDisconnect);
   }, [gpsState, clearWatch]);
 
+  // Keep the socket connected while waiting for the dispatcher's completion
+  // scan, even if the driver isn't broadcasting GPS at that moment — this
+  // is what lets the "arrived" screen update itself the instant the QR
+  // code is scanned, with no manual refresh needed.
+  useEffect(() => {
+    if (trip?.status !== 'ARRIVING') return;
+    socket.connect();
+  }, [trip?.status]);
+
+  // Listen for the dispatcher's QR scan completing this trip in real time.
+  useEffect(() => {
+    const handleRemoteStatusChange = (payload) => {
+      if (!payload?.tripId || payload.tripId !== tripIdRef.current) return;
+      const updatedTrip = payload.trip;
+      if (!updatedTrip) return;
+
+      setTrip(updatedTrip);
+
+      if (updatedTrip.status === 'COMPLETED') {
+        stopLocationSharing();
+        fetchMyTrip();
+      }
+    };
+    socket.on('trip_status_changed', handleRemoteStatusChange);
+    return () => socket.off('trip_status_changed', handleRemoteStatusChange);
+  }, [stopLocationSharing, fetchMyTrip]);
+
   // ── render: loading ────────────────────────────────────────────────────────
 
   if (loading) {
@@ -937,13 +989,12 @@ export default function DriverDashboard() {
 
             <StatusControlPanel
               trip={trip}
-              routeMinutes={routeDurationMinutes}
-              departureTime={departureTime}
               delayMinutes={delayMinutes}
               eta={eta}
               statusUpdating={statusUpdating}
               onAdvance={handleAdvanceStatus}
               onAddDelay={handleAddDelay}
+              onRefresh={() => fetchMyTrip()}
             />
 
             {gpsError && gpsState !== GPS_STATE.IDLE && gpsState !== GPS_STATE.ERROR && (
