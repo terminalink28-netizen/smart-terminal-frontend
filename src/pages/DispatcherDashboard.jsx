@@ -125,6 +125,57 @@ function TripCard({ trip, liveData, isSelected, onClick }) {
   );
 }
 
+// ─── TerminalVanCard ──────────────────────────────────────────────────────────
+// Shows a van that is physically AT the terminal right now — either idle and
+// ready to be loaded, or already boarding passengers. Disappears from this
+// list the moment its trip moves to DEPARTING (see getTerminalVans backend).
+
+function TerminalVanCard({ entry }) {
+  const isBoarding = entry.terminalStatus === 'BOARDING';
+
+  return (
+    <div
+      className={`p-3 rounded-xl border ${
+        isBoarding
+          ? 'border-green-200 bg-green-50'
+          : 'border-slate-200 bg-white'
+      }`}
+    >
+      <div className="flex justify-between items-start gap-2">
+        <div className="min-w-0">
+          <div className="font-black text-slate-800 text-sm truncate">
+            {entry.driver?.name ?? 'No driver on file'}
+          </div>
+          <div className="text-xs font-bold text-emerald-700 uppercase tracking-widest mt-0.5">
+            {entry.plateNumber}
+          </div>
+        </div>
+        <span
+          className={`shrink-0 text-xs font-bold px-2 py-0.5 rounded border ${
+            isBoarding
+              ? 'bg-green-100 text-green-800 border-green-200'
+              : 'bg-slate-100 text-slate-600 border-slate-200'
+          }`}
+        >
+          {isBoarding ? 'Boarding' : 'Idle'}
+        </span>
+      </div>
+
+      {isBoarding && entry.trip?.routeName && (
+        <div className="text-xs text-slate-500 mt-2 pt-2 border-t border-green-100">
+          Route: <span className="font-semibold text-slate-700">{entry.trip.routeName}</span>
+        </div>
+      )}
+
+      {!isBoarding && (
+        <div className="text-xs text-slate-400 mt-2 pt-2 border-t border-slate-100">
+          Ready — waiting for driver to start a trip.
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ErrorState({ message, onRetry }) {
   return (
     <div className="h-screen flex items-center justify-center p-4 bg-gray-100">
@@ -235,6 +286,12 @@ export default function DispatcherDashboard() {
   const [selectedTripId, setSelectedTripId] = useState(null);
   const [reloadToken, setReloadToken]     = useState(0);
 
+  // Vans currently at the terminal (IDLE or BOARDING) — separate from
+  // activeTrips, since IDLE vans have no trip at all.
+  const [terminalVans, setTerminalVans]   = useState([]);
+  const [terminalLoading, setTerminalLoading] = useState(true);
+  const [terminalError, setTerminalError] = useState('');
+
   const [isScannerOpen, setIsScannerOpen] = useState(false);
   const [isCreateOpen, setIsCreateOpen]   = useState(false);
   const [successMessage, setSuccessMessage] = useState('');
@@ -262,21 +319,38 @@ export default function DispatcherDashboard() {
     }
   }, []);
 
+  const fetchTerminalVans = useCallback(async (signal) => {
+    try {
+      const response = await apiClient.get('/trips/terminal', { signal });
+      setTerminalVans(Array.isArray(response.data) ? response.data : []);
+      setTerminalError('');
+    } catch (err) {
+      if (err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') return;
+      setTerminalError('Could not load vans at the terminal.');
+      console.error('[DispatcherDashboard] fetchTerminalVans error:', err);
+    } finally {
+      setTerminalLoading(false);
+    }
+  }, []);
+
   // Set up 30-second polling fallback (Same as PublicTracker)
   useEffect(() => {
     const id = setInterval(() => {
       const ctrl = new AbortController();
       fetchActiveTrips(ctrl.signal);
+      fetchTerminalVans(ctrl.signal);
     }, REFETCH_INTERVAL_MS);
     return () => clearInterval(id);
-  }, [fetchActiveTrips]);
+  }, [fetchActiveTrips, fetchTerminalVans]);
 
   // ── WebSockets ─────────────────────────────────────────────────────────────
 
   useEffect(() => {
     const controller = new AbortController();
     setLoading(true);
+    setTerminalLoading(true);
     fetchActiveTrips(controller.signal);
+    fetchTerminalVans(controller.signal);
 
     const handleInitialLocations = (locationsArray = []) => {
       if (Array.isArray(locationsArray)) {
@@ -299,7 +373,10 @@ export default function DispatcherDashboard() {
       );
     };
 
-    // FIX: Safely remove trips when they are completed or cancelled
+    // FIX: Safely remove trips when they are completed or cancelled.
+    // Also refresh the terminal list here — a status change (BOARDING ->
+    // DEPARTING, or -> COMPLETED which frees the van back to IDLE) always
+    // means the terminal's set of "vans physically here" just changed.
     const handleTripStatusChanged = ({ tripId, status, trip }) => {
       if (!tripId) return;
       setActiveTrips((prev) => {
@@ -311,12 +388,16 @@ export default function DispatcherDashboard() {
         if (trip) return [trip, ...prev];
         return prev;
       });
+      fetchTerminalVans();
     };
 
-    // FIX: Instantly add new trips started by drivers
+    // FIX: Instantly add new trips started by drivers. A driver self-starting
+    // a trip means a van just went IDLE -> BOARDING — still at the terminal,
+    // so the terminal list needs a refresh too, not just activeTrips.
     const handleTripDispatched = ({ trip }) => {
       if (!trip?.id) return;
       setActiveTrips((prev) => (prev.some((t) => t.id === trip.id) ? prev : [trip, ...prev]));
+      fetchTerminalVans();
     };
 
     socket.connect();
@@ -340,7 +421,7 @@ export default function DispatcherDashboard() {
       socket.disconnect();
       if (successTimerRef.current) clearTimeout(successTimerRef.current);
     };
-  }, [fetchActiveTrips, reloadToken]);
+  }, [fetchActiveTrips, fetchTerminalVans, reloadToken]);
 
   // ── Callbacks ──────────────────────────────────────────────────────────────
 
@@ -350,10 +431,14 @@ export default function DispatcherDashboard() {
     successTimerRef.current = setTimeout(() => setSuccessMessage(''), SUCCESS_BANNER_TTL);
   }, []);
 
+  // A successful QR scan can move a trip all the way to COMPLETED (freeing
+  // the van to IDLE) — refresh both lists so the terminal panel picks up
+  // the van immediately instead of waiting for the next 30s poll.
   const handleScanSuccess = useCallback((result) => {
-  showSuccess(typeof result === 'string' ? result : 'QR scan successful.');
-  fetchActiveTrips();
-}, [fetchActiveTrips, showSuccess]);
+    showSuccess(typeof result === 'string' ? result : 'QR scan successful.');
+    fetchActiveTrips();
+    fetchTerminalVans();
+  }, [fetchActiveTrips, fetchTerminalVans, showSuccess]);
 
   const handleDepartureConfirm = useCallback(async ({ tripId, departureTime }) => {
     setIsDepartureSubmitting(true);
@@ -373,7 +458,8 @@ export default function DispatcherDashboard() {
   const handleCreateSuccess = useCallback((message) => {
     showSuccess(message);
     fetchActiveTrips();
-  }, [fetchActiveTrips, showSuccess]);
+    fetchTerminalVans();
+  }, [fetchActiveTrips, fetchTerminalVans, showSuccess]);
 
   const handleTripSelect = useCallback((tripId) => {
     setSelectedTripId((prev) => (prev === tripId ? null : tripId));
@@ -391,8 +477,13 @@ export default function DispatcherDashboard() {
     } catch (err) {
       console.error('[DispatcherDashboard] Logout error:', err);
     } finally {
+      // Both keys must go — ProtectedRoute and Login's redirect-if-logged-in
+      // effect both key off 'user', but the Bearer token in localStorage is
+      // a separate credential that also needs clearing (see the driver
+      // dashboard fix for the full explanation of this bug).
+      localStorage.removeItem('token');
       localStorage.removeItem('user');
-      navigate('/', { replace: true }); 
+      navigate('/login', { replace: true });
     }
   }, [navigate]);
 
@@ -505,31 +596,66 @@ const vanIcon = L.divIcon({
             <MetricCard label="Fleet Avg"    value={`${avgSpeedKph} km/h`} />
           </div>
 
-          <div className="flex-1 overflow-y-auto p-4 bg-slate-50">
-            <h2 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-3 flex justify-between">
-              Live Fleet Status
-              <span className="text-blue-500 font-bold">{activeTrips.length}</span>
-            </h2>
+          <div className="flex-1 overflow-y-auto p-4 bg-slate-50 space-y-6">
 
-            {activeTrips.length === 0 ? (
-              <div className="text-center py-12 border-2 border-dashed border-slate-200 rounded-2xl bg-white">
-                <span className="text-3xl mb-2 block">🅿️</span>
-                <p className="text-sm font-bold text-slate-600">Terminal is clear.</p>
-                <p className="text-xs text-slate-400 mt-1 font-medium">Wait for drivers to self-start or dispatch manually.</p>
-              </div>
-            ) : (
-              <div className="flex flex-col gap-3">
-                {activeTrips.map((trip) => (
-                  <TripCard
-                    key={trip.id}
-                    trip={trip}
-                    liveData={liveLocations[trip.id]}
-                    isSelected={selectedTripId === trip.id}
-                    onClick={() => handleTripSelect(trip.id)}
-                  />
-                ))}
-              </div>
-            )}
+            {/* ── At the Terminal ─────────────────────────────────────────── */}
+            <div>
+              <h2 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-3 flex justify-between items-center">
+                🅿️ At the Terminal
+                <span className="text-purple-500 font-bold">{terminalVans.length}</span>
+              </h2>
+
+              {terminalError && (
+                <div className="text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2 mb-2">
+                  {terminalError}
+                </div>
+              )}
+
+              {terminalLoading ? (
+                <div className="text-center py-8 border-2 border-dashed border-slate-200 rounded-2xl bg-white">
+                  <p className="text-xs font-semibold text-slate-400">Loading terminal status…</p>
+                </div>
+              ) : terminalVans.length === 0 ? (
+                <div className="text-center py-8 border-2 border-dashed border-slate-200 rounded-2xl bg-white">
+                  <span className="text-2xl mb-1 block">🚐</span>
+                  <p className="text-xs font-bold text-slate-500">No vans at the terminal right now.</p>
+                </div>
+              ) : (
+                <div className="flex flex-col gap-2">
+                  {terminalVans.map((entry) => (
+                    <TerminalVanCard key={entry.vanId} entry={entry} />
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* ── Live Fleet Status ────────────────────────────────────────── */}
+            <div>
+              <h2 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-3 flex justify-between">
+                Live Fleet Status
+                <span className="text-blue-500 font-bold">{activeTrips.length}</span>
+              </h2>
+
+              {activeTrips.length === 0 ? (
+                <div className="text-center py-12 border-2 border-dashed border-slate-200 rounded-2xl bg-white">
+                  <span className="text-3xl mb-2 block">🅿️</span>
+                  <p className="text-sm font-bold text-slate-600">Terminal is clear.</p>
+                  <p className="text-xs text-slate-400 mt-1 font-medium">Wait for drivers to self-start or dispatch manually.</p>
+                </div>
+              ) : (
+                <div className="flex flex-col gap-3">
+                  {activeTrips.map((trip) => (
+                    <TripCard
+                      key={trip.id}
+                      trip={trip}
+                      liveData={liveLocations[trip.id]}
+                      isSelected={selectedTripId === trip.id}
+                      onClick={() => handleTripSelect(trip.id)}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
         </aside>
 
