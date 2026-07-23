@@ -9,7 +9,19 @@ const GPS_OPTIONS = { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 };
 // GPS is only locked (disabled) when there is nothing to broadcast
 const GPS_LOCKED_STATUSES = ['SCHEDULED', 'COMPLETED', 'CANCELLED'];
 
-// Full state-machine status set from backend
+// Friendly, plain-language copy for each status — shown to the driver
+// instead of raw backend enum values like "ARRIVING".
+const STATUS_COPY = {
+  SCHEDULED:  { label: 'Scheduled',           icon: '🗓️' },
+  BOARDING:   { label: 'Boarding Passengers', icon: '🧍' },
+  DEPARTING:  { label: 'Preparing to Depart', icon: '🚦' },
+  DEPARTED:   { label: 'On the Road',         icon: '🚐' },
+  ARRIVING:   { label: 'Arriving Soon',       icon: '📍' },
+  DELAYED:    { label: 'Delayed',             icon: '⏱️' },
+  COMPLETED:  { label: 'Trip Completed',      icon: '✅' },
+  CANCELLED:  { label: 'Cancelled',           icon: '✕' },
+};
+
 const STATUS_STYLES = {
   BOARDING:   'bg-green-100  text-green-800  border border-green-200',
   DEPARTING:  'bg-amber-100  text-amber-800  border border-amber-200',
@@ -20,6 +32,15 @@ const STATUS_STYLES = {
   CANCELLED:  'bg-red-100    text-red-700    border border-red-200',
   SCHEDULED:  'bg-yellow-100 text-yellow-800 border border-yellow-200',
 };
+
+// The forward-moving trip lifecycle a driver walks through manually.
+// Each entry knows what button to show to advance to the *next* step.
+const STATUS_FLOW = [
+  { key: 'BOARDING',  next: 'DEPARTING', actionLabel: '🚦 Ready to Depart',      actionHint: 'Tap once all passengers are seated.' },
+  { key: 'DEPARTING', next: 'DEPARTED',  actionLabel: '🚐 Confirm Departure',    actionHint: "Tap the moment you actually pull out." },
+  { key: 'DEPARTED',  next: 'ARRIVING',  actionLabel: '📍 Approaching Terminal', actionHint: "Tap when you're close to Virac Terminal." },
+  { key: 'ARRIVING',  next: 'COMPLETED', actionLabel: '✅ Complete Trip',        actionHint: 'Tap once everyone has disembarked.' },
+];
 
 const MUNICIPALITIES = [
   { name: 'Bato',       minutes: 30,  emoji: '🏘️' },
@@ -77,14 +98,60 @@ function msToKmh(mps) {
   return Math.round(mps * 3.6);
 }
 
+function friendlyStatus(status) {
+  return STATUS_COPY[status] ?? { label: status ?? 'Unknown', icon: '•' };
+}
+
 // ─── sub-components ───────────────────────────────────────────────────────────
 
 function StatusBadge({ status }) {
   const cls = STATUS_STYLES[status] ?? 'bg-gray-100 text-gray-600 border border-gray-200';
+  const { label, icon } = friendlyStatus(status);
   return (
-    <span className={`inline-block text-xs font-bold uppercase tracking-wider px-2 py-0.5 rounded ${cls}`}>
-      {status}
+    <span className={`inline-flex items-center gap-1 text-xs font-bold uppercase tracking-wider px-2 py-0.5 rounded ${cls}`}>
+      <span aria-hidden="true">{icon}</span> {label}
     </span>
+  );
+}
+
+// A simple horizontal progress tracker so the driver can see, at a glance,
+// where they are in the trip and what's still ahead — like a delivery
+// tracking strip.
+function TripProgressStepper({ status }) {
+  const idx = STATUS_FLOW.findIndex((s) => s.key === status);
+  // While DELAYED, we don't know which leg they were on, so just show the
+  // stepper collapsed with a delay note instead of guessing a position.
+  if (idx === -1) return null;
+
+  return (
+    <div className="flex items-center" aria-label="Trip progress">
+      {STATUS_FLOW.map((step, i) => {
+        const isDone    = i < idx;
+        const isCurrent = i === idx;
+        const { icon } = friendlyStatus(step.key);
+        return (
+          <div key={step.key} className="flex items-center flex-1 last:flex-none">
+            <div className="flex flex-col items-center gap-1">
+              <div
+                className={`w-8 h-8 rounded-full flex items-center justify-center text-sm border-2 transition-colors ${
+                  isDone
+                    ? 'bg-green-500 border-green-500 text-white'
+                    : isCurrent
+                    ? 'bg-blue-600 border-blue-600 text-white shadow-md'
+                    : 'bg-white border-gray-200 text-gray-300'
+                }`}
+                aria-current={isCurrent ? 'step' : undefined}
+              >
+                {isDone ? '✓' : icon}
+              </div>
+            </div>
+            {i < STATUS_FLOW.length - 1 && (
+              <div className={`flex-1 h-1 mx-1 rounded-full ${isDone ? 'bg-green-500' : 'bg-gray-200'}`} />
+            )}
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
@@ -130,9 +197,12 @@ function TripManifest({ trip, eta, delayMinutes }) {
 
   return (
     <section className="bg-slate-50 p-4 rounded-xl border border-slate-200">
-      <h2 className="text-sm font-bold text-slate-700 uppercase tracking-wider mb-3 border-b border-slate-200 pb-2">
-        Trip manifest
-      </h2>
+      <div className="flex items-center justify-between mb-3 border-b border-slate-200 pb-2">
+        <h2 className="text-sm font-bold text-slate-700 uppercase tracking-wider">Trip manifest</h2>
+        <span className="text-xs font-semibold text-slate-500">
+          {origin} <span className="text-slate-300 mx-1">→</span> {trip.route?.destination ?? DESTINATION}
+        </span>
+      </div>
       <dl className="grid grid-cols-2 gap-y-3 text-sm">
         {fields.map(({ label, value }) => (
           <>
@@ -177,60 +247,94 @@ function BoardingPanel({ seatCounts, onDecrTotal, onIncrTotal, onDecrAvail, onIn
   );
 }
 
-function GpsButton({ trip, gpsState, lastCoords, onStart, onStop }) {
+// ── LiveTrackingCard ────────────────────────────────────────────────────────
+// A Life360-style live tracking card: big current-speed readout, a pulsing
+// "live" indicator, and a small stat row for peak speed / GPS accuracy.
+
+function LiveTrackingCard({ trip, gpsState, gpsError, lastCoords, maxSpeedKmh, onStart, onStop }) {
   const isLocked = !trip || GPS_LOCKED_STATUSES.includes(trip.status);
 
   if (isLocked) {
     return (
-      <button disabled aria-disabled="true"
-        className="w-full bg-gray-100 text-gray-400 font-semibold py-4 px-4 rounded-xl border border-gray-300 cursor-not-allowed text-center text-sm">
-        GPS unavailable — status: {trip?.status ?? 'no trip'}
-      </button>
+      <section className="bg-gray-50 border border-gray-200 rounded-xl p-5 text-center">
+        <p className="text-sm font-semibold text-gray-400">📡 Live tracking unavailable</p>
+        <p className="text-xs text-gray-400 mt-1">
+          {trip ? `Trip status is "${friendlyStatus(trip.status).label}."` : 'No active trip yet.'}
+        </p>
+      </section>
     );
   }
 
   if (gpsState === GPS_STATE.ACQUIRING) {
     return (
-      <button disabled aria-disabled="true" aria-label="Acquiring GPS signal"
-        className="w-full bg-blue-400 text-white font-bold py-4 px-4 rounded-xl shadow-lg flex justify-center items-center gap-3 cursor-wait">
-        <span className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" aria-hidden="true" />
-        Acquiring GPS signal…
-      </button>
+      <section className="bg-blue-50 border border-blue-200 rounded-xl p-6 text-center">
+        <div className="w-10 h-10 mx-auto border-4 border-blue-500 border-t-transparent rounded-full animate-spin mb-3" role="status" />
+        <p className="text-sm font-bold text-blue-800">Finding your GPS signal…</p>
+        <p className="text-xs text-blue-400 mt-1">This can take a few seconds outdoors, longer indoors.</p>
+      </section>
     );
   }
 
   if (gpsState === GPS_STATE.LIVE) {
     const kmh = msToKmh(lastCoords?.speed);
     return (
-      <div className="flex flex-col gap-2">
-        <button onClick={onStop} aria-label="Stop sharing GPS location"
-          className="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-4 px-4 rounded-xl shadow-lg flex justify-center items-center gap-2 transition-colors active:scale-[0.98]">
-          <span className="w-3 h-3 bg-white rounded-full animate-pulse" aria-hidden="true" />
-          Stop sharing location
-        </button>
+      <section className="bg-gradient-to-br from-blue-600 to-indigo-700 rounded-2xl p-6 text-white shadow-lg" aria-label="Live speed tracking">
+        <div className="flex items-center justify-center gap-2 mb-1">
+          <span className="w-2.5 h-2.5 bg-green-400 rounded-full animate-pulse" aria-hidden="true" />
+          <span className="text-xs font-bold uppercase tracking-widest text-blue-100">Live tracking active</span>
+        </div>
+
+        <div className="text-center my-4">
+          <span className="text-7xl font-black tabular-nums leading-none">
+            {kmh === null ? '—' : kmh}
+          </span>
+          <span className="text-lg font-bold text-blue-200 ml-2">km/h</span>
+        </div>
+
+        <div className="grid grid-cols-2 gap-3 text-center mb-5">
+          <div className="bg-white/10 rounded-lg py-2">
+            <p className="text-[11px] uppercase tracking-wide text-blue-200 font-semibold">Peak speed</p>
+            <p className="text-xl font-black tabular-nums">{maxSpeedKmh} <span className="text-xs font-semibold">km/h</span></p>
+          </div>
+          <div className="bg-white/10 rounded-lg py-2">
+            <p className="text-[11px] uppercase tracking-wide text-blue-200 font-semibold">GPS accuracy</p>
+            <p className="text-xl font-black tabular-nums">
+              {lastCoords?.accuracy != null ? `±${Math.round(lastCoords.accuracy)}m` : '—'}
+            </p>
+          </div>
+        </div>
+
         {lastCoords && (
-          <p className="text-xs text-center text-green-600 font-medium">
-            📡 Live · {lastCoords.lat.toFixed(5)}, {lastCoords.lng.toFixed(5)}
-            {lastCoords.accuracy != null && (
-              <span className="text-gray-400 ml-1">(±{Math.round(lastCoords.accuracy)}m)</span>
-            )}
-            {' · '}
-            {kmh === null ? (
-              <span className="text-gray-400">speed unavailable</span>
-            ) : (
-              <span className="font-bold">{kmh} km/h</span>
-            )}
+          <p className="text-[11px] text-center text-blue-200 font-mono mb-4">
+            {lastCoords.lat.toFixed(5)}, {lastCoords.lng.toFixed(5)}
           </p>
         )}
-      </div>
+
+        <button onClick={onStop} aria-label="Stop sharing GPS location"
+          className="w-full bg-white/15 hover:bg-white/25 text-white font-bold py-3 px-4 rounded-xl transition-colors active:scale-[0.98] border border-white/20">
+          Stop sharing location
+        </button>
+      </section>
     );
   }
 
+  // IDLE or ERROR
   return (
-    <button onClick={onStart} aria-label="Share live GPS location"
-      className="w-full bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-bold text-base py-4 px-4 rounded-xl shadow-lg border-b-4 border-blue-800 transition-colors active:border-b-0 active:translate-y-0.5">
-      📍 Share live location
-    </button>
+    <section className="bg-white border-2 border-dashed border-blue-200 rounded-xl p-5 text-center">
+      <p className="text-3xl mb-2" aria-hidden="true">📍</p>
+      <p className="text-sm font-bold text-gray-800 mb-1">Share your live location</p>
+      <p className="text-xs text-gray-500 mb-4">Passengers and dispatch will see your position and speed in real time — just like a delivery tracker.</p>
+      {gpsError && (
+        <div role="alert" className="flex items-start gap-2 text-sm text-red-700 bg-red-50 border border-red-200 p-3 rounded-xl mb-4 text-left">
+          <span className="text-base leading-none mt-0.5" aria-hidden="true">⚠️</span>
+          <span className="font-medium">{gpsError}</span>
+        </div>
+      )}
+      <button onClick={onStart} aria-label="Share live GPS location"
+        className="w-full bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-bold text-base py-4 px-4 rounded-xl shadow-lg border-b-4 border-blue-800 transition-colors active:border-b-0 active:translate-y-0.5">
+        📍 Share live location
+      </button>
+    </section>
   );
 }
 
@@ -260,66 +364,79 @@ function ETACountdown({ eta }) {
   );
 }
 
-// ─── ETAPanel ─────────────────────────────────────────────────────────────────
+// ── StatusControlPanel ──────────────────────────────────────────────────────
+// Replaces the old single-purpose "I've departed" button with a generic
+// step-forward control that works for every leg of the trip: Boarding →
+// Departing → Departed → Arriving → Completed.
 
-function ETAPanel({ trip, routeMinutes, departureTime, delayMinutes, eta, onMarkDeparted, onAddDelay }) {
-  if (!trip || !ETA_ACTIVE_STATUSES.includes(trip.status)) return null;
+function StatusControlPanel({ trip, routeMinutes, departureTime, delayMinutes, eta, statusUpdating, onAdvance, onAddDelay }) {
+  if (!trip) return null;
 
-  const isEnRoute = ['DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'].includes(trip.status);
-
-  if (!departureTime && !isEnRoute) {
-    return (
-      <section className="bg-indigo-50 p-4 rounded-xl border border-indigo-200" aria-label="Departure control">
-        <h2 className="text-sm font-bold text-indigo-900 uppercase tracking-wider mb-2 text-center">Ready to Depart?</h2>
-        <p className="text-xs text-indigo-500 text-center mb-4">
-          Estimated travel time to Virac: <strong>{routeMinutes} min</strong>
-        </p>
-        <button onClick={onMarkDeparted}
-          className="w-full bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white font-bold py-3 px-4 rounded-xl shadow-sm transition-colors active:scale-[0.98] border-b-4 border-indigo-800 active:border-b-0 active:translate-y-0.5"
-          aria-label="Mark van as departed and advance status to DEPARTING">
-          🚐 I've Departed — Start ETA
-        </button>
-        <p className="text-xs text-indigo-400 text-center mt-2">
-          Tap once you leave the loading area. Status changes to Departing and passengers see your ETA.
-        </p>
-      </section>
-    );
-  }
-
-  const departureStr = departureTime
-    ? departureTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    : '—';
+  const step = STATUS_FLOW.find((s) => s.key === trip.status);
+  const showEta = ETA_ACTIVE_STATUSES.includes(trip.status) && (departureTime || ['DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'].includes(trip.status));
 
   return (
-    <section className="bg-indigo-50 p-4 rounded-xl border-2 border-indigo-300" aria-label="Expected arrival time">
-      <h2 className="text-sm font-bold text-indigo-900 uppercase tracking-wider mb-3 text-center">
-        Expected Arrival · Virac Terminal
-      </h2>
-      <div className="text-center mb-3">
-        <p className="text-5xl font-black text-indigo-800 tabular-nums leading-none">
-          {eta ? eta.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—'}
-        </p>
-        <p className="text-xs text-indigo-500 mt-1.5">
-          Departed {departureStr}
-          {delayMinutes > 0 && <span className="text-amber-600 font-bold ml-1.5">(+{delayMinutes} min delay)</span>}
-        </p>
-        <ETACountdown eta={eta} />
+    <section className="bg-indigo-50 p-4 rounded-xl border-2 border-indigo-200" aria-label="Trip status control">
+      <h2 className="text-sm font-bold text-indigo-900 uppercase tracking-wider mb-4 text-center">Trip status</h2>
+
+      <div className="mb-5 px-1">
+        <TripProgressStepper status={trip.status} />
       </div>
-      <hr className="border-indigo-200 my-3" />
-      <div>
-        <p className="text-xs text-indigo-600 font-semibold text-center mb-2">Report a delay:</p>
-        <div className="flex gap-2 justify-center" role="group" aria-label="Add delay minutes">
-          {DELAY_OPTIONS.map((mins) => (
-            <button key={mins} onClick={() => onAddDelay(mins)} aria-label={`Add ${mins} minute delay`}
-              className="px-3 py-1.5 bg-amber-100 hover:bg-amber-200 active:bg-amber-300 text-amber-800 text-xs font-bold rounded-lg border border-amber-300 transition-colors active:scale-95">
-              +{mins}m
-            </button>
-          ))}
+
+      {trip.status === 'DELAYED' && (
+        <div className="bg-orange-50 border border-orange-200 rounded-lg p-3 text-center text-sm text-orange-800 font-semibold mb-4">
+          ⏱️ Trip marked as delayed. Use the buttons below to report further delay, or contact your dispatcher to resume.
         </div>
-        <p className="text-xs text-indigo-400 text-center mt-2">
-          Delay is added to your ETA and shown to all passengers in real-time.
-        </p>
-      </div>
+      )}
+
+      {showEta && (
+        <div className="text-center mb-4">
+          <p className="text-xs text-indigo-500 mb-0.5">Estimated arrival · Virac Terminal</p>
+          <p className="text-4xl font-black text-indigo-800 tabular-nums leading-none">
+            {eta ? eta.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—'}
+          </p>
+          {delayMinutes > 0 && (
+            <p className="text-xs text-amber-600 font-bold mt-1">+{delayMinutes} min delay added</p>
+          )}
+          <ETACountdown eta={eta} />
+        </div>
+      )}
+
+      {step && (
+        <div className="mb-2">
+          <button onClick={() => onAdvance(step.next)} disabled={statusUpdating}
+            className="w-full bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white font-bold py-4 px-4 rounded-xl shadow-sm transition-colors active:scale-[0.98] border-b-4 border-indigo-800 active:border-b-0 active:translate-y-0.5 disabled:opacity-60 disabled:cursor-not-allowed"
+            aria-label={`Advance trip status to ${friendlyStatus(step.next).label}`}>
+            {statusUpdating ? (
+              <span className="flex items-center justify-center gap-2">
+                <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                Updating…
+              </span>
+            ) : step.actionLabel}
+          </button>
+          <p className="text-xs text-indigo-400 text-center mt-2">{step.actionHint}</p>
+        </div>
+      )}
+
+      {ETA_ACTIVE_STATUSES.includes(trip.status) && trip.status !== 'BOARDING' && (
+        <>
+          <hr className="border-indigo-200 my-3" />
+          <div>
+            <p className="text-xs text-indigo-600 font-semibold text-center mb-2">Running behind? Report a delay:</p>
+            <div className="flex gap-2 justify-center" role="group" aria-label="Add delay minutes">
+              {DELAY_OPTIONS.map((mins) => (
+                <button key={mins} onClick={() => onAddDelay(mins)} aria-label={`Add ${mins} minute delay`}
+                  className="px-3 py-1.5 bg-amber-100 hover:bg-amber-200 active:bg-amber-300 text-amber-800 text-xs font-bold rounded-lg border border-amber-300 transition-colors active:scale-95">
+                  +{mins}m
+                </button>
+              ))}
+            </div>
+            <p className="text-xs text-indigo-400 text-center mt-2">
+              Delay is added to your ETA and shown to all passengers in real-time.
+            </p>
+          </div>
+        </>
+      )}
     </section>
   );
 }
@@ -459,6 +576,7 @@ export default function DriverDashboard() {
   const [gpsState, setGpsState]           = useState(GPS_STATE.IDLE);
   const [gpsError, setGpsError]           = useState('');
   const [lastCoords, setLastCoords]       = useState(null);
+  const [maxSpeedKmh, setMaxSpeedKmh]     = useState(0);
   const [seatCounts, setSeatCounts]       = useState({ total: 14, available: 14 });
   const [departureTime, setDepartureTime] = useState(null);
   const [delayMinutes, setDelayMinutes]   = useState(0);
@@ -542,6 +660,7 @@ export default function DriverDashboard() {
 
     setGpsError('');
     setGpsState(GPS_STATE.ACQUIRING);
+    setMaxSpeedKmh(0);
     lastFixRef.current = null;
     socket.connect();
 
@@ -591,6 +710,11 @@ export default function DriverDashboard() {
         setLastCoords({ lat, lng, accuracy, speed: resolvedSpeed });
         setGpsState(GPS_STATE.LIVE);
         setGpsError('');
+
+        const kmh = msToKmh(resolvedSpeed);
+        if (kmh !== null) {
+          setMaxSpeedKmh((prev) => Math.max(prev, kmh));
+        }
       },
       (err) => {
         console.error('[DriverDashboard] geolocation error:', err);
@@ -603,31 +727,40 @@ export default function DriverDashboard() {
     );
   }, [clearWatch]);
 
-  // ── Departure: advance status + start local ETA ────────────────────────────
+  // ── Status control: generic step-forward for the whole trip lifecycle ─────
 
-  const handleMarkDeparted = useCallback(async () => {
-    if (!tripIdRef.current || statusUpdating) return;
+  const handleAdvanceStatus = useCallback(async (newStatus) => {
+    if (!tripIdRef.current || !newStatus || statusUpdating) return;
     setStatusUpdating(true);
     try {
-      const response = await apiClient.patch(`/trips/${tripIdRef.current}/status`, {
-        newStatus: 'DEPARTING',
-      });
+      const response = await apiClient.patch(`/trips/${tripIdRef.current}/status`, { newStatus });
       const updatedTrip = response.data?.trip ?? response.data;
       if (updatedTrip?.id) {
         setTrip(updatedTrip);
       } else {
-        setTrip((prev) => prev ? { ...prev, status: 'DEPARTING' } : prev);
+        setTrip((prev) => prev ? { ...prev, status: newStatus } : prev);
       }
-      setDepartureTime(new Date());
-      setDelayMinutes(0);
+
+      // Start the ETA clock the first time the trip leaves Boarding.
+      if (newStatus === 'DEPARTING' && !departureTime) {
+        setDepartureTime(new Date());
+        setDelayMinutes(0);
+      }
+
+      // Wrapping up: stop broadcasting location and pull a fresh trip list
+      // so the driver lands back on "ready for next trip" automatically.
+      if (newStatus === 'COMPLETED') {
+        stopLocationSharing();
+        fetchMyTrip();
+      }
     } catch (err) {
-      console.error('[DriverDashboard] mark departed error:', err);
+      console.error('[DriverDashboard] status update error:', err);
       const msg = err?.response?.data?.error ?? err?.response?.data?.message ?? 'Could not update trip status. Try again.';
       setGpsError(msg);
     } finally {
       setStatusUpdating(false);
     }
-  }, [statusUpdating]);
+  }, [statusUpdating, departureTime, stopLocationSharing, fetchMyTrip]);
 
   const handleAddDelay = useCallback((minutes) => {
     setDelayMinutes((prev) => prev + minutes);
@@ -688,6 +821,7 @@ export default function DriverDashboard() {
     setGpsState(GPS_STATE.IDLE);
     setGpsError('');
     setLastCoords(null);
+    setMaxSpeedKmh(0);
     lastFixRef.current = null;
     const capacity = newTrip?.van?.capacity ?? 14;
     setSeatCounts({ total: capacity, available: capacity });
@@ -773,7 +907,9 @@ export default function DriverDashboard() {
         <header className="flex justify-between items-center border-b border-gray-100 pb-4">
           <div>
             <h1 className="text-2xl font-black text-gray-900 leading-tight">Driver portal</h1>
-            <p className="text-xs text-gray-400 mt-0.5">Secure live tracking</p>
+            <p className="text-xs text-gray-400 mt-0.5">
+              {trip ? `Hi ${trip.driver?.name ?? 'there'} — here's your trip` : 'Secure live tracking'}
+            </p>
           </div>
           <button onClick={handleLogout}
             className="text-sm font-semibold text-red-600 bg-red-50 hover:bg-red-100 px-3 py-1.5 rounded-lg transition-colors"
@@ -799,24 +935,18 @@ export default function DriverDashboard() {
               />
             )}
 
-            <ETAPanel
+            <StatusControlPanel
               trip={trip}
               routeMinutes={routeDurationMinutes}
               departureTime={departureTime}
               delayMinutes={delayMinutes}
               eta={eta}
-              onMarkDeparted={handleMarkDeparted}
+              statusUpdating={statusUpdating}
+              onAdvance={handleAdvanceStatus}
               onAddDelay={handleAddDelay}
             />
 
-            {statusUpdating && (
-              <div className="flex items-center gap-2 text-xs text-indigo-600 font-medium justify-center">
-                <span className="w-3 h-3 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin" />
-                Updating trip status…
-              </div>
-            )}
-
-            {gpsError && (
+            {gpsError && gpsState !== GPS_STATE.IDLE && gpsState !== GPS_STATE.ERROR && (
               <div role="alert" className="flex items-start gap-2 text-sm text-red-700 bg-red-50 border border-red-200 p-3 rounded-xl">
                 <span className="text-base leading-none mt-0.5" aria-hidden="true">⚠️</span>
                 <span className="font-medium">{gpsError}</span>
@@ -824,10 +954,12 @@ export default function DriverDashboard() {
             )}
 
             <div className="mt-auto pt-2">
-              <GpsButton
+              <LiveTrackingCard
                 trip={trip}
                 gpsState={gpsState}
+                gpsError={gpsError}
                 lastCoords={lastCoords}
+                maxSpeedKmh={maxSpeedKmh}
                 onStart={startLocationSharing}
                 onStop={stopLocationSharing}
               />
