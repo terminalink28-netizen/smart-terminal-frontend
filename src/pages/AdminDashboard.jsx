@@ -935,7 +935,7 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
     if (!form.status) e.status = 'Status is required.';
 
     if (!isEdit) {
-      if (!form.driverName.trim()) e.driverName = 'Username is required.';
+      if (!form.driverName.trim()) e.driverName = "Driver's full name is required.";
       if (!form.driverPassword) e.driverPassword = 'A PIN is required.';
       else if (form.driverPassword.length < PASSWORD_MIN) e.driverPassword = `PIN must be at least ${PASSWORD_MIN} characters.`;
     }
@@ -1013,8 +1013,8 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
                 along with the PIN below. You'll also get a scannable QR code for this van at the same time.
               </p>
               <div className="space-y-4">
-                <Field label="Username" required error={errors.driverName}>
-                  <input name="driverName" type="text" value={form.driverName} onChange={change} placeholder="e.g. juandelacruz" autoComplete="off" maxLength={60} className={inputCls(errors.driverName)} />
+                <Field label="Driver's Full Name" required error={errors.driverName}>
+                  <input name="driverName" type="text" value={form.driverName} onChange={change} placeholder="e.g. Juan dela Cruz" autoComplete="off" maxLength={60} className={inputCls(errors.driverName)} />
                 </Field>
                 <Field
                   label="Driver PIN"
