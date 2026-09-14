@@ -11,19 +11,23 @@ const EMPTY_DATA = {
 };
 
 const EMPTY_STAFF_FORM = { name: '', email: '', role: '', driverId: '', password: '' };
-// Added driver fields for combined registration
-const EMPTY_VAN_FORM   = { plateNumber: '', capacity: '', status: 'IDLE', driverName: '', driverPin: '' };
+// Van form now uses a full password for the driver (not a 4-digit PIN label).
+const EMPTY_VAN_FORM   = { plateNumber: '', capacity: '', status: 'IDLE', driverName: '', driverPassword: '' };
 
 const VAN_STATUSES = ['IDLE', 'DISPATCHED', 'MAINTENANCE', 'OUT_OF_SERVICE'];
 
 const AUDIT_STORAGE_KEY = 'terminalink_admin_audit_history_v1';
-const AUDIT_REFRESH_MS  = 24 * 60 * 60 * 1000; 
-const AUDIT_MAX_STORED  = 5000;                
-const AUDIT_PAGE_SIZE   = 50;                  
+const AUDIT_REFRESH_MS  = 24 * 60 * 60 * 1000;
+const AUDIT_MAX_STORED  = 5000;
+const AUDIT_PAGE_SIZE   = 50;
 
 const EMAIL_RE     = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DRIVER_ID_RE = /^DRV-\d{3,}$/i;
 const PLATE_RE     = /^[A-Z0-9\- ]{4,15}$/i;
+
+// Minimum password length. The random generator produces 4–8 char numeric
+// passwords, so this must be 4 or lower for generated values to pass.
+const PASSWORD_MIN = 4;
 
 const inputCls = (hasError) =>
   `w-full px-3 py-2 border rounded-lg text-sm focus:outline-none focus:ring-2
@@ -57,7 +61,7 @@ function describeApiError(err, fallback) {
 
 const handleAuthFailure = (err) => {
   if (err?.response?.status === 401 || err?.response?.status === 403) {
-    localStorage.removeItem('user'); 
+    localStorage.removeItem('user');
     window.location.replace('/login');
     return true;
   }
@@ -78,6 +82,66 @@ function extractDriverId(responseData) {
   );
 }
 
+// ─── Random Password Generator ────────────────────────────────────────────────
+// Produces a numeric password 4–8 digits long, retrying if it lands on a
+// well-known weak pattern. See WEAK_PASSWORD_PATTERNS below.
+
+const WEAK_PASSWORD_PATTERNS = new Set([
+  // Repeated single digit (0000, 1111, 2222 …)
+  '0000','1111','2222','3333','4444','5555','6666','7777','8888','9999',
+  '00000','11111','22222','33333','44444','55555','66666','77777','88888','99999',
+  '000000','111111','222222','333333','444444','555555','666666','777777','888888','999999',
+  '0000000','1111111','2222222','3333333','4444444','5555555','6666666','7777777','8888888','9999999',
+  '00000000','11111111','22222222','33333333','44444444','55555555','66666666','77777777','88888888','99999999',
+  // Sequential ascending / descending
+  '0123','1234','2345','3456','4567','5678','6789',
+  '3210','4321','5432','6543','7654','8765','9876',
+  '01234','12345','23456','34567','45678','56789',
+  '43210','54321','65432','76543','87654','98765',
+  '012345','123456','234567','345678','456789',
+  '543210','654321','765432','876543','987654',
+  '0123456','1234567','2345678','3456789',
+  '6543210','7654321','8765432','9876543',
+  '01234567','12345678','23456789',
+  '76543210','87654321','98765432',
+  // Common repeated-pattern PINs
+  '1212','2121','1122','2211','1010','0101',
+  '123123','112233','121212','696969','101010',
+  '12341234','12121212','11112222',
+]);
+
+function isWeakPassword(pw) {
+  if (!pw) return true;
+  // All characters identical (e.g. 77777)
+  if (/^(.)\1+$/.test(pw)) return true;
+  // Direct match against the known-weak list
+  if (WEAK_PASSWORD_PATTERNS.has(pw)) return true;
+  // Pure digits that form a straight ascending or descending run (1234, 9876)
+  if (/^\d+$/.test(pw)) {
+    const digits = pw.split('').map(Number);
+    let asc = true, desc = true;
+    for (let i = 1; i < digits.length; i++) {
+      if (digits[i] !== digits[i - 1] + 1) asc = false;
+      if (digits[i] !== digits[i - 1] - 1) desc = false;
+    }
+    if (asc || desc) return true;
+  }
+  return false;
+}
+
+// Generates a 4–8 digit numeric password that isn't a weak/obvious pattern.
+function generateRandomPassword(minLen = 4, maxLen = 8) {
+  const len = Math.floor(Math.random() * (maxLen - minLen + 1)) + minLen;
+  let pw = '';
+  let attempts = 0;
+  do {
+    pw = '';
+    for (let i = 0; i < len; i++) pw += Math.floor(Math.random() * 10);
+    attempts++;
+  } while (isWeakPassword(pw) && attempts < 200);
+  return pw;
+}
+
 // ─── AdminDashboard ───────────────────────────────────────────────────────────
 
 export default function AdminDashboard() {
@@ -87,17 +151,17 @@ export default function AdminDashboard() {
   const [reloadToken, setReloadToken] = useState(0);
   const [loggingOut, setLoggingOut] = useState(false);
 
-  const [staffModal, setStaffModal] = useState(null); 
+  const [staffModal, setStaffModal] = useState(null);
   const [mutationLoading, setMutationLoading] = useState(false);
   const [mutationError, setMutationError]     = useState('');
   const [togglingId, setTogglingId]           = useState(null);
 
-  const [vanModal, setVanModal]         = useState(null); 
+  const [vanModal, setVanModal]         = useState(null);
   const [vanMutationLoading, setVanMutationLoading] = useState(false);
   const [vanMutationError, setVanMutationError]     = useState('');
 
   // Shown right after a van + driver is created, so the admin can copy
-  // down the driver's login ID, PIN, and van QR token before it's gone.
+  // down the driver's login ID, password, and van QR token before it's gone.
   const [driverCredentials, setDriverCredentials] = useState(null);
 
   // Lets the admin re-open an existing van's QR token later, not just
@@ -106,8 +170,12 @@ export default function AdminDashboard() {
 
   const [pendingDelete, setPendingDelete] = useState(null);
 
-  const [toast, setToast] = useState(null); 
+  const [toast, setToast] = useState(null);
   const toastTimer = useRef(null);
+
+  // Lightweight search filters for the two tables.
+  const [vanSearch, setVanSearch]     = useState('');
+  const [staffSearch, setStaffSearch] = useState('');
 
   const [isAuditOpen, setIsAuditOpen]     = useState(false);
   const [auditLogs, setAuditLogs]         = useState([]);
@@ -119,7 +187,7 @@ export default function AdminDashboard() {
   const [auditDateTo, setAuditDateTo]     = useState('');
   const [auditVisible, setAuditVisible]   = useState(AUDIT_PAGE_SIZE);
   const [lastAuditSync, setLastAuditSync] = useState(null);
-  const lastAuditSyncRef = useRef(null);   
+  const lastAuditSyncRef = useRef(null);
 
   const showToast = useCallback((type, message) => {
     clearTimeout(toastTimer.current);
@@ -224,7 +292,7 @@ export default function AdminDashboard() {
       console.error('Logout request failed, logging out locally anyway:', err);
     } finally {
       localStorage.removeItem('token');
-      localStorage.removeItem('user'); 
+      localStorage.removeItem('user');
       try { localStorage.removeItem(AUDIT_STORAGE_KEY); } catch (err) { console.error(err); }
       window.location.replace('/login');
     }
@@ -267,7 +335,7 @@ export default function AdminDashboard() {
       setStaffModal(null);
       setReloadToken((n) => n + 1);
     } catch (err) {
-      if (handleAuthFailure(err)) return; 
+      if (handleAuthFailure(err)) return;
       console.error('Failed to save staff account:', err);
       setMutationError(describeApiError(err, 'Failed to save this account. Please check the details and try again.'));
     } finally {
@@ -287,25 +355,26 @@ export default function AdminDashboard() {
         const { data: res } = await apiClient.post('/admin/vans', formData);
         const driverId = extractDriverId(res);
 
-        showToast('success', `${formData.plateNumber} and driver have been successfully registered.`);
+        showToast('success', `${formData.plateNumber} and its driver have been successfully registered.`);
         setVanModal(null);
 
         // Surface the driver's login credentials AND the van's QR token
-        // right away — the PIN is hashed server-side after this and can't
-        // be recovered later, and this is the most convenient moment to
-        // grab the QR too (though it can also be viewed later from the
+        // right away — the password is hashed server-side after this and
+        // can't be recovered later, and this is the most convenient moment
+        // to grab the QR too (though it can also be viewed later from the
         // vans table via the "QR" button).
         setDriverCredentials({
           plateNumber: formData.plateNumber,
           driverName: formData.driverName,
           driverId,
-          pin: formData.driverPin,
+          // `formData.driverPin` is the wire-format field name the API expects.
+          password: formData.driverPin,
           qrToken: res?.qrToken ?? null,
         });
       }
       setReloadToken((n) => n + 1);
     } catch (err) {
-      if (handleAuthFailure(err)) return; 
+      if (handleAuthFailure(err)) return;
       console.error('Failed to save van:', err);
       setVanMutationError(describeApiError(err, 'Failed to save this van. Please check the details and try again.'));
     } finally {
@@ -323,9 +392,9 @@ export default function AdminDashboard() {
       setData((prev) => isVan ? { ...prev, vans: prev.vans.filter((v) => v.id !== pendingDelete.id) } : { ...prev, staff: prev.staff.filter((u) => u.id !== pendingDelete.id) });
       showToast('success', isVan ? `${pendingDelete.label} has been removed from the vans list.` : `${pendingDelete.label}'s account has been permanently removed.`);
       setPendingDelete(null);
-      setReloadToken((n) => n + 1); 
+      setReloadToken((n) => n + 1);
     } catch (err) {
-      if (handleAuthFailure(err)) return; 
+      if (handleAuthFailure(err)) return;
       console.error(`Failed to delete ${isVan ? 'van' : 'user'}:`, err);
       const message = describeApiError(err, `Could not delete ${isVan ? 'this van' : 'this account'}. The server rejected the request.`);
       isVan ? setVanMutationError(message) : setMutationError(message);
@@ -335,7 +404,7 @@ export default function AdminDashboard() {
   }, [pendingDelete, showToast]);
 
   const handleToggleActive = useCallback(async (user) => {
-    if (togglingId !== null) return; 
+    if (togglingId !== null) return;
     setTogglingId(user.id);
     const next = !user.isActive;
     try {
@@ -343,7 +412,7 @@ export default function AdminDashboard() {
       setData((prev) => ({ ...prev, staff: prev.staff.map((u) => u.id === user.id ? { ...u, isActive: next } : u) }));
       showToast('success', `${user.name ?? 'User'} has been ${next ? 'activated' : 'deactivated'}.`);
     } catch (err) {
-      if (handleAuthFailure(err)) return; 
+      if (handleAuthFailure(err)) return;
       console.error('Failed to toggle user active status:', err);
       showToast('error', describeApiError(err, `Could not update ${user.name ?? 'this user'}'s status. Please try again.`));
     } finally {
@@ -351,6 +420,33 @@ export default function AdminDashboard() {
     }
   }, [togglingId, showToast]);
 
+  // ── Table search filters ──────────────────────────────────────────────────
+  const filteredVans = useMemo(() => {
+    const q = vanSearch.trim().toLowerCase();
+    if (!q) return data.vans;
+    return data.vans.filter((van) => {
+      const driverName = van.driverName ?? van.driver?.name ?? '';
+      return (
+        String(van.plateNumber ?? '').toLowerCase().includes(q) ||
+        String(van.status ?? '').toLowerCase().includes(q) ||
+        String(van.capacity ?? '').toLowerCase().includes(q) ||
+        String(driverName).toLowerCase().includes(q)
+      );
+    });
+  }, [data.vans, vanSearch]);
+
+  const filteredStaff = useMemo(() => {
+    const q = staffSearch.trim().toLowerCase();
+    if (!q) return data.staff;
+    return data.staff.filter((user) => (
+      String(user.name ?? '').toLowerCase().includes(q) ||
+      String(user.email ?? '').toLowerCase().includes(q) ||
+      String(user.driverId ?? '').toLowerCase().includes(q) ||
+      String(user.role ?? '').toLowerCase().includes(q)
+    ));
+  }, [data.staff, staffSearch]);
+
+  // ── Audit helpers ─────────────────────────────────────────────────────────
   const auditActionOptions = useMemo(() => {
     const set = new Set();
     auditLogs.forEach((entry) => { if (entry?.action) set.add(entry.action); });
@@ -408,7 +504,7 @@ export default function AdminDashboard() {
     setAuditSearch(''); setAuditActionFilter(''); setAuditDateFrom(''); setAuditDateTo(''); setAuditVisible(AUDIT_PAGE_SIZE);
   }, []);
 
-  if (loading) return <PageState title="Loading Command Center…" />;
+  if (loading) return <PageState loading title="Loading Command Center…" />;
 
   if (fetchError) {
     return <PageState title="Dashboard unavailable" message={fetchError} actionLabel="Retry" onAction={() => setReloadToken((n) => n + 1)} />;
@@ -435,64 +531,120 @@ export default function AdminDashboard() {
             🧾 Audit Trail
             <span className="bg-gray-100 text-gray-600 text-xs font-bold px-1.5 py-0.5 rounded">{auditLogs.length}</span>
           </button>
-          <button onClick={() => setReloadToken((n) => n + 1)} title="Refresh dashboard" className="p-2 rounded-lg text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition">🔄</button>
+          <button onClick={() => setReloadToken((n) => n + 1)} title="Refresh dashboard" aria-label="Refresh dashboard" className="p-2 rounded-lg text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition">🔄</button>
           <button onClick={handleLogout} disabled={loggingOut} className="bg-red-50 text-red-600 font-bold px-4 py-2 rounded-lg border border-red-200 hover:bg-red-100 transition text-sm disabled:opacity-50 disabled:cursor-not-allowed">
-            {loggingOut ? 'Logging out…' : 'Secure Logout'}
+            {loggingOut ? 'Logging out…' : 'Log out'}
           </button>
         </div>
       </div>
 
       <div className="max-w-6xl mx-auto space-y-6">
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-          <StatCard title="Active Trips" value={data.stats.activeTrips} color="text-green-600" />
-          <StatCard title="Total Trips Logged" value={data.stats.totalTrips} color="text-blue-600" />
-          <StatCard title="Total Vans" value={data.stats.totalVans} color="text-purple-600" />
-          <StatCard title="Total Staff" value={data.stats.totalUsers} color="text-orange-600" />
+          <StatCard title="Active Trips" value={data.stats.activeTrips} color="text-green-600" icon="🚐" />
+          <StatCard title="Total Trips Logged" value={data.stats.totalTrips} color="text-blue-600" icon="📊" />
+          <StatCard title="Total Vans" value={data.stats.totalVans} color="text-purple-600" icon="🚌" />
+          <StatCard title="Total Staff" value={data.stats.totalUsers} color="text-orange-600" icon="👥" />
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {/* ── Vans card ─────────────────────────────────────────────── */}
           <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-200">
-            <div className="flex justify-between items-center mb-4 border-b pb-2">
-              <h2 className="text-lg font-bold text-gray-800">Registered Vans</h2>
-              <button onClick={openAddVanModal} className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-1.5 rounded-lg transition shadow-sm">＋ Add Van &amp; Driver</button>
+            <div className="flex justify-between items-center mb-3 border-b pb-2 gap-3">
+              <h2 className="text-lg font-bold text-gray-800 flex items-center gap-2">
+                Registered Vans
+                <span className="text-xs font-bold bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full">{data.vans.length}</span>
+              </h2>
+              <button onClick={openAddVanModal} className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-1.5 rounded-lg transition shadow-sm whitespace-nowrap">＋ Add Van &amp; Driver</button>
             </div>
+
+            {data.vans.length > 0 && (
+              <div className="mb-3">
+                <SearchInput
+                  value={vanSearch}
+                  onChange={setVanSearch}
+                  placeholder="Search by plate, status, capacity, or driver…"
+                  ariaLabel="Search vans"
+                />
+              </div>
+            )}
+
             <div className="overflow-x-auto">
               <table className="w-full text-sm text-left">
                 <thead className="bg-gray-50 text-gray-500 text-xs uppercase tracking-wide">
                   <tr><th className="p-3">Plate</th><th className="p-3">Capacity</th><th className="p-3">Status</th><th className="p-3 text-right">Actions</th></tr>
                 </thead>
                 <tbody>
-                  {data.vans.length === 0 ? <EmptyTableRow colSpan={4} message="No van records found." /> : data.vans.map((van) => (
-                    <tr key={van.id} className="border-b hover:bg-gray-50">
-                      <td className="p-3 font-bold text-gray-800">{van.plateNumber ?? '—'}</td>
-                      <td className="p-3 text-gray-600">{van.capacity ?? 0} pax</td>
-                      <td className="p-3"><VanStatusBadge status={van.status} /></td>
-                      <td className="p-3">
-                        <div className="flex gap-1.5 justify-end">
-                          <button onClick={() => setViewingQrVan(van)} title="View this van's scan QR" className="text-xs font-semibold px-2 py-1 rounded border border-purple-300 text-purple-700 bg-purple-50 hover:bg-purple-100 transition">QR</button>
-                          <button onClick={() => openEditVanModal(van)} className="text-xs font-semibold px-2 py-1 rounded border border-blue-300 text-blue-700 bg-blue-50 hover:bg-blue-100 transition">Edit</button>
-                          <button onClick={() => openDeleteVanModal(van)} className="text-xs font-semibold px-2 py-1 rounded border border-red-300 text-red-600 bg-red-50 hover:bg-red-100 transition">Delete</button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
+                  {filteredVans.length === 0 ? (
+                    <EmptyTableRow
+                      colSpan={4}
+                      message={
+                        data.vans.length === 0
+                          ? 'No vans yet. Click "Add Van & Driver" to register the first one.'
+                          : 'No vans match your search.'
+                      }
+                    />
+                  ) : filteredVans.map((van) => {
+                    const driverName = van.driverName ?? van.driver?.name ?? null;
+                    return (
+                      <tr key={van.id} className="border-b hover:bg-gray-50">
+                        <td className="p-3">
+                          <div className="font-bold text-gray-800">{van.plateNumber ?? '—'}</div>
+                          {driverName && <div className="text-xs text-gray-400 mt-0.5">Driver: {driverName}</div>}
+                        </td>
+                        <td className="p-3 text-gray-600">{van.capacity ?? 0} pax</td>
+                        <td className="p-3"><VanStatusBadge status={van.status} /></td>
+                        <td className="p-3">
+                          <div className="flex gap-1.5 justify-end">
+                            <button onClick={() => setViewingQrVan(van)} title="View this van's scan QR" className="text-xs font-semibold px-2 py-1 rounded border border-purple-300 text-purple-700 bg-purple-50 hover:bg-purple-100 transition">QR</button>
+                            <button onClick={() => openEditVanModal(van)} className="text-xs font-semibold px-2 py-1 rounded border border-blue-300 text-blue-700 bg-blue-50 hover:bg-blue-100 transition">Edit</button>
+                            <button onClick={() => openDeleteVanModal(van)} className="text-xs font-semibold px-2 py-1 rounded border border-red-300 text-red-600 bg-red-50 hover:bg-red-100 transition">Delete</button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
           </div>
 
+          {/* ── Staff card ────────────────────────────────────────────── */}
           <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-200">
-            <div className="flex justify-between items-center mb-4 border-b pb-2">
-              <h2 className="text-lg font-bold text-gray-800">System Users &amp; Drivers</h2>
-              <button onClick={openAddStaffModal} className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-1.5 rounded-lg transition shadow-sm">＋ Add Staff Account</button>
+            <div className="flex justify-between items-center mb-3 border-b pb-2 gap-3">
+              <h2 className="text-lg font-bold text-gray-800 flex items-center gap-2">
+                System Users &amp; Drivers
+                <span className="text-xs font-bold bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full">{data.staff.length}</span>
+              </h2>
+              <button onClick={openAddStaffModal} className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-1.5 rounded-lg transition shadow-sm whitespace-nowrap">＋ Add Staff Account</button>
             </div>
+
+            {data.staff.length > 0 && (
+              <div className="mb-3">
+                <SearchInput
+                  value={staffSearch}
+                  onChange={setStaffSearch}
+                  placeholder="Search by name, email, ID, or role…"
+                  ariaLabel="Search staff"
+                />
+              </div>
+            )}
+
             <div className="overflow-x-auto">
               <table className="w-full text-sm text-left">
                 <thead className="bg-gray-50 text-gray-500 text-xs uppercase tracking-wide">
                   <tr><th className="p-3">Name</th><th className="p-3">Role</th><th className="p-3">Status</th><th className="p-3 text-right">Actions</th></tr>
                 </thead>
                 <tbody>
-                  {data.staff.length === 0 ? <EmptyTableRow colSpan={4} message="No staff accounts found." /> : data.staff.map((user) => {
+                  {filteredStaff.length === 0 ? (
+                    <EmptyTableRow
+                      colSpan={4}
+                      message={
+                        data.staff.length === 0
+                          ? 'No staff accounts yet. Click "Add Staff Account" to create one.'
+                          : 'No staff match your search.'
+                      }
+                    />
+                  ) : filteredStaff.map((user) => {
                     const isBusy = togglingId === user.id;
                     const anyToggling = togglingId !== null;
                     return (
@@ -552,6 +704,7 @@ function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onCl
 
   const [form, setForm]     = useState(EMPTY_STAFF_FORM);
   const [errors, setErrors] = useState({});
+  const [passwordVisible, setPasswordVisible] = useState(false);
   const nameRef              = useRef(null);
 
   useEffect(() => {
@@ -562,6 +715,7 @@ function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onCl
           : EMPTY_STAFF_FORM,
       );
       setErrors({});
+      setPasswordVisible(false);
       onClearError();
       const id = setTimeout(() => nameRef.current?.focus(), 60);
       return () => clearTimeout(id);
@@ -582,6 +736,14 @@ function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onCl
     if (serverError) onClearError();
   };
 
+  const handleGeneratePassword = () => {
+    const pw = generateRandomPassword();
+    setForm((p) => ({ ...p, password: pw }));
+    setErrors((p) => ({ ...p, password: '' }));
+    setPasswordVisible(true);
+    if (serverError) onClearError();
+  };
+
   const validate = () => {
     const e   = {};
     const nm  = form.name.trim();
@@ -598,8 +760,8 @@ function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onCl
     }
 
     if (!isEdit) {
-      if (!form.password) e.password = 'This field is required.';
-      else if (form.password.length < 8) e.password = 'Password must be at least 8 characters.';
+      if (!form.password) e.password = 'A password is required.';
+      else if (form.password.length < PASSWORD_MIN) e.password = `Password must be at least ${PASSWORD_MIN} characters.`;
     }
 
     return e;
@@ -624,14 +786,14 @@ function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onCl
       <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md">
         <div className="flex justify-between items-center p-5 border-b">
           <h2 id="staff-modal-title" className="text-lg font-bold text-gray-900">{isEdit ? 'Edit Account' : 'Add Staff Account'}</h2>
-          <button onClick={onClose} disabled={isLoading} className="text-gray-400 hover:text-gray-600 disabled:opacity-40 text-xl leading-none">✕</button>
+          <button onClick={onClose} disabled={isLoading} aria-label="Close" className="text-gray-400 hover:text-gray-600 disabled:opacity-40 text-xl leading-none">✕</button>
         </div>
         {serverError && <div className="mx-5 mt-4 p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg text-sm">⚠️ {serverError}</div>}
         <div className="p-5 space-y-4">
           <Field label="Full Name" required error={errors.name}>
             <input ref={nameRef} name="name" type="text" value={form.name} onChange={change} placeholder="e.g. Juan dela Cruz" autoComplete="name" maxLength={100} className={inputCls(errors.name)} />
           </Field>
-          
+
           <Field label="Role" required error={errors.role}>
             <select name="role" value={form.role} onChange={change} disabled={isEdit} className={`${inputCls(errors.role)} bg-white disabled:opacity-60 disabled:cursor-not-allowed`}>
               <option value="">— Select a role —</option>
@@ -639,9 +801,9 @@ function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onCl
               <option value="DISPATCHER">Dispatcher</option>
               {isEdit && form.role === 'DRIVER' && <option value="DRIVER">Driver</option>}
             </select>
-            {!isEdit && <p className="text-xs text-blue-600 mt-1.5 font-medium">To add a Driver, use "Add Van &amp; Driver" instead — drivers log in with a van and a PIN, not an email.</p>}
+            {!isEdit && <p className="text-xs text-blue-600 mt-1.5 font-medium">To add a Driver, use "Add Van &amp; Driver" instead — drivers sign in with a login ID and password, not an email.</p>}
           </Field>
-          
+
           {form.role && form.role !== 'DRIVER' && (
             <Field label="Email Address" required error={errors.email}>
               <input name="email" type="email" value={form.email} onChange={change} placeholder="staff@terminal.gov.ph" autoComplete="email" className={inputCls(errors.email)} />
@@ -649,8 +811,24 @@ function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onCl
           )}
 
           {!isEdit && form.role && (
-            <Field label="Password" required error={errors.password} hint="Min. 8 characters.">
-              <input name="password" type="password" value={form.password} onChange={change} placeholder="Min. 8 characters" autoComplete="new-password" className={inputCls(errors.password)} />
+            <Field
+              label="Password"
+              required
+              error={errors.password}
+              hint={`At least ${PASSWORD_MIN} characters. Use the generator for a quick, non-obvious password.`}
+              action={<GeneratePasswordButton onGenerate={handleGeneratePassword} />}
+            >
+              <PasswordInput
+                name="password"
+                value={form.password}
+                onChange={change}
+                placeholder="Enter a password"
+                autoComplete="new-password"
+                hasError={errors.password}
+                maxLength={128}
+                visible={passwordVisible}
+                onToggleVisible={() => setPasswordVisible((v) => !v)}
+              />
             </Field>
           )}
           {isEdit && <p className="text-xs text-gray-400">To reset this user's password, use the dedicated reset flow — it isn't changed here.</p>}
@@ -675,12 +853,14 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
 
   const [form, setForm]     = useState(EMPTY_VAN_FORM);
   const [errors, setErrors] = useState({});
+  const [driverPasswordVisible, setDriverPasswordVisible] = useState(false);
   const plateRef             = useRef(null);
 
   useEffect(() => {
     if (isOpen) {
-      setForm(isEdit && original ? { plateNumber: original.plateNumber ?? '', capacity: String(original.capacity ?? ''), status: original.status ?? 'IDLE', driverName: '', driverPin: '' } : EMPTY_VAN_FORM);
+      setForm(isEdit && original ? { plateNumber: original.plateNumber ?? '', capacity: String(original.capacity ?? ''), status: original.status ?? 'IDLE', driverName: '', driverPassword: '' } : EMPTY_VAN_FORM);
       setErrors({});
+      setDriverPasswordVisible(false);
       onClearError();
       const id = setTimeout(() => plateRef.current?.focus(), 60);
       return () => clearTimeout(id);
@@ -701,6 +881,14 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
     if (serverError) onClearError();
   };
 
+  const handleGenerateDriverPassword = () => {
+    const pw = generateRandomPassword();
+    setForm((p) => ({ ...p, driverPassword: pw }));
+    setErrors((p) => ({ ...p, driverPassword: '' }));
+    setDriverPasswordVisible(true);
+    if (serverError) onClearError();
+  };
+
   const validate = () => {
     const e   = {};
     const plt = form.plateNumber.trim();
@@ -716,8 +904,8 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
 
     if (!isEdit) {
       if (!form.driverName.trim()) e.driverName = 'Driver name is required.';
-      if (!form.driverPin) e.driverPin = 'PIN is required.';
-      else if (form.driverPin.length < 4) e.driverPin = 'PIN must be at least 4 characters.';
+      if (!form.driverPassword) e.driverPassword = 'A password is required.';
+      else if (form.driverPassword.length < PASSWORD_MIN) e.driverPassword = `Password must be at least ${PASSWORD_MIN} characters.`;
     }
 
     return e;
@@ -726,16 +914,18 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
   const submit = () => {
     const e = validate();
     if (Object.keys(e).length > 0) { setErrors(e); return; }
-    
-    const payload = { 
-      plateNumber: form.plateNumber.trim().toUpperCase(), 
-      capacity: Number(form.capacity), 
-      status: form.status 
+
+    const payload = {
+      plateNumber: form.plateNumber.trim().toUpperCase(),
+      capacity: Number(form.capacity),
+      status: form.status,
     };
 
     if (!isEdit) {
       payload.driverName = form.driverName.trim();
-      payload.driverPin = form.driverPin;
+      // NOTE: the backend wire-format field is still called `driverPin`,
+      // but it now carries a full password rather than a short numeric PIN.
+      payload.driverPin = form.driverPassword;
     }
 
     onSubmit(payload);
@@ -748,11 +938,11 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
       <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden">
         <div className="flex justify-between items-center p-5 border-b bg-slate-50">
           <h2 id="van-modal-title" className="text-lg font-black text-gray-900">{isEdit ? 'Edit Van' : 'Add Van & Driver'}</h2>
-          <button onClick={onClose} disabled={isLoading} className="text-gray-400 hover:text-gray-600 disabled:opacity-40 text-xl leading-none">✕</button>
+          <button onClick={onClose} disabled={isLoading} aria-label="Close" className="text-gray-400 hover:text-gray-600 disabled:opacity-40 text-xl leading-none">✕</button>
         </div>
-        
+
         {serverError && <div className="mx-5 mt-4 p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg text-sm font-medium">⚠️ {serverError}</div>}
-        
+
         <div className="p-5 max-h-[70vh] overflow-y-auto space-y-6">
           {/* VAN DETAILS */}
           <div>
@@ -761,7 +951,7 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
               <Field label="Plate Number" required error={errors.plateNumber}>
                 <input ref={plateRef} name="plateNumber" type="text" value={form.plateNumber} onChange={change} placeholder="e.g. ABC-1234" autoComplete="off" maxLength={15} disabled={isEdit} className={`${inputCls(errors.plateNumber)} uppercase disabled:bg-gray-100 disabled:text-gray-500`} />
               </Field>
-              
+
               <div className="grid grid-cols-2 gap-4">
                 <Field label="Capacity" required error={errors.capacity} hint="Passenger seats (1-30).">
                   <input name="capacity" type="number" min={1} max={30} value={form.capacity} onChange={change} placeholder="e.g. 14" className={inputCls(errors.capacity)} />
@@ -781,21 +971,37 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
               <h3 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-3 border-b pb-1">Assigned Driver</h3>
               <p className="text-xs text-blue-600 mb-3 font-medium">
                 A new driver account will be created — not by email, but with a login ID the system generates
-                automatically. You'll see that ID right after you submit this form, so you can pass it to the driver
-                along with the PIN below. You'll also get a scannable QR code for this van at the same time.
+                automatically. You'll see that ID right after you submit this form, so you can hand it to the driver
+                along with the password below. You'll also get a scannable QR code for this van at the same time.
               </p>
               <div className="space-y-4">
                 <Field label="Driver Full Name" required error={errors.driverName}>
                   <input name="driverName" type="text" value={form.driverName} onChange={change} placeholder="e.g. Juan dela Cruz" className={inputCls(errors.driverName)} />
                 </Field>
-                <Field label="Login PIN" required error={errors.driverPin} hint="What the driver will type in as their password. Min. 4 characters.">
-                  <input name="driverPin" type="password" value={form.driverPin} onChange={change} placeholder="e.g. 1234" maxLength={8} className={inputCls(errors.driverPin)} />
+                <Field
+                  label="Driver Password"
+                  required
+                  error={errors.driverPassword}
+                  hint={`What the driver will type in to sign in. At least ${PASSWORD_MIN} characters — use the generator for a quick, non-obvious one.`}
+                  action={<GeneratePasswordButton onGenerate={handleGenerateDriverPassword} />}
+                >
+                  <PasswordInput
+                    name="driverPassword"
+                    value={form.driverPassword}
+                    onChange={change}
+                    placeholder="Enter a password"
+                    autoComplete="new-password"
+                    hasError={errors.driverPassword}
+                    maxLength={128}
+                    visible={driverPasswordVisible}
+                    onToggleVisible={() => setDriverPasswordVisible((v) => !v)}
+                  />
                 </Field>
               </div>
             </div>
           )}
         </div>
-        
+
         <div className="flex gap-3 p-5 border-t bg-gray-50 rounded-b-2xl">
           <button onClick={onClose} disabled={isLoading} className="flex-1 py-2 border border-gray-300 rounded-lg text-sm font-semibold text-gray-700 hover:bg-gray-100 transition disabled:opacity-40">Cancel</button>
           <button onClick={submit} disabled={isLoading} className="flex-[2] py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-sm font-bold transition disabled:opacity-70 disabled:cursor-not-allowed">
@@ -809,14 +1015,16 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
 
 // ─── DriverCredentialsModal ────────────────────────────────────────────────────
 // Shown once, immediately after a van + driver is created. This is the only
-// moment the PIN is visible on screen — after this it only exists as a hash
-// on the server, so make sure the admin has a chance to write it down.
-// The QR token, unlike the PIN, is NOT one-time-only — it can be re-viewed
+// moment the password is visible on screen — after this it only exists as a
+// hash on the server, so make sure the admin has a chance to write it down.
+// The QR token, unlike the password, is NOT one-time-only — it can be re-viewed
 // any time later via the "QR" button in the vans table (see QrOnlyModal).
 
 function DriverCredentialsModal({ credentials, onClose }) {
+  const [showPassword, setShowPassword] = useState(false);
+
   useEffect(() => {
-    if (!credentials) return;
+    if (!credentials) { setShowPassword(false); return; }
     const fn = (e) => { if (e.key === 'Escape') onClose(); };
     document.addEventListener('keydown', fn);
     return () => document.removeEventListener('keydown', fn);
@@ -824,8 +1032,9 @@ function DriverCredentialsModal({ credentials, onClose }) {
 
   if (!credentials) return null;
 
-  const { plateNumber, driverName, driverId, pin, qrToken } = credentials;
+  const { plateNumber, driverName, driverId, password, qrToken } = credentials;
   const missingId = !driverId;
+  const maskedPassword = password ? '•'.repeat(Math.min(password.length, 16)) : '—';
 
   return (
     <div role="dialog" aria-modal="true" aria-labelledby="driver-creds-title" className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
@@ -834,7 +1043,7 @@ function DriverCredentialsModal({ credentials, onClose }) {
           <div className="text-4xl" aria-hidden="true">✅</div>
           <h2 id="driver-creds-title" className="text-lg font-black text-gray-900">Driver Account Created</h2>
           <p className="text-sm text-gray-500">
-            Give <strong>{driverName}</strong> these details — this is the only time the PIN will be shown.
+            Give <strong>{driverName}</strong> these details — this is the only time the password will be shown.
           </p>
 
           <div className="bg-gray-50 border border-gray-200 rounded-xl p-4 text-left space-y-3">
@@ -842,19 +1051,38 @@ function DriverCredentialsModal({ credentials, onClose }) {
               <div className="text-xs font-bold text-gray-400 uppercase tracking-wide">Van</div>
               <div className="font-bold text-gray-900">{plateNumber}</div>
             </div>
+
             <div>
-              <div className="text-xs font-bold text-gray-400 uppercase tracking-wide">Login ID</div>
+              <div className="text-xs font-bold text-gray-400 uppercase tracking-wide mb-0.5">Login ID</div>
               {missingId ? (
                 <div className="text-sm text-amber-700">
                   Not returned by the server. Check the vans list or your database for this driver's ID.
                 </div>
               ) : (
-                <div className="font-mono font-bold text-gray-900 text-base">{driverId}</div>
+                <div className="flex items-center gap-2">
+                  <div className="font-mono font-bold text-gray-900 text-base flex-1 break-all">{driverId}</div>
+                  <CopyButton text={driverId} label="Copy" />
+                </div>
               )}
             </div>
+
             <div>
-              <div className="text-xs font-bold text-gray-400 uppercase tracking-wide">PIN</div>
-              <div className="font-mono font-bold text-gray-900 text-base">{pin}</div>
+              <div className="text-xs font-bold text-gray-400 uppercase tracking-wide mb-0.5">Password</div>
+              <div className="flex items-center gap-2">
+                <div className="font-mono font-bold text-gray-900 text-base flex-1 break-all">
+                  {showPassword ? (password ?? '—') : maskedPassword}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowPassword((s) => !s)}
+                  aria-label={showPassword ? 'Hide password' : 'Show password'}
+                  title={showPassword ? 'Hide password' : 'Show password'}
+                  className="shrink-0 text-xs font-bold px-2 py-1.5 rounded border border-gray-300 text-gray-600 bg-white hover:bg-gray-100 transition"
+                >
+                  {showPassword ? '🙈' : '👁'}
+                </button>
+                <CopyButton text={password ?? ''} label="Copy" disabled={!password} />
+              </div>
             </div>
 
             {qrToken && (
@@ -866,12 +1094,7 @@ function DriverCredentialsModal({ credentials, onClose }) {
                   <code className="flex-1 text-[11px] bg-white border border-gray-200 rounded px-2 py-1.5 break-all font-mono">
                     {qrToken}
                   </code>
-                  <button
-                    onClick={() => navigator.clipboard.writeText(qrToken)}
-                    className="shrink-0 text-xs font-bold px-2 py-1.5 rounded border border-blue-300 text-blue-700 bg-blue-50 hover:bg-blue-100 transition"
-                  >
-                    Copy
-                  </button>
+                  <CopyButton text={qrToken} label="Copy" />
                 </div>
                 <img
                   src={`https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=${encodeURIComponent(qrToken)}`}
@@ -886,7 +1109,7 @@ function DriverCredentialsModal({ credentials, onClose }) {
           </div>
 
           <p className="text-xs text-gray-400">
-            The driver enters the Login ID and PIN above on the driver sign-in screen — no email needed.
+            The driver enters the Login ID and password above on the driver sign-in screen — no email needed.
           </p>
         </div>
         <div className="p-5 border-t bg-gray-50 rounded-b-2xl">
@@ -901,7 +1124,7 @@ function DriverCredentialsModal({ credentials, onClose }) {
 
 // ─── QrOnlyModal ────────────────────────────────────────────────────────────
 // Re-opens an existing van's QR (from the vans table "QR" button) without
-// showing any driver/PIN fields — those are one-time-only and unrelated
+// showing any driver/password fields — those are one-time-only and unrelated
 // to viewing a van's permanent scan code later.
 
 function QrOnlyModal({ van, onClose }) {
@@ -933,12 +1156,7 @@ function QrOnlyModal({ van, onClose }) {
                 <code className="flex-1 text-[11px] bg-white border border-gray-200 rounded px-2 py-1.5 break-all font-mono">
                   {qrToken}
                 </code>
-                <button
-                  onClick={() => navigator.clipboard.writeText(qrToken)}
-                  className="shrink-0 text-xs font-bold px-2 py-1.5 rounded border border-blue-300 text-blue-700 bg-blue-50 hover:bg-blue-100 transition"
-                >
-                  Copy
-                </button>
+                <CopyButton text={qrToken} label="Copy" />
               </div>
               <img
                 src={`https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(qrToken)}`}
@@ -1014,17 +1232,123 @@ function VanStatusBadge({ status }) {
   return <span className={`px-2 py-1 rounded text-xs font-bold ${styles[status] ?? 'bg-gray-100 text-gray-600'}`}>{(status ?? 'UNKNOWN').replace('_', ' ')}</span>;
 }
 
-function StatCard({ title, value, color }) {
+function StatCard({ title, value, color, icon }) {
   return (
-    <div className="bg-white p-6 rounded-xl shadow-sm border border-gray-200 flex flex-col items-center justify-center">
-      <div className="text-sm text-gray-500 font-semibold mb-1 text-center">{title}</div>
-      <div className={`text-3xl font-black ${color}`}>{value ?? 0}</div>
+    <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-200 flex items-center gap-4">
+      {icon && (
+        <div className={`text-2xl w-11 h-11 shrink-0 rounded-full bg-gray-50 flex items-center justify-center ${color}`} aria-hidden="true">
+          {icon}
+        </div>
+      )}
+      <div className="min-w-0">
+        <div className="text-xs text-gray-500 font-semibold uppercase tracking-wide truncate">{title}</div>
+        <div className={`text-2xl font-black ${color}`}>{value ?? 0}</div>
+      </div>
     </div>
   );
 }
 
 function EmptyTableRow({ colSpan, message }) {
-  return <tr><td colSpan={colSpan} className="p-4 text-center text-sm text-gray-400 italic">{message}</td></tr>;
+  return <tr><td colSpan={colSpan} className="p-6 text-center text-sm text-gray-400 italic">{message}</td></tr>;
+}
+
+// Controlled password input with a show/hide toggle.
+function PasswordInput({ name, value, onChange, placeholder, autoComplete, hasError, maxLength, inputRef, visible, onToggleVisible }) {
+  return (
+    <div className="relative">
+      <input
+        ref={inputRef}
+        name={name}
+        type={visible ? 'text' : 'password'}
+        value={value}
+        onChange={onChange}
+        placeholder={placeholder}
+        autoComplete={autoComplete}
+        maxLength={maxLength}
+        className={`${inputCls(hasError)} pr-11`}
+      />
+      <button
+        type="button"
+        onClick={onToggleVisible}
+        aria-label={visible ? 'Hide password' : 'Show password'}
+        title={visible ? 'Hide password' : 'Show password'}
+        className="absolute inset-y-0 right-0 px-3 flex items-center text-gray-400 hover:text-gray-700 transition"
+      >
+        {visible ? '🙈' : '👁'}
+      </button>
+    </div>
+  );
+}
+
+// Small inline "generate random password" link-style button.
+function GeneratePasswordButton({ onGenerate }) {
+  return (
+    <button
+      type="button"
+      onClick={onGenerate}
+      title="Generate a random 4–8 digit password that isn't an obvious pattern"
+      className="text-xs font-semibold text-blue-600 hover:text-blue-800 hover:underline transition inline-flex items-center gap-1 whitespace-nowrap"
+    >
+      🎲 Generate a Random Password
+    </button>
+  );
+}
+
+// Small copy-to-clipboard button that briefly shows a confirmation.
+function CopyButton({ text, label = 'Copy', disabled }) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = async () => {
+    if (disabled) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch { /* clipboard not available — fail silently */ }
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={handleCopy}
+      disabled={disabled}
+      title={copied ? 'Copied!' : label}
+      className={`shrink-0 text-xs font-bold px-2 py-1.5 rounded border transition ${
+        copied
+          ? 'border-green-300 text-green-700 bg-green-50'
+          : 'border-blue-300 text-blue-700 bg-blue-50 hover:bg-blue-100'
+      } disabled:opacity-40 disabled:cursor-not-allowed`}
+    >
+      {copied ? '✓ Copied' : label}
+    </button>
+  );
+}
+
+// Simple table search box.
+function SearchInput({ value, onChange, placeholder, ariaLabel }) {
+  return (
+    <div className="relative">
+      <span className="absolute inset-y-0 left-0 pl-3 flex items-center text-gray-400 pointer-events-none" aria-hidden="true">🔍</span>
+      <input
+        type="text"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        aria-label={ariaLabel}
+        className="w-full pl-9 pr-9 py-2 border border-gray-300 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400"
+      />
+      {value && (
+        <button
+          type="button"
+          onClick={() => onChange('')}
+          aria-label="Clear search"
+          className="absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 hover:text-gray-700 text-xs"
+        >
+          ✕
+        </button>
+      )}
+    </div>
+  );
 }
 
 // ─── AuditTrailModal ──────────────────────────────────────────────────────────
@@ -1060,14 +1384,14 @@ function AuditTrailModal({
         </div>
         <div className="p-5 border-b space-y-3">
           <div className="flex flex-wrap items-center gap-2">
-            <input type="text" value={search} onChange={(e) => onSearchChange(e.target.value)} placeholder="Search actor, action, target…" className="px-3 py-1.5 border border-gray-300 rounded-lg text-xs flex-1 min-w-[10rem] focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400" />
-            <select value={actionFilter} onChange={(e) => onActionFilterChange(e.target.value)} className="px-3 py-1.5 border border-gray-300 rounded-lg text-xs bg-white focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400">
+            <input type="text" value={search} onChange={(e) => onSearchChange(e.target.value)} placeholder="Search actor, action, target…" aria-label="Search audit trail" className="px-3 py-1.5 border border-gray-300 rounded-lg text-xs flex-1 min-w-[10rem] focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400" />
+            <select value={actionFilter} onChange={(e) => onActionFilterChange(e.target.value)} aria-label="Filter by action" className="px-3 py-1.5 border border-gray-300 rounded-lg text-xs bg-white focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400">
               <option value="">All actions</option>
               {actionOptions.map((a) => <option key={a} value={a}>{a}</option>)}
             </select>
-            <input type="date" value={dateFrom} onChange={(e) => onDateFromChange(e.target.value)} title="From date" className="px-3 py-1.5 border border-gray-300 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400" />
+            <input type="date" value={dateFrom} onChange={(e) => onDateFromChange(e.target.value)} title="From date" aria-label="From date" className="px-3 py-1.5 border border-gray-300 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400" />
             <span className="text-xs text-gray-400">to</span>
-            <input type="date" value={dateTo} onChange={(e) => onDateToChange(e.target.value)} title="To date" className="px-3 py-1.5 border border-gray-300 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400" />
+            <input type="date" value={dateTo} onChange={(e) => onDateToChange(e.target.value)} title="To date" aria-label="To date" className="px-3 py-1.5 border border-gray-300 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400" />
             {hasFilters && <button onClick={onClearFilters} className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-gray-300 text-gray-500 hover:bg-gray-100 transition">Clear filters</button>}
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -1123,10 +1447,13 @@ function formatAuditTimestamp(value) {
   return d.toLocaleString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
-function PageState({ title, message, actionLabel, onAction }) {
+function PageState({ title, message, actionLabel, onAction, loading }) {
   return (
     <div className="min-h-screen bg-gray-100 flex items-center justify-center p-6">
       <div className="max-w-md w-full bg-white rounded-xl shadow-sm border p-6 text-center">
+        {loading && (
+          <div className="mx-auto mb-4 h-10 w-10 rounded-full border-4 border-blue-100 border-t-blue-600 animate-spin" aria-hidden="true" />
+        )}
         <h1 className="text-xl font-black text-gray-800">{title}</h1>
         {message && <p className="mt-3 text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg p-3">{message}</p>}
         {actionLabel && onAction && <button onClick={onAction} className="mt-4 w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-lg transition">{actionLabel}</button>}
@@ -1135,10 +1462,15 @@ function PageState({ title, message, actionLabel, onAction }) {
   );
 }
 
-function Field({ label, required, error, hint, children }) {
+function Field({ label, required, error, hint, action, children }) {
   return (
     <div>
-      <label className="block text-sm font-semibold text-gray-700 mb-1">{label} {required && <span className="text-red-500 ml-0.5" aria-hidden="true">*</span>}</label>
+      <div className="flex items-baseline justify-between gap-2 mb-1">
+        <label className="block text-sm font-semibold text-gray-700">
+          {label} {required && <span className="text-red-500 ml-0.5" aria-hidden="true">*</span>}
+        </label>
+        {action}
+      </div>
       {children}
       {hint && !error && <p className="text-xs text-gray-400 mt-1">{hint}</p>}
       {error && <p role="alert" className="text-xs text-red-500 mt-1">{error}</p>}
