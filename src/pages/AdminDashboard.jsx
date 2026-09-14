@@ -11,7 +11,8 @@ const EMPTY_DATA = {
 };
 
 const EMPTY_STAFF_FORM = { name: '', email: '', role: '', driverId: '', password: '' };
-// Van form now uses a full password for the driver (not a 4-digit PIN label).
+// Van form: the driver's "login secret" is now labeled as a PIN in the UI,
+// but the wire-format field name stays `driverPin` for backend compatibility.
 const EMPTY_VAN_FORM   = { plateNumber: '', capacity: '', status: 'IDLE', driverName: '', driverPassword: '' };
 
 const VAN_STATUSES = ['IDLE', 'DISPATCHED', 'MAINTENANCE', 'OUT_OF_SERVICE'];
@@ -25,8 +26,8 @@ const EMAIL_RE     = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const DRIVER_ID_RE = /^DRV-\d{3,}$/i;
 const PLATE_RE     = /^[A-Z0-9\- ]{4,15}$/i;
 
-// Minimum password length. The random generator produces 4–8 char numeric
-// passwords, so this must be 4 or lower for generated values to pass.
+// Minimum PIN length. The random generator produces 4–8 digit PINs,
+// so this must be 4 or lower for generated values to pass validation.
 const PASSWORD_MIN = 4;
 
 const inputCls = (hasError) =>
@@ -69,7 +70,6 @@ const handleAuthFailure = (err) => {
 };
 
 // Pulls a driver login ID out of whatever shape the backend returns.
-// Covers common variants so this keeps working even if field naming shifts.
 function extractDriverId(responseData) {
   return (
     responseData?.driver?.driverId ??
@@ -82,12 +82,12 @@ function extractDriverId(responseData) {
   );
 }
 
-// ─── Random Password Generator ────────────────────────────────────────────────
-// Produces a numeric password 4–8 digits long, retrying if it lands on a
-// well-known weak pattern. See WEAK_PASSWORD_PATTERNS below.
+// ─── Random PIN Generator ─────────────────────────────────────────────────────
+// Produces a numeric PIN 4–8 digits long, retrying if it lands on a
+// well-known weak pattern.
 
 const WEAK_PASSWORD_PATTERNS = new Set([
-  // Repeated single digit (0000, 1111, 2222 …)
+  // Repeated single digit
   '0000','1111','2222','3333','4444','5555','6666','7777','8888','9999',
   '00000','11111','22222','33333','44444','55555','66666','77777','88888','99999',
   '000000','111111','222222','333333','444444','555555','666666','777777','888888','999999',
@@ -112,11 +112,8 @@ const WEAK_PASSWORD_PATTERNS = new Set([
 
 function isWeakPassword(pw) {
   if (!pw) return true;
-  // All characters identical (e.g. 77777)
   if (/^(.)\1+$/.test(pw)) return true;
-  // Direct match against the known-weak list
   if (WEAK_PASSWORD_PATTERNS.has(pw)) return true;
-  // Pure digits that form a straight ascending or descending run (1234, 9876)
   if (/^\d+$/.test(pw)) {
     const digits = pw.split('').map(Number);
     let asc = true, desc = true;
@@ -129,7 +126,6 @@ function isWeakPassword(pw) {
   return false;
 }
 
-// Generates a 4–8 digit numeric password that isn't a weak/obvious pattern.
 function generateRandomPassword(minLen = 4, maxLen = 8) {
   const len = Math.floor(Math.random() * (maxLen - minLen + 1)) + minLen;
   let pw = '';
@@ -160,12 +156,7 @@ export default function AdminDashboard() {
   const [vanMutationLoading, setVanMutationLoading] = useState(false);
   const [vanMutationError, setVanMutationError]     = useState('');
 
-  // Shown right after a van + driver is created, so the admin can copy
-  // down the driver's login ID, password, and van QR token before it's gone.
   const [driverCredentials, setDriverCredentials] = useState(null);
-
-  // Lets the admin re-open an existing van's QR token later, not just
-  // right after creation.
   const [viewingQrVan, setViewingQrVan] = useState(null);
 
   const [pendingDelete, setPendingDelete] = useState(null);
@@ -173,7 +164,6 @@ export default function AdminDashboard() {
   const [toast, setToast] = useState(null);
   const toastTimer = useRef(null);
 
-  // Lightweight search filters for the two tables.
   const [vanSearch, setVanSearch]     = useState('');
   const [staffSearch, setStaffSearch] = useState('');
 
@@ -358,11 +348,6 @@ export default function AdminDashboard() {
         showToast('success', `${formData.plateNumber} and its driver have been successfully registered.`);
         setVanModal(null);
 
-        // Surface the driver's login credentials AND the van's QR token
-        // right away — the password is hashed server-side after this and
-        // can't be recovered later, and this is the most convenient moment
-        // to grab the QR too (though it can also be viewed later from the
-        // vans table via the "QR" button).
         setDriverCredentials({
           plateNumber: formData.plateNumber,
           driverName: formData.driverName,
@@ -420,7 +405,6 @@ export default function AdminDashboard() {
     }
   }, [togglingId, showToast]);
 
-  // ── Table search filters ──────────────────────────────────────────────────
   const filteredVans = useMemo(() => {
     const q = vanSearch.trim().toLowerCase();
     if (!q) return data.vans;
@@ -446,7 +430,6 @@ export default function AdminDashboard() {
     ));
   }, [data.staff, staffSearch]);
 
-  // ── Audit helpers ─────────────────────────────────────────────────────────
   const auditActionOptions = useMemo(() => {
     const set = new Set();
     auditLogs.forEach((entry) => { if (entry?.action) set.add(entry.action); });
@@ -513,48 +496,76 @@ export default function AdminDashboard() {
   const anyMutationBusy = mutationLoading || vanMutationLoading;
 
   return (
-    <div className="min-h-screen bg-gray-100 p-4 md:p-6">
+    <div className="min-h-screen bg-gray-100 p-3 sm:p-4 md:p-6">
       {toast && (
-        <div role="status" aria-live="polite" className={`fixed top-4 left-1/2 -translate-x-1/2 z-50 px-5 py-3 rounded-xl shadow-xl font-semibold text-sm flex items-center gap-3 max-w-sm w-full border ${toast.type === 'success' ? 'bg-green-50 text-green-800 border-green-200' : 'bg-red-50 text-red-800 border-red-200'}`}>
+        <div
+          role="status"
+          aria-live="polite"
+          className={`fixed top-3 left-1/2 -translate-x-1/2 z-50 px-4 py-3 rounded-xl shadow-xl font-semibold text-sm flex items-center gap-3 max-w-[calc(100%-1.5rem)] sm:max-w-sm w-full border ${
+            toast.type === 'success' ? 'bg-green-50 text-green-800 border-green-200' : 'bg-red-50 text-red-800 border-red-200'
+          }`}
+        >
           <span className="flex-1">{toast.type === 'success' ? '✅' : '⚠️'} {toast.message}</span>
           <button onClick={() => setToast(null)} aria-label="Dismiss" className="opacity-50 hover:opacity-100 font-bold text-base leading-none">✕</button>
         </div>
       )}
 
-      <div className="max-w-6xl mx-auto bg-white p-5 rounded-xl shadow-sm border mb-6 flex flex-wrap gap-3 justify-between items-center">
-        <div>
-          <h1 className="text-2xl font-extrabold text-gray-900">Catanduanes Command Center</h1>
-          <p className="text-sm text-gray-500">System Administration &amp; Analytics</p>
+      {/* ── Header ─────────────────────────────────────────────────────── */}
+      <div className="max-w-6xl mx-auto bg-white p-4 sm:p-5 rounded-xl shadow-sm border mb-4 sm:mb-6 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3">
+        <div className="min-w-0">
+          <h1 className="text-xl sm:text-2xl font-extrabold text-gray-900 leading-tight">Catanduanes Command Center</h1>
+          <p className="text-xs sm:text-sm text-gray-500 mt-0.5">System Administration &amp; Analytics</p>
         </div>
-        <div className="flex items-center gap-3">
-          <button onClick={() => setIsAuditOpen(true)} title="View the full audit trail" className="text-sm font-semibold px-4 py-2 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-100 transition flex items-center gap-2">
-            🧾 Audit Trail
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            onClick={() => setIsAuditOpen(true)}
+            title="View the full audit trail"
+            className="text-xs sm:text-sm font-semibold px-3 sm:px-4 py-2 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-100 transition flex items-center gap-2 flex-1 sm:flex-initial justify-center"
+          >
+            🧾 <span className="hidden xs:inline sm:inline">Audit Trail</span>
             <span className="bg-gray-100 text-gray-600 text-xs font-bold px-1.5 py-0.5 rounded">{auditLogs.length}</span>
           </button>
-          <button onClick={() => setReloadToken((n) => n + 1)} title="Refresh dashboard" aria-label="Refresh dashboard" className="p-2 rounded-lg text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition">🔄</button>
-          <button onClick={handleLogout} disabled={loggingOut} className="bg-red-50 text-red-600 font-bold px-4 py-2 rounded-lg border border-red-200 hover:bg-red-100 transition text-sm disabled:opacity-50 disabled:cursor-not-allowed">
+          <button
+            onClick={() => setReloadToken((n) => n + 1)}
+            title="Refresh dashboard"
+            aria-label="Refresh dashboard"
+            className="p-2 rounded-lg text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition"
+          >
+            🔄
+          </button>
+          <button
+            onClick={handleLogout}
+            disabled={loggingOut}
+            className="bg-red-50 text-red-600 font-bold px-3 sm:px-4 py-2 rounded-lg border border-red-200 hover:bg-red-100 transition text-xs sm:text-sm disabled:opacity-50 disabled:cursor-not-allowed flex-1 sm:flex-initial"
+          >
             {loggingOut ? 'Logging out…' : 'Log out'}
           </button>
         </div>
       </div>
 
-      <div className="max-w-6xl mx-auto space-y-6">
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+      <div className="max-w-6xl mx-auto space-y-4 sm:space-y-6">
+        {/* ── Stat cards ───────────────────────────────────────────────── */}
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 sm:gap-4">
           <StatCard title="Active Trips" value={data.stats.activeTrips} color="text-green-600" icon="🚐" />
-          <StatCard title="Total Trips Logged" value={data.stats.totalTrips} color="text-blue-600" icon="📊" />
+          <StatCard title="Total Trips" value={data.stats.totalTrips} color="text-blue-600" icon="📊" />
           <StatCard title="Total Vans" value={data.stats.totalVans} color="text-purple-600" icon="🚌" />
           <StatCard title="Total Staff" value={data.stats.totalUsers} color="text-orange-600" icon="👥" />
         </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-6">
           {/* ── Vans card ─────────────────────────────────────────────── */}
-          <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-200">
-            <div className="flex justify-between items-center mb-3 border-b pb-2 gap-3">
-              <h2 className="text-lg font-bold text-gray-800 flex items-center gap-2">
+          <div className="bg-white p-3 sm:p-4 rounded-xl shadow-sm border border-gray-200">
+            <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2 sm:gap-3 mb-3 border-b pb-3">
+              <h2 className="text-base sm:text-lg font-bold text-gray-800 flex items-center gap-2">
                 Registered Vans
                 <span className="text-xs font-bold bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full">{data.vans.length}</span>
               </h2>
-              <button onClick={openAddVanModal} className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-1.5 rounded-lg transition shadow-sm whitespace-nowrap">＋ Add Van &amp; Driver</button>
+              <button
+                onClick={openAddVanModal}
+                className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-1.5 rounded-lg transition shadow-sm whitespace-nowrap self-stretch sm:self-auto"
+              >
+                ＋ Add Van &amp; Driver
+              </button>
             </div>
 
             {data.vans.length > 0 && (
@@ -562,16 +573,21 @@ export default function AdminDashboard() {
                 <SearchInput
                   value={vanSearch}
                   onChange={setVanSearch}
-                  placeholder="Search by plate, status, capacity, or driver…"
+                  placeholder="Search vans…"
                   ariaLabel="Search vans"
                 />
               </div>
             )}
 
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm text-left">
+            <div className="overflow-x-auto -mx-3 sm:mx-0">
+              <table className="w-full text-sm text-left min-w-[480px]">
                 <thead className="bg-gray-50 text-gray-500 text-xs uppercase tracking-wide">
-                  <tr><th className="p-3">Plate</th><th className="p-3">Capacity</th><th className="p-3">Status</th><th className="p-3 text-right">Actions</th></tr>
+                  <tr>
+                    <th className="p-3">Plate</th>
+                    <th className="p-3">Capacity</th>
+                    <th className="p-3">Status</th>
+                    <th className="p-3 text-right">Actions</th>
+                  </tr>
                 </thead>
                 <tbody>
                   {filteredVans.length === 0 ? (
@@ -579,7 +595,7 @@ export default function AdminDashboard() {
                       colSpan={4}
                       message={
                         data.vans.length === 0
-                          ? 'No vans yet. Click "Add Van & Driver" to register the first one.'
+                          ? 'No vans yet. Tap "Add Van & Driver" to register the first one.'
                           : 'No vans match your search.'
                       }
                     />
@@ -609,13 +625,18 @@ export default function AdminDashboard() {
           </div>
 
           {/* ── Staff card ────────────────────────────────────────────── */}
-          <div className="bg-white p-4 rounded-xl shadow-sm border border-gray-200">
-            <div className="flex justify-between items-center mb-3 border-b pb-2 gap-3">
-              <h2 className="text-lg font-bold text-gray-800 flex items-center gap-2">
+          <div className="bg-white p-3 sm:p-4 rounded-xl shadow-sm border border-gray-200">
+            <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2 sm:gap-3 mb-3 border-b pb-3">
+              <h2 className="text-base sm:text-lg font-bold text-gray-800 flex items-center gap-2">
                 System Users &amp; Drivers
                 <span className="text-xs font-bold bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full">{data.staff.length}</span>
               </h2>
-              <button onClick={openAddStaffModal} className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-1.5 rounded-lg transition shadow-sm whitespace-nowrap">＋ Add Staff Account</button>
+              <button
+                onClick={openAddStaffModal}
+                className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-1.5 rounded-lg transition shadow-sm whitespace-nowrap self-stretch sm:self-auto"
+              >
+                ＋ Add Staff Account
+              </button>
             </div>
 
             {data.staff.length > 0 && (
@@ -623,16 +644,21 @@ export default function AdminDashboard() {
                 <SearchInput
                   value={staffSearch}
                   onChange={setStaffSearch}
-                  placeholder="Search by name, email, ID, or role…"
+                  placeholder="Search staff…"
                   ariaLabel="Search staff"
                 />
               </div>
             )}
 
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm text-left">
+            <div className="overflow-x-auto -mx-3 sm:mx-0">
+              <table className="w-full text-sm text-left min-w-[480px]">
                 <thead className="bg-gray-50 text-gray-500 text-xs uppercase tracking-wide">
-                  <tr><th className="p-3">Name</th><th className="p-3">Role</th><th className="p-3">Status</th><th className="p-3 text-right">Actions</th></tr>
+                  <tr>
+                    <th className="p-3">Name</th>
+                    <th className="p-3">Role</th>
+                    <th className="p-3">Status</th>
+                    <th className="p-3 text-right">Actions</th>
+                  </tr>
                 </thead>
                 <tbody>
                   {filteredStaff.length === 0 ? (
@@ -640,7 +666,7 @@ export default function AdminDashboard() {
                       colSpan={4}
                       message={
                         data.staff.length === 0
-                          ? 'No staff accounts yet. Click "Add Staff Account" to create one.'
+                          ? 'No staff accounts yet. Tap "Add Staff Account" to create one.'
                           : 'No staff match your search.'
                       }
                     />
@@ -651,7 +677,7 @@ export default function AdminDashboard() {
                       <tr key={user.id} className={`border-b hover:bg-gray-50 transition-opacity ${isBusy ? 'opacity-50' : ''}`}>
                         <td className="p-3">
                           <div className="font-bold text-gray-800 leading-tight">{user.name ?? 'Unnamed'}</div>
-                          <div className="text-xs text-gray-400 mt-0.5">{user.email || user.driverId || '—'}</div>
+                          <div className="text-xs text-gray-400 mt-0.5 break-all">{user.email || user.driverId || '—'}</div>
                         </td>
                         <td className="p-3"><RoleBadge role={user.role} /></td>
                         <td className="p-3">
@@ -760,8 +786,8 @@ function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onCl
     }
 
     if (!isEdit) {
-      if (!form.password) e.password = 'A password is required.';
-      else if (form.password.length < PASSWORD_MIN) e.password = `Password must be at least ${PASSWORD_MIN} characters.`;
+      if (!form.password) e.password = 'A PIN is required.';
+      else if (form.password.length < PASSWORD_MIN) e.password = `PIN must be at least ${PASSWORD_MIN} characters.`;
     }
 
     return e;
@@ -782,14 +808,20 @@ function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onCl
   if (!isOpen) return null;
 
   return (
-    <div role="dialog" aria-modal="true" aria-labelledby="staff-modal-title" className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" onClick={(e) => { if (e.target === e.currentTarget && !isLoading) onClose(); }}>
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md">
-        <div className="flex justify-between items-center p-5 border-b">
-          <h2 id="staff-modal-title" className="text-lg font-bold text-gray-900">{isEdit ? 'Edit Account' : 'Add Staff Account'}</h2>
-          <button onClick={onClose} disabled={isLoading} aria-label="Close" className="text-gray-400 hover:text-gray-600 disabled:opacity-40 text-xl leading-none">✕</button>
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="staff-modal-title"
+      className="fixed inset-0 bg-black/50 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4"
+      onClick={(e) => { if (e.target === e.currentTarget && !isLoading) onClose(); }}
+    >
+      <div className="bg-white rounded-t-2xl sm:rounded-2xl shadow-2xl w-full max-w-md max-h-[95vh] sm:max-h-[90vh] flex flex-col">
+        <div className="flex justify-between items-center p-4 sm:p-5 border-b">
+          <h2 id="staff-modal-title" className="text-base sm:text-lg font-bold text-gray-900">{isEdit ? 'Edit Account' : 'Add Staff Account'}</h2>
+          <button onClick={onClose} disabled={isLoading} aria-label="Close" className="text-gray-400 hover:text-gray-600 disabled:opacity-40 text-xl leading-none p-1">✕</button>
         </div>
-        {serverError && <div className="mx-5 mt-4 p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg text-sm">⚠️ {serverError}</div>}
-        <div className="p-5 space-y-4">
+        {serverError && <div className="mx-4 sm:mx-5 mt-4 p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg text-sm">⚠️ {serverError}</div>}
+        <div className="p-4 sm:p-5 space-y-4 overflow-y-auto">
           <Field label="Full Name" required error={errors.name}>
             <input ref={nameRef} name="name" type="text" value={form.name} onChange={change} placeholder="e.g. Juan dela Cruz" autoComplete="name" maxLength={100} className={inputCls(errors.name)} />
           </Field>
@@ -801,7 +833,7 @@ function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onCl
               <option value="DISPATCHER">Dispatcher</option>
               {isEdit && form.role === 'DRIVER' && <option value="DRIVER">Driver</option>}
             </select>
-            {!isEdit && <p className="text-xs text-blue-600 mt-1.5 font-medium">To add a Driver, use "Add Van &amp; Driver" instead — drivers sign in with a login ID and password, not an email.</p>}
+            {!isEdit && <p className="text-xs text-blue-600 mt-1.5 font-medium">To add a Driver, use "Add Van &amp; Driver" instead — drivers sign in with a login ID and PIN, not an email.</p>}
           </Field>
 
           {form.role && form.role !== 'DRIVER' && (
@@ -812,17 +844,17 @@ function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onCl
 
           {!isEdit && form.role && (
             <Field
-              label="Password"
+              label="PIN"
               required
               error={errors.password}
-              hint={`At least ${PASSWORD_MIN} characters. Use the generator for a quick, non-obvious password.`}
+              hint={`At least ${PASSWORD_MIN} characters. Use the generator for a quick, non-obvious PIN.`}
               action={<GeneratePasswordButton onGenerate={handleGeneratePassword} />}
             >
               <PasswordInput
                 name="password"
                 value={form.password}
                 onChange={change}
-                placeholder="Enter a password"
+                placeholder="Enter a PIN"
                 autoComplete="new-password"
                 hasError={errors.password}
                 maxLength={128}
@@ -831,11 +863,11 @@ function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onCl
               />
             </Field>
           )}
-          {isEdit && <p className="text-xs text-gray-400">To reset this user's password, use the dedicated reset flow — it isn't changed here.</p>}
+          {isEdit && <p className="text-xs text-gray-400">To reset this user's PIN, use the dedicated reset flow — it isn't changed here.</p>}
         </div>
-        <div className="flex gap-3 p-5 border-t bg-gray-50 rounded-b-2xl">
-          <button onClick={onClose} disabled={isLoading} className="flex-1 py-2 border border-gray-300 rounded-lg text-sm font-semibold text-gray-700 hover:bg-gray-100 transition disabled:opacity-40">Cancel</button>
-          <button onClick={submit} disabled={isLoading} className="flex-1 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-bold transition disabled:opacity-70 disabled:cursor-not-allowed">
+        <div className="flex flex-col-reverse sm:flex-row gap-2 sm:gap-3 p-4 sm:p-5 border-t bg-gray-50 rounded-b-2xl">
+          <button onClick={onClose} disabled={isLoading} className="flex-1 py-2.5 sm:py-2 border border-gray-300 rounded-lg text-sm font-semibold text-gray-700 hover:bg-gray-100 transition disabled:opacity-40">Cancel</button>
+          <button onClick={submit} disabled={isLoading} className="flex-1 py-2.5 sm:py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-bold transition disabled:opacity-70 disabled:cursor-not-allowed">
             {isLoading ? (isEdit ? 'Saving…' : 'Creating…') : (isEdit ? 'Save Changes' : 'Create Account')}
           </button>
         </div>
@@ -903,9 +935,9 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
     if (!form.status) e.status = 'Status is required.';
 
     if (!isEdit) {
-      if (!form.driverName.trim()) e.driverName = 'Driver name is required.';
-      if (!form.driverPassword) e.driverPassword = 'A password is required.';
-      else if (form.driverPassword.length < PASSWORD_MIN) e.driverPassword = `Password must be at least ${PASSWORD_MIN} characters.`;
+      if (!form.driverName.trim()) e.driverName = 'Username is required.';
+      if (!form.driverPassword) e.driverPassword = 'A PIN is required.';
+      else if (form.driverPassword.length < PASSWORD_MIN) e.driverPassword = `PIN must be at least ${PASSWORD_MIN} characters.`;
     }
 
     return e;
@@ -924,7 +956,7 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
     if (!isEdit) {
       payload.driverName = form.driverName.trim();
       // NOTE: the backend wire-format field is still called `driverPin`,
-      // but it now carries a full password rather than a short numeric PIN.
+      // but the UI now presents it as a PIN rather than a password.
       payload.driverPin = form.driverPassword;
     }
 
@@ -934,16 +966,22 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
   if (!isOpen) return null;
 
   return (
-    <div role="dialog" aria-modal="true" aria-labelledby="van-modal-title" className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" onClick={(e) => { if (e.target === e.currentTarget && !isLoading) onClose(); }}>
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden">
-        <div className="flex justify-between items-center p-5 border-b bg-slate-50">
-          <h2 id="van-modal-title" className="text-lg font-black text-gray-900">{isEdit ? 'Edit Van' : 'Add Van & Driver'}</h2>
-          <button onClick={onClose} disabled={isLoading} aria-label="Close" className="text-gray-400 hover:text-gray-600 disabled:opacity-40 text-xl leading-none">✕</button>
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="van-modal-title"
+      className="fixed inset-0 bg-black/50 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4"
+      onClick={(e) => { if (e.target === e.currentTarget && !isLoading) onClose(); }}
+    >
+      <div className="bg-white rounded-t-2xl sm:rounded-2xl shadow-2xl w-full max-w-md max-h-[95vh] sm:max-h-[90vh] flex flex-col">
+        <div className="flex justify-between items-center p-4 sm:p-5 border-b bg-slate-50">
+          <h2 id="van-modal-title" className="text-base sm:text-lg font-black text-gray-900">{isEdit ? 'Edit Van' : 'Add Van & Driver'}</h2>
+          <button onClick={onClose} disabled={isLoading} aria-label="Close" className="text-gray-400 hover:text-gray-600 disabled:opacity-40 text-xl leading-none p-1">✕</button>
         </div>
 
-        {serverError && <div className="mx-5 mt-4 p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg text-sm font-medium">⚠️ {serverError}</div>}
+        {serverError && <div className="mx-4 sm:mx-5 mt-4 p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg text-sm font-medium">⚠️ {serverError}</div>}
 
-        <div className="p-5 max-h-[70vh] overflow-y-auto space-y-6">
+        <div className="p-4 sm:p-5 overflow-y-auto space-y-6">
           {/* VAN DETAILS */}
           <div>
             <h3 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-3 border-b pb-1">Van Information</h3>
@@ -952,8 +990,8 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
                 <input ref={plateRef} name="plateNumber" type="text" value={form.plateNumber} onChange={change} placeholder="e.g. ABC-1234" autoComplete="off" maxLength={15} disabled={isEdit} className={`${inputCls(errors.plateNumber)} uppercase disabled:bg-gray-100 disabled:text-gray-500`} />
               </Field>
 
-              <div className="grid grid-cols-2 gap-4">
-                <Field label="Capacity" required error={errors.capacity} hint="Passenger seats (1-30).">
+              <div className="grid grid-cols-2 gap-3 sm:gap-4">
+                <Field label="Capacity" required error={errors.capacity} hint="Seats (1-30).">
                   <input name="capacity" type="number" min={1} max={30} value={form.capacity} onChange={change} placeholder="e.g. 14" className={inputCls(errors.capacity)} />
                 </Field>
                 <Field label="Status" required error={errors.status}>
@@ -972,14 +1010,14 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
               <p className="text-xs text-blue-600 mb-3 font-medium">
                 A new driver account will be created — not by email, but with a login ID the system generates
                 automatically. You'll see that ID right after you submit this form, so you can hand it to the driver
-                along with the password below. You'll also get a scannable QR code for this van at the same time.
+                along with the PIN below. You'll also get a scannable QR code for this van at the same time.
               </p>
               <div className="space-y-4">
-                <Field label="Driver Full Name" required error={errors.driverName}>
-                  <input name="driverName" type="text" value={form.driverName} onChange={change} placeholder="e.g. Juan dela Cruz" className={inputCls(errors.driverName)} />
+                <Field label="Username" required error={errors.driverName}>
+                  <input name="driverName" type="text" value={form.driverName} onChange={change} placeholder="e.g. juandelacruz" autoComplete="off" maxLength={60} className={inputCls(errors.driverName)} />
                 </Field>
                 <Field
-                  label="Driver Password"
+                  label="Driver PIN"
                   required
                   error={errors.driverPassword}
                   hint={`What the driver will type in to sign in. At least ${PASSWORD_MIN} characters — use the generator for a quick, non-obvious one.`}
@@ -989,7 +1027,7 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
                     name="driverPassword"
                     value={form.driverPassword}
                     onChange={change}
-                    placeholder="Enter a password"
+                    placeholder="Enter a PIN"
                     autoComplete="new-password"
                     hasError={errors.driverPassword}
                     maxLength={128}
@@ -1002,9 +1040,9 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
           )}
         </div>
 
-        <div className="flex gap-3 p-5 border-t bg-gray-50 rounded-b-2xl">
-          <button onClick={onClose} disabled={isLoading} className="flex-1 py-2 border border-gray-300 rounded-lg text-sm font-semibold text-gray-700 hover:bg-gray-100 transition disabled:opacity-40">Cancel</button>
-          <button onClick={submit} disabled={isLoading} className="flex-[2] py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-sm font-bold transition disabled:opacity-70 disabled:cursor-not-allowed">
+        <div className="flex flex-col-reverse sm:flex-row gap-2 sm:gap-3 p-4 sm:p-5 border-t bg-gray-50 rounded-b-2xl">
+          <button onClick={onClose} disabled={isLoading} className="flex-1 py-2.5 sm:py-2 border border-gray-300 rounded-lg text-sm font-semibold text-gray-700 hover:bg-gray-100 transition disabled:opacity-40">Cancel</button>
+          <button onClick={submit} disabled={isLoading} className="flex-[2] py-2.5 sm:py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-sm font-bold transition disabled:opacity-70 disabled:cursor-not-allowed">
             {isLoading ? (isEdit ? 'Saving…' : 'Creating…') : (isEdit ? 'Save Changes' : 'Add Van & Driver')}
           </button>
         </div>
@@ -1015,10 +1053,8 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
 
 // ─── DriverCredentialsModal ────────────────────────────────────────────────────
 // Shown once, immediately after a van + driver is created. This is the only
-// moment the password is visible on screen — after this it only exists as a
-// hash on the server, so make sure the admin has a chance to write it down.
-// The QR token, unlike the password, is NOT one-time-only — it can be re-viewed
-// any time later via the "QR" button in the vans table (see QrOnlyModal).
+// moment the PIN is visible on screen — after this it only exists as a hash
+// on the server, so make sure the admin has a chance to write it down.
 
 function DriverCredentialsModal({ credentials, onClose }) {
   const [showPassword, setShowPassword] = useState(false);
@@ -1037,16 +1073,21 @@ function DriverCredentialsModal({ credentials, onClose }) {
   const maskedPassword = password ? '•'.repeat(Math.min(password.length, 16)) : '—';
 
   return (
-    <div role="dialog" aria-modal="true" aria-labelledby="driver-creds-title" className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm">
-        <div className="p-6 space-y-4 text-center max-h-[85vh] overflow-y-auto">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="driver-creds-title"
+      className="fixed inset-0 bg-black/50 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4"
+    >
+      <div className="bg-white rounded-t-2xl sm:rounded-2xl shadow-2xl w-full max-w-sm max-h-[95vh] sm:max-h-[90vh] flex flex-col">
+        <div className="p-5 sm:p-6 space-y-4 text-center overflow-y-auto">
           <div className="text-4xl" aria-hidden="true">✅</div>
-          <h2 id="driver-creds-title" className="text-lg font-black text-gray-900">Driver Account Created</h2>
+          <h2 id="driver-creds-title" className="text-base sm:text-lg font-black text-gray-900">Driver Account Created</h2>
           <p className="text-sm text-gray-500">
-            Give <strong>{driverName}</strong> these details — this is the only time the password will be shown.
+            Give <strong>{driverName}</strong> these details — this is the only time the PIN will be shown.
           </p>
 
-          <div className="bg-gray-50 border border-gray-200 rounded-xl p-4 text-left space-y-3">
+          <div className="bg-gray-50 border border-gray-200 rounded-xl p-3 sm:p-4 text-left space-y-3">
             <div>
               <div className="text-xs font-bold text-gray-400 uppercase tracking-wide">Van</div>
               <div className="font-bold text-gray-900">{plateNumber}</div>
@@ -1060,23 +1101,23 @@ function DriverCredentialsModal({ credentials, onClose }) {
                 </div>
               ) : (
                 <div className="flex items-center gap-2">
-                  <div className="font-mono font-bold text-gray-900 text-base flex-1 break-all">{driverId}</div>
+                  <div className="font-mono font-bold text-gray-900 text-sm sm:text-base flex-1 break-all">{driverId}</div>
                   <CopyButton text={driverId} label="Copy" />
                 </div>
               )}
             </div>
 
             <div>
-              <div className="text-xs font-bold text-gray-400 uppercase tracking-wide mb-0.5">Password</div>
+              <div className="text-xs font-bold text-gray-400 uppercase tracking-wide mb-0.5">PIN</div>
               <div className="flex items-center gap-2">
-                <div className="font-mono font-bold text-gray-900 text-base flex-1 break-all">
+                <div className="font-mono font-bold text-gray-900 text-sm sm:text-base flex-1 break-all">
                   {showPassword ? (password ?? '—') : maskedPassword}
                 </div>
                 <button
                   type="button"
                   onClick={() => setShowPassword((s) => !s)}
-                  aria-label={showPassword ? 'Hide password' : 'Show password'}
-                  title={showPassword ? 'Hide password' : 'Show password'}
+                  aria-label={showPassword ? 'Hide PIN' : 'Show PIN'}
+                  title={showPassword ? 'Hide PIN' : 'Show PIN'}
                   className="shrink-0 text-xs font-bold px-2 py-1.5 rounded border border-gray-300 text-gray-600 bg-white hover:bg-gray-100 transition"
                 >
                   {showPassword ? '🙈' : '👁'}
@@ -1099,7 +1140,7 @@ function DriverCredentialsModal({ credentials, onClose }) {
                 <img
                   src={`https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=${encodeURIComponent(qrToken)}`}
                   alt="Van QR preview"
-                  className="mt-3 mx-auto rounded-lg border border-gray-200"
+                  className="mt-3 mx-auto rounded-lg border border-gray-200 max-w-full"
                 />
                 <p className="text-xs text-gray-400 mt-2">
                   Paste the text above into any QR generator, or right-click the preview image to save it directly.
@@ -1109,11 +1150,11 @@ function DriverCredentialsModal({ credentials, onClose }) {
           </div>
 
           <p className="text-xs text-gray-400">
-            The driver enters the Login ID and password above on the driver sign-in screen — no email needed.
+            The driver enters the Login ID and PIN above on the driver sign-in screen — no email needed.
           </p>
         </div>
-        <div className="p-5 border-t bg-gray-50 rounded-b-2xl">
-          <button onClick={onClose} className="w-full py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-bold transition">
+        <div className="p-4 sm:p-5 border-t bg-gray-50 rounded-b-2xl">
+          <button onClick={onClose} className="w-full py-2.5 sm:py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-bold transition">
             Got it, close
           </button>
         </div>
@@ -1123,9 +1164,6 @@ function DriverCredentialsModal({ credentials, onClose }) {
 }
 
 // ─── QrOnlyModal ────────────────────────────────────────────────────────────
-// Re-opens an existing van's QR (from the vans table "QR" button) without
-// showing any driver/password fields — those are one-time-only and unrelated
-// to viewing a van's permanent scan code later.
 
 function QrOnlyModal({ van, onClose }) {
   useEffect(() => {
@@ -1140,18 +1178,23 @@ function QrOnlyModal({ van, onClose }) {
   const qrToken = van.qrToken;
 
   return (
-    <div role="dialog" aria-modal="true" aria-labelledby="qr-only-title" className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm">
-        <div className="p-6 space-y-4 text-center">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="qr-only-title"
+      className="fixed inset-0 bg-black/50 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4"
+    >
+      <div className="bg-white rounded-t-2xl sm:rounded-2xl shadow-2xl w-full max-w-sm max-h-[95vh] sm:max-h-[90vh] flex flex-col">
+        <div className="p-5 sm:p-6 space-y-4 text-center overflow-y-auto">
           <div className="text-4xl" aria-hidden="true">📱</div>
-          <h2 id="qr-only-title" className="text-lg font-black text-gray-900">{van.plateNumber} — Scan QR</h2>
+          <h2 id="qr-only-title" className="text-base sm:text-lg font-black text-gray-900">{van.plateNumber} — Scan QR</h2>
 
           {!qrToken ? (
             <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-sm text-amber-800">
               No QR token was returned for this van by the server.
             </div>
           ) : (
-            <div className="bg-gray-50 border border-gray-200 rounded-xl p-4 text-left space-y-3">
+            <div className="bg-gray-50 border border-gray-200 rounded-xl p-3 sm:p-4 text-left space-y-3">
               <div className="flex items-center gap-2">
                 <code className="flex-1 text-[11px] bg-white border border-gray-200 rounded px-2 py-1.5 break-all font-mono">
                   {qrToken}
@@ -1161,7 +1204,7 @@ function QrOnlyModal({ van, onClose }) {
               <img
                 src={`https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(qrToken)}`}
                 alt="Van QR preview"
-                className="mx-auto rounded-lg border border-gray-200"
+                className="mx-auto rounded-lg border border-gray-200 max-w-full"
               />
               <p className="text-xs text-gray-400">
                 Reprint this if the sticker is lost or damaged — it's the same code every time.
@@ -1169,8 +1212,8 @@ function QrOnlyModal({ van, onClose }) {
             </div>
           )}
         </div>
-        <div className="p-5 border-t bg-gray-50 rounded-b-2xl">
-          <button onClick={onClose} className="w-full py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-bold transition">
+        <div className="p-4 sm:p-5 border-t bg-gray-50 rounded-b-2xl">
+          <button onClick={onClose} className="w-full py-2.5 sm:py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-bold transition">
             Close
           </button>
         </div>
@@ -1195,23 +1238,29 @@ function ConfirmDeleteModal({ target, onClose, onConfirm, isLoading, serverError
   if (!target) return null;
 
   return (
-    <div role="dialog" aria-modal="true" aria-labelledby="delete-modal-title" className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" onClick={(e) => { if (e.target === e.currentTarget && !isLoading) onClose(); }}>
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm">
-        <div className="p-6 space-y-4 text-center">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="delete-modal-title"
+      className="fixed inset-0 bg-black/50 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4"
+      onClick={(e) => { if (e.target === e.currentTarget && !isLoading) onClose(); }}
+    >
+      <div className="bg-white rounded-t-2xl sm:rounded-2xl shadow-2xl w-full max-w-sm max-h-[95vh] sm:max-h-[90vh] flex flex-col">
+        <div className="p-5 sm:p-6 space-y-4 text-center overflow-y-auto">
           <div className="text-4xl" aria-hidden="true">⚠️</div>
-          <h2 id="delete-modal-title" className="text-lg font-black text-gray-900">{isVan ? 'Remove Van?' : 'Delete Account?'}</h2>
+          <h2 id="delete-modal-title" className="text-base sm:text-lg font-black text-gray-900">{isVan ? 'Remove Van?' : 'Delete Account?'}</h2>
           <p className="text-sm text-gray-500">You are about to {isVan ? 'permanently remove' : 'permanently delete'}:</p>
-          <div className="inline-block py-2 px-5 bg-gray-50 border border-gray-200 rounded-xl text-left">
-            <p className="font-bold text-gray-900">{target.label}</p>
+          <div className="inline-block py-2 px-4 sm:px-5 bg-gray-50 border border-gray-200 rounded-xl text-left">
+            <p className="font-bold text-gray-900 break-all">{target.label}</p>
             <div className="mt-1">{isVan ? <span className="text-xs text-gray-500">{target.sublabel}</span> : <RoleBadge role={target.role} />}</div>
           </div>
           {isAdminRole && <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-700 text-left"><strong>Admin account detected.</strong> Ensure at least one other admin remains in the system before proceeding.</div>}
           <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-800 text-left">This action is <strong>permanent and cannot be undone.</strong> {isVan ? 'This van will no longer be assignable to trips.' : 'All data associated with this account will be removed.'}</div>
           {serverError && <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700 text-left">⚠️ {serverError}</div>}
         </div>
-        <div className="flex gap-3 p-5 border-t bg-gray-50 rounded-b-2xl">
-          <button onClick={onClose} disabled={isLoading} className="flex-1 py-2 border border-gray-300 rounded-lg text-sm font-semibold text-gray-700 hover:bg-gray-100 transition disabled:opacity-40">Cancel</button>
-          <button onClick={onConfirm} disabled={isLoading} className="flex-1 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-sm font-black transition disabled:opacity-70 disabled:cursor-not-allowed">
+        <div className="flex flex-col-reverse sm:flex-row gap-2 sm:gap-3 p-4 sm:p-5 border-t bg-gray-50 rounded-b-2xl">
+          <button onClick={onClose} disabled={isLoading} className="flex-1 py-2.5 sm:py-2 border border-gray-300 rounded-lg text-sm font-semibold text-gray-700 hover:bg-gray-100 transition disabled:opacity-40">Cancel</button>
+          <button onClick={onConfirm} disabled={isLoading} className="flex-1 py-2.5 sm:py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-sm font-black transition disabled:opacity-70 disabled:cursor-not-allowed">
             {isLoading ? 'Deleting…' : `🗑 Yes, ${isVan ? 'Remove' : 'Delete'}`}
           </button>
         </div>
@@ -1229,20 +1278,20 @@ function RoleBadge({ role }) {
 
 function VanStatusBadge({ status }) {
   const styles = { IDLE: 'bg-yellow-100 text-yellow-800', DISPATCHED: 'bg-green-100 text-green-800', MAINTENANCE: 'bg-orange-100 text-orange-800', OUT_OF_SERVICE: 'bg-red-100 text-red-800' };
-  return <span className={`px-2 py-1 rounded text-xs font-bold ${styles[status] ?? 'bg-gray-100 text-gray-600'}`}>{(status ?? 'UNKNOWN').replace('_', ' ')}</span>;
+  return <span className={`px-2 py-1 rounded text-xs font-bold whitespace-nowrap ${styles[status] ?? 'bg-gray-100 text-gray-600'}`}>{(status ?? 'UNKNOWN').replace('_', ' ')}</span>;
 }
 
 function StatCard({ title, value, color, icon }) {
   return (
-    <div className="bg-white p-5 rounded-xl shadow-sm border border-gray-200 flex items-center gap-4">
+    <div className="bg-white p-3 sm:p-5 rounded-xl shadow-sm border border-gray-200 flex items-center gap-3 sm:gap-4">
       {icon && (
-        <div className={`text-2xl w-11 h-11 shrink-0 rounded-full bg-gray-50 flex items-center justify-center ${color}`} aria-hidden="true">
+        <div className={`text-xl sm:text-2xl w-9 h-9 sm:w-11 sm:h-11 shrink-0 rounded-full bg-gray-50 flex items-center justify-center ${color}`} aria-hidden="true">
           {icon}
         </div>
       )}
-      <div className="min-w-0">
-        <div className="text-xs text-gray-500 font-semibold uppercase tracking-wide truncate">{title}</div>
-        <div className={`text-2xl font-black ${color}`}>{value ?? 0}</div>
+      <div className="min-w-0 flex-1">
+        <div className="text-[10px] sm:text-xs text-gray-500 font-semibold uppercase tracking-wide truncate">{title}</div>
+        <div className={`text-lg sm:text-2xl font-black ${color}`}>{value ?? 0}</div>
       </div>
     </div>
   );
@@ -1252,7 +1301,6 @@ function EmptyTableRow({ colSpan, message }) {
   return <tr><td colSpan={colSpan} className="p-6 text-center text-sm text-gray-400 italic">{message}</td></tr>;
 }
 
-// Controlled password input with a show/hide toggle.
 function PasswordInput({ name, value, onChange, placeholder, autoComplete, hasError, maxLength, inputRef, visible, onToggleVisible }) {
   return (
     <div className="relative">
@@ -1270,8 +1318,8 @@ function PasswordInput({ name, value, onChange, placeholder, autoComplete, hasEr
       <button
         type="button"
         onClick={onToggleVisible}
-        aria-label={visible ? 'Hide password' : 'Show password'}
-        title={visible ? 'Hide password' : 'Show password'}
+        aria-label={visible ? 'Hide PIN' : 'Show PIN'}
+        title={visible ? 'Hide PIN' : 'Show PIN'}
         className="absolute inset-y-0 right-0 px-3 flex items-center text-gray-400 hover:text-gray-700 transition"
       >
         {visible ? '🙈' : '👁'}
@@ -1280,21 +1328,19 @@ function PasswordInput({ name, value, onChange, placeholder, autoComplete, hasEr
   );
 }
 
-// Small inline "generate random password" link-style button.
 function GeneratePasswordButton({ onGenerate }) {
   return (
     <button
       type="button"
       onClick={onGenerate}
-      title="Generate a random 4–8 digit password that isn't an obvious pattern"
+      title="Generate a random 4–8 digit PIN that isn't an obvious pattern"
       className="text-xs font-semibold text-blue-600 hover:text-blue-800 hover:underline transition inline-flex items-center gap-1 whitespace-nowrap"
     >
-      🎲 Generate a Random Password
+      🎲 Generate Random PIN
     </button>
   );
 }
 
-// Small copy-to-clipboard button that briefly shows a confirmation.
 function CopyButton({ text, label = 'Copy', disabled }) {
   const [copied, setCopied] = useState(false);
 
@@ -1324,7 +1370,6 @@ function CopyButton({ text, label = 'Copy', disabled }) {
   );
 }
 
-// Simple table search box.
 function SearchInput({ value, onChange, placeholder, ariaLabel }) {
   return (
     <div className="relative">
@@ -1335,7 +1380,7 @@ function SearchInput({ value, onChange, placeholder, ariaLabel }) {
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
         aria-label={ariaLabel}
-        className="w-full pl-9 pr-9 py-2 border border-gray-300 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400"
+        className="w-full pl-9 pr-9 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400"
       />
       {value && (
         <button
@@ -1373,45 +1418,100 @@ function AuditTrailModal({
   const hasFilters = Boolean(search || actionFilter || dateFrom || dateTo);
 
   return (
-    <div role="dialog" aria-modal="true" aria-labelledby="audit-modal-title" className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl max-h-[90vh] flex flex-col">
-        <div className="flex flex-wrap justify-between items-center gap-3 p-5 border-b">
-          <div>
-            <h2 id="audit-modal-title" className="text-lg font-bold text-gray-900">Audit Trail</h2>
-            <p className="text-xs text-gray-400 mt-0.5">{fullCount} {fullCount === 1 ? 'entry' : 'entries'} saved on this device {lastSync && <> · Last synced {formatAuditTimestamp(lastSync)}</>}</p>
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="audit-modal-title"
+      className="fixed inset-0 bg-black/50 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4"
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <div className="bg-white rounded-t-2xl sm:rounded-2xl shadow-2xl w-full max-w-4xl max-h-[95vh] sm:max-h-[90vh] flex flex-col">
+        <div className="flex flex-wrap justify-between items-center gap-3 p-4 sm:p-5 border-b">
+          <div className="min-w-0">
+            <h2 id="audit-modal-title" className="text-base sm:text-lg font-bold text-gray-900">Audit Trail</h2>
+            <p className="text-xs text-gray-400 mt-0.5">
+              {fullCount} {fullCount === 1 ? 'entry' : 'entries'} saved on this device
+              {lastSync && <> · Synced {formatAuditTimestamp(lastSync)}</>}
+            </p>
           </div>
-          <button onClick={onClose} aria-label="Close audit trail" className="text-gray-400 hover:text-gray-600 text-xl leading-none">✕</button>
+          <button onClick={onClose} aria-label="Close audit trail" className="text-gray-400 hover:text-gray-600 text-xl leading-none p-1">✕</button>
         </div>
-        <div className="p-5 border-b space-y-3">
-          <div className="flex flex-wrap items-center gap-2">
-            <input type="text" value={search} onChange={(e) => onSearchChange(e.target.value)} placeholder="Search actor, action, target…" aria-label="Search audit trail" className="px-3 py-1.5 border border-gray-300 rounded-lg text-xs flex-1 min-w-[10rem] focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400" />
-            <select value={actionFilter} onChange={(e) => onActionFilterChange(e.target.value)} aria-label="Filter by action" className="px-3 py-1.5 border border-gray-300 rounded-lg text-xs bg-white focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400">
+
+        <div className="p-3 sm:p-5 border-b space-y-3">
+          <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-2">
+            <input
+              type="text"
+              value={search}
+              onChange={(e) => onSearchChange(e.target.value)}
+              placeholder="Search actor, action, target…"
+              aria-label="Search audit trail"
+              className="px-3 py-2 sm:py-1.5 border border-gray-300 rounded-lg text-sm sm:text-xs flex-1 min-w-0 sm:min-w-[10rem] focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400"
+            />
+            <select
+              value={actionFilter}
+              onChange={(e) => onActionFilterChange(e.target.value)}
+              aria-label="Filter by action"
+              className="px-3 py-2 sm:py-1.5 border border-gray-300 rounded-lg text-sm sm:text-xs bg-white focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400"
+            >
               <option value="">All actions</option>
               {actionOptions.map((a) => <option key={a} value={a}>{a}</option>)}
             </select>
-            <input type="date" value={dateFrom} onChange={(e) => onDateFromChange(e.target.value)} title="From date" aria-label="From date" className="px-3 py-1.5 border border-gray-300 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400" />
-            <span className="text-xs text-gray-400">to</span>
-            <input type="date" value={dateTo} onChange={(e) => onDateToChange(e.target.value)} title="To date" aria-label="To date" className="px-3 py-1.5 border border-gray-300 rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400" />
-            {hasFilters && <button onClick={onClearFilters} className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-gray-300 text-gray-500 hover:bg-gray-100 transition">Clear filters</button>}
+            <div className="flex items-center gap-2">
+              <input
+                type="date"
+                value={dateFrom}
+                onChange={(e) => onDateFromChange(e.target.value)}
+                title="From date"
+                aria-label="From date"
+                className="flex-1 px-3 py-2 sm:py-1.5 border border-gray-300 rounded-lg text-sm sm:text-xs focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400"
+              />
+              <span className="text-xs text-gray-400">to</span>
+              <input
+                type="date"
+                value={dateTo}
+                onChange={(e) => onDateToChange(e.target.value)}
+                title="To date"
+                aria-label="To date"
+                className="flex-1 px-3 py-2 sm:py-1.5 border border-gray-300 rounded-lg text-sm sm:text-xs focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400"
+              />
+            </div>
+            {hasFilters && (
+              <button onClick={onClearFilters} className="text-xs font-semibold px-3 py-2 sm:py-1.5 rounded-lg border border-gray-300 text-gray-500 hover:bg-gray-100 transition">Clear filters</button>
+            )}
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <button onClick={onRefresh} disabled={loading} title="Check for new audit entries now" className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-100 transition disabled:opacity-50">{loading ? 'Syncing…' : '🔄 Refresh Now'}</button>
-            <button onClick={onExportCsv} title="Export the currently filtered entries as CSV" className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-100 transition">⬇️ Export CSV</button>
-            <button onClick={onClearHistory} title="Clear locally saved history on this device" className="text-xs font-semibold px-3 py-1.5 rounded-lg border border-red-200 text-red-600 hover:bg-red-50 transition ml-auto">Clear local history</button>
+            <button onClick={onRefresh} disabled={loading} title="Check for new audit entries now" className="text-xs font-semibold px-3 py-2 sm:py-1.5 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-100 transition disabled:opacity-50 flex-1 sm:flex-initial">
+              {loading ? 'Syncing…' : '🔄 Refresh'}
+            </button>
+            <button onClick={onExportCsv} title="Export filtered entries as CSV" className="text-xs font-semibold px-3 py-2 sm:py-1.5 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-100 transition flex-1 sm:flex-initial">⬇️ Export CSV</button>
+            <button onClick={onClearHistory} title="Clear locally saved history on this device" className="text-xs font-semibold px-3 py-2 sm:py-1.5 rounded-lg border border-red-200 text-red-600 hover:bg-red-50 transition w-full sm:w-auto sm:ml-auto">Clear local history</button>
           </div>
           {error && <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-800">⚠️ {error}</div>}
         </div>
+
         <div className="overflow-y-auto flex-1">
-          <table className="w-full text-sm text-left">
-            <thead className="bg-gray-50 text-gray-500 text-xs uppercase tracking-wide sticky top-0">
-              <tr><th className="p-3">Timestamp</th><th className="p-3">Actor</th><th className="p-3">Action</th><th className="p-3">Target</th><th className="p-3">Details</th></tr>
+          <table className="w-full text-sm text-left min-w-[560px]">
+            <thead className="bg-gray-50 text-gray-500 text-xs uppercase tracking-wide sticky top-0 z-10">
+              <tr>
+                <th className="p-3">Timestamp</th>
+                <th className="p-3">Actor</th>
+                <th className="p-3">Action</th>
+                <th className="p-3">Target</th>
+                <th className="p-3">Details</th>
+              </tr>
             </thead>
             <tbody>
-              {logs.length === 0 ? <EmptyTableRow colSpan={5} message={loading ? 'Loading audit history…' : 'No audit entries match these filters.'} /> : logs.map((entry) => {
+              {logs.length === 0 ? (
+                <EmptyTableRow colSpan={5} message={loading ? 'Loading audit history…' : 'No audit entries match these filters.'} />
+              ) : logs.map((entry) => {
                 const isExpanded = expandedId === entry.id;
                 const hasMeta = entry.metadata && typeof entry.metadata === 'object';
                 return (
-                  <tr key={entry.id} onClick={() => hasMeta && setExpandedId(isExpanded ? null : entry.id)} className={`border-b hover:bg-gray-50 align-top ${hasMeta ? 'cursor-pointer' : ''}`}>
+                  <tr
+                    key={entry.id}
+                    onClick={() => hasMeta && setExpandedId(isExpanded ? null : entry.id)}
+                    className={`border-b hover:bg-gray-50 align-top ${hasMeta ? 'cursor-pointer' : ''}`}
+                  >
                     <td className="p-3 whitespace-nowrap text-gray-500 text-xs">{formatAuditTimestamp(entry.timestamp ?? entry.createdAt)}</td>
                     <td className="p-3 font-semibold text-gray-800">{entry.actorName ?? entry.actor ?? 'System'}</td>
                     <td className="p-3"><AuditActionBadge action={entry.action} /></td>
@@ -1423,6 +1523,7 @@ function AuditTrailModal({
             </tbody>
           </table>
         </div>
+
         {totalCount > logs.length && (
           <div className="p-4 border-t text-center">
             <button onClick={onLoadMore} className="text-xs font-semibold px-4 py-2 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-100 transition">Load more ({totalCount - logs.length} remaining)</button>
@@ -1437,7 +1538,7 @@ function AuditActionBadge({ action }) {
   const key = (action ?? '').toUpperCase();
   const styles = { CREATE: 'bg-green-100 text-green-800', UPDATE: 'bg-blue-100 text-blue-800', DELETE: 'bg-red-100 text-red-800', LOGIN: 'bg-purple-100 text-purple-800', LOGOUT: 'bg-gray-100 text-gray-600' };
   const matched = Object.keys(styles).find((k) => key.includes(k));
-  return <span className={`px-2 py-0.5 rounded text-xs font-bold ${matched ? styles[matched] : 'bg-gray-100 text-gray-600'}`}>{action ?? 'UNKNOWN'}</span>;
+  return <span className={`px-2 py-0.5 rounded text-xs font-bold whitespace-nowrap ${matched ? styles[matched] : 'bg-gray-100 text-gray-600'}`}>{action ?? 'UNKNOWN'}</span>;
 }
 
 function formatAuditTimestamp(value) {
@@ -1449,12 +1550,12 @@ function formatAuditTimestamp(value) {
 
 function PageState({ title, message, actionLabel, onAction, loading }) {
   return (
-    <div className="min-h-screen bg-gray-100 flex items-center justify-center p-6">
+    <div className="min-h-screen bg-gray-100 flex items-center justify-center p-4 sm:p-6">
       <div className="max-w-md w-full bg-white rounded-xl shadow-sm border p-6 text-center">
         {loading && (
           <div className="mx-auto mb-4 h-10 w-10 rounded-full border-4 border-blue-100 border-t-blue-600 animate-spin" aria-hidden="true" />
         )}
-        <h1 className="text-xl font-black text-gray-800">{title}</h1>
+        <h1 className="text-lg sm:text-xl font-black text-gray-800">{title}</h1>
         {message && <p className="mt-3 text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg p-3">{message}</p>}
         {actionLabel && onAction && <button onClick={onAction} className="mt-4 w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-lg transition">{actionLabel}</button>}
       </div>
@@ -1465,7 +1566,7 @@ function PageState({ title, message, actionLabel, onAction, loading }) {
 function Field({ label, required, error, hint, action, children }) {
   return (
     <div>
-      <div className="flex items-baseline justify-between gap-2 mb-1">
+      <div className="flex flex-wrap items-baseline justify-between gap-x-2 gap-y-1 mb-1">
         <label className="block text-sm font-semibold text-gray-700">
           {label} {required && <span className="text-red-500 ml-0.5" aria-hidden="true">*</span>}
         </label>
