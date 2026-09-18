@@ -30,6 +30,24 @@ const PLATE_RE     = /^[A-Z0-9\- ]{4,15}$/i;
 // so this must be 4 or lower for generated values to pass validation.
 const PASSWORD_MIN = 4;
 
+// ── Analytics color maps ──────────────────────────────────────────────────
+const VAN_STATUS_BAR_COLORS = {
+  IDLE: 'bg-yellow-400',
+  DISPATCHED: 'bg-green-500',
+  MAINTENANCE: 'bg-orange-400',
+  OUT_OF_SERVICE: 'bg-red-500',
+};
+const ROLE_BAR_COLORS = {
+  ADMIN: 'bg-purple-500',
+  DISPATCHER: 'bg-blue-500',
+  DRIVER: 'bg-gray-400',
+};
+const APPROVAL_BAR_COLORS = {
+  APPROVED: 'bg-green-500',
+  PENDING: 'bg-amber-400',
+  REJECTED: 'bg-red-500',
+};
+
 const inputCls = (hasError) =>
   `w-full px-3 py-2 border rounded-lg text-sm focus:outline-none focus:ring-2
    focus:ring-blue-400 transition ${
@@ -179,6 +197,17 @@ export default function AdminDashboard() {
   const [lastAuditSync, setLastAuditSync] = useState(null);
   const lastAuditSyncRef = useRef(null);
 
+  // ── Pending driver applications ──────────────────────────────────────────
+  const [pendingDrivers, setPendingDrivers] = useState([]);
+  const [pendingLoading, setPendingLoading] = useState(true);
+  const [pendingError, setPendingError]     = useState('');
+  const [driverActionId, setDriverActionId] = useState(null);
+  const [licensePhotoView, setLicensePhotoView] = useState(null);
+  const [rejectTarget, setRejectTarget]     = useState(null);
+  const [rejectReason, setRejectReason]     = useState('');
+  const [rejectSubmitting, setRejectSubmitting] = useState(false);
+  const [rejectError, setRejectError]       = useState('');
+
   const showToast = useCallback((type, message) => {
     clearTimeout(toastTimer.current);
     setToast({ type, message });
@@ -212,6 +241,29 @@ export default function AdminDashboard() {
     fetchAdminData(ctrl.signal);
     return () => ctrl.abort();
   }, [fetchAdminData, reloadToken]);
+
+  // ── Pending drivers: fetch ───────────────────────────────────────────────
+  const fetchPendingDrivers = useCallback(async (signal) => {
+    setPendingLoading(true);
+    setPendingError('');
+    try {
+      const { data: raw } = await apiClient.get('/admin/drivers/pending', { signal });
+      setPendingDrivers(Array.isArray(raw) ? raw : []);
+    } catch (err) {
+      if (err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') return;
+      if (handleAuthFailure(err)) return;
+      console.error('Failed to load pending drivers:', err);
+      setPendingError(describeApiError(err, 'Failed to load pending driver applications.'));
+    } finally {
+      setPendingLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    const ctrl = new AbortController();
+    fetchPendingDrivers(ctrl.signal);
+    return () => ctrl.abort();
+  }, [fetchPendingDrivers, reloadToken]);
 
   const persistAuditHistory = useCallback((logs, syncTime) => {
     try {
@@ -405,6 +457,59 @@ export default function AdminDashboard() {
     }
   }, [togglingId, showToast]);
 
+  // ── Pending drivers: approve / reject ────────────────────────────────────
+  const handleApproveDriver = useCallback(async (driver) => {
+    if (driverActionId !== null) return;
+    setDriverActionId(driver.id);
+    try {
+      await apiClient.patch(`/admin/drivers/${driver.id}/approve`);
+      setPendingDrivers((prev) => prev.filter((d) => d.id !== driver.id));
+      showToast('success', `${driver.name} has been approved and can now log in.`);
+      setReloadToken((n) => n + 1);
+    } catch (err) {
+      if (handleAuthFailure(err)) return;
+      console.error('Failed to approve driver:', err);
+      showToast('error', describeApiError(err, `Could not approve ${driver.name}. Please try again.`));
+    } finally {
+      setDriverActionId(null);
+    }
+  }, [driverActionId, showToast]);
+
+  const openRejectModal = useCallback((driver) => {
+    setRejectError('');
+    setRejectReason('');
+    setRejectTarget(driver);
+  }, []);
+
+  const closeRejectModal = useCallback(() => {
+    if (rejectSubmitting) return;
+    setRejectTarget(null);
+    setRejectReason('');
+    setRejectError('');
+  }, [rejectSubmitting]);
+
+  const handleConfirmReject = useCallback(async () => {
+    if (!rejectTarget) return;
+    setRejectSubmitting(true);
+    setRejectError('');
+    try {
+      await apiClient.patch(`/admin/drivers/${rejectTarget.id}/reject`, {
+        reason: rejectReason.trim() || undefined,
+      });
+      setPendingDrivers((prev) => prev.filter((d) => d.id !== rejectTarget.id));
+      showToast('success', `${rejectTarget.name}'s application has been rejected.`);
+      setRejectTarget(null);
+      setRejectReason('');
+      setReloadToken((n) => n + 1);
+    } catch (err) {
+      if (handleAuthFailure(err)) return;
+      console.error('Failed to reject driver:', err);
+      setRejectError(describeApiError(err, 'Could not reject this application. Please try again.'));
+    } finally {
+      setRejectSubmitting(false);
+    }
+  }, [rejectTarget, rejectReason, showToast]);
+
   const filteredVans = useMemo(() => {
     const q = vanSearch.trim().toLowerCase();
     if (!q) return data.vans;
@@ -426,6 +531,7 @@ export default function AdminDashboard() {
       String(user.name ?? '').toLowerCase().includes(q) ||
       String(user.email ?? '').toLowerCase().includes(q) ||
       String(user.driverId ?? '').toLowerCase().includes(q) ||
+      String(user.contactNumber ?? '').toLowerCase().includes(q) ||
       String(user.role ?? '').toLowerCase().includes(q)
     ));
   }, [data.staff, staffSearch]);
@@ -486,6 +592,34 @@ export default function AdminDashboard() {
   const clearAuditFilters = useCallback(() => {
     setAuditSearch(''); setAuditActionFilter(''); setAuditDateFrom(''); setAuditDateTo(''); setAuditVisible(AUDIT_PAGE_SIZE);
   }, []);
+
+  // ── Analytics ──────────────────────────────────────────────────────────
+  const roleBreakdown = useMemo(() => {
+    const counts = { ADMIN: 0, DISPATCHER: 0, DRIVER: 0 };
+    data.staff.forEach((u) => { if (counts[u.role] !== undefined) counts[u.role] += 1; });
+    return counts;
+  }, [data.staff]);
+
+  const vanStatusBreakdown = useMemo(() => {
+    const counts = {};
+    VAN_STATUSES.forEach((s) => { counts[s] = 0; });
+    data.vans.forEach((v) => { if (counts[v.status] !== undefined) counts[v.status] += 1; });
+    return counts;
+  }, [data.vans]);
+
+  const driverApprovalBreakdown = useMemo(() => {
+    const counts = { APPROVED: 0, PENDING: 0, REJECTED: 0 };
+    data.staff.forEach((u) => {
+      if (u.role !== 'DRIVER') return;
+      const status = u.approvalStatus ?? 'APPROVED';
+      if (counts[status] !== undefined) counts[status] += 1;
+    });
+    // Applications still in the pending queue haven't landed in `staff` yet
+    // (they're not full driver accounts until approved), so fold them in
+    // here for an accurate live snapshot.
+    counts.PENDING += pendingDrivers.length;
+    return counts;
+  }, [data.staff, pendingDrivers]);
 
   if (loading) return <PageState loading title="Loading Command Center…" />;
 
@@ -550,6 +684,104 @@ export default function AdminDashboard() {
           <StatCard title="Total Trips" value={data.stats.totalTrips} color="text-blue-600" icon="📊" />
           <StatCard title="Total Vans" value={data.stats.totalVans} color="text-purple-600" icon="🚌" />
           <StatCard title="Total Staff" value={data.stats.totalUsers} color="text-orange-600" icon="👥" />
+        </div>
+
+        {/* ── Analytics ────────────────────────────────────────────────── */}
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-4">
+          <BreakdownCard
+            title="Staff by Role"
+            entries={[
+              { label: 'Admin', count: roleBreakdown.ADMIN, colorClass: ROLE_BAR_COLORS.ADMIN },
+              { label: 'Dispatcher', count: roleBreakdown.DISPATCHER, colorClass: ROLE_BAR_COLORS.DISPATCHER },
+              { label: 'Driver', count: roleBreakdown.DRIVER, colorClass: ROLE_BAR_COLORS.DRIVER },
+            ]}
+          />
+          <BreakdownCard
+            title="Fleet Status"
+            entries={VAN_STATUSES.map((s) => ({
+              label: s.replace('_', ' '),
+              count: vanStatusBreakdown[s],
+              colorClass: VAN_STATUS_BAR_COLORS[s],
+            }))}
+          />
+          <BreakdownCard
+            title="Driver Approvals"
+            entries={[
+              { label: 'Approved', count: driverApprovalBreakdown.APPROVED, colorClass: APPROVAL_BAR_COLORS.APPROVED },
+              { label: 'Pending', count: driverApprovalBreakdown.PENDING, colorClass: APPROVAL_BAR_COLORS.PENDING },
+              { label: 'Rejected', count: driverApprovalBreakdown.REJECTED, colorClass: APPROVAL_BAR_COLORS.REJECTED },
+            ]}
+          />
+        </div>
+
+        {/* ── Pending driver applications ─────────────────────────────── */}
+        <div className="bg-white p-3 sm:p-4 rounded-xl shadow-sm border border-gray-200">
+          <div className="flex justify-between items-center mb-3 border-b pb-3">
+            <h2 className="text-base sm:text-lg font-bold text-gray-800 flex items-center gap-2">
+              Pending Driver Applications
+              <span className="text-xs font-bold bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full">{pendingDrivers.length}</span>
+            </h2>
+          </div>
+
+          {pendingLoading ? (
+            <p className="text-sm text-gray-400 text-center py-6">Loading applications…</p>
+          ) : pendingError ? (
+            <p className="text-sm text-red-600 text-center py-6">{pendingError}</p>
+          ) : pendingDrivers.length === 0 ? (
+            <p className="text-sm text-gray-400 text-center py-6 italic">No pending applications right now.</p>
+          ) : (
+            <div className="space-y-3">
+              {pendingDrivers.map((driver) => {
+                const isBusy = driverActionId === driver.id;
+                return (
+                  <div
+                    key={driver.id}
+                    className={`flex flex-col sm:flex-row sm:items-center gap-3 border border-gray-200 rounded-lg p-3 transition-opacity ${isBusy ? 'opacity-50' : ''}`}
+                  >
+                    <button
+                      type="button"
+                      onClick={() => driver.licensePhotoUrl && setLicensePhotoView(driver)}
+                      disabled={!driver.licensePhotoUrl}
+                      className="shrink-0 w-16 h-16 rounded-lg border border-gray-200 overflow-hidden bg-gray-50 disabled:cursor-default"
+                      title="View license photo"
+                    >
+                      {driver.licensePhotoUrl ? (
+                        <img src={driver.licensePhotoUrl} alt="License" className="w-full h-full object-cover" />
+                      ) : (
+                        <span className="flex items-center justify-center h-full text-xl">📄</span>
+                      )}
+                    </button>
+
+                    <div className="flex-1 min-w-0">
+                      <div className="font-bold text-gray-800">{driver.name}</div>
+                      <div className="text-xs text-gray-400 mt-0.5 flex flex-wrap gap-x-3">
+                        <span>ID: {driver.driverId}</span>
+                        <span>📞 {driver.contactNumber || '—'}</span>
+                        <span>Applied {formatAuditTimestamp(driver.createdAt)}</span>
+                      </div>
+                    </div>
+
+                    <div className="flex gap-2 shrink-0">
+                      <button
+                        onClick={() => handleApproveDriver(driver)}
+                        disabled={isBusy}
+                        className="text-xs font-bold px-3 py-1.5 rounded-lg border border-green-300 text-green-700 bg-green-50 hover:bg-green-100 transition disabled:opacity-40"
+                      >
+                        {isBusy ? '…' : '✓ Approve'}
+                      </button>
+                      <button
+                        onClick={() => openRejectModal(driver)}
+                        disabled={isBusy}
+                        className="text-xs font-bold px-3 py-1.5 rounded-lg border border-red-300 text-red-600 bg-red-50 hover:bg-red-100 transition disabled:opacity-40"
+                      >
+                        ✕ Reject
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-6">
@@ -651,10 +883,11 @@ export default function AdminDashboard() {
             )}
 
             <div className="overflow-x-auto -mx-3 sm:mx-0">
-              <table className="w-full text-sm text-left min-w-[480px]">
+              <table className="w-full text-sm text-left min-w-[560px]">
                 <thead className="bg-gray-50 text-gray-500 text-xs uppercase tracking-wide">
                   <tr>
                     <th className="p-3">Name</th>
+                    <th className="p-3">Contact</th>
                     <th className="p-3">Role</th>
                     <th className="p-3">Status</th>
                     <th className="p-3 text-right">Actions</th>
@@ -663,7 +896,7 @@ export default function AdminDashboard() {
                 <tbody>
                   {filteredStaff.length === 0 ? (
                     <EmptyTableRow
-                      colSpan={4}
+                      colSpan={5}
                       message={
                         data.staff.length === 0
                           ? 'No staff accounts yet. Tap "Add Staff Account" to create one.'
@@ -679,6 +912,7 @@ export default function AdminDashboard() {
                           <div className="font-bold text-gray-800 leading-tight">{user.name ?? 'Unnamed'}</div>
                           <div className="text-xs text-gray-400 mt-0.5 break-all">{user.email || user.driverId || '—'}</div>
                         </td>
+                        <td className="p-3 text-gray-600 whitespace-nowrap">{user.contactNumber || '—'}</td>
                         <td className="p-3"><RoleBadge role={user.role} /></td>
                         <td className="p-3">
                           <span className={`px-2 py-0.5 rounded text-xs font-bold ${user.isActive ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-500'}`}>
@@ -717,6 +951,16 @@ export default function AdminDashboard() {
       <DriverCredentialsModal credentials={driverCredentials} onClose={() => setDriverCredentials(null)} />
       <QrOnlyModal van={viewingQrVan} onClose={() => setViewingQrVan(null)} />
       <ConfirmDeleteModal target={pendingDelete} onClose={closeDeleteModal} onConfirm={handleConfirmDelete} isLoading={anyMutationBusy} serverError={pendingDelete?.kind === 'van' ? vanMutationError : mutationError} />
+      <LicensePhotoModal driver={licensePhotoView} onClose={() => setLicensePhotoView(null)} />
+      <RejectDriverModal
+        target={rejectTarget}
+        reason={rejectReason}
+        onReasonChange={setRejectReason}
+        onClose={closeRejectModal}
+        onConfirm={handleConfirmReject}
+        isLoading={rejectSubmitting}
+        serverError={rejectError}
+      />
     </div>
   );
 }
@@ -833,7 +1077,7 @@ function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onCl
               <option value="DISPATCHER">Dispatcher</option>
               {isEdit && form.role === 'DRIVER' && <option value="DRIVER">Driver</option>}
             </select>
-            {!isEdit && <p className="text-xs text-blue-600 mt-1.5 font-medium">To add a Driver, use "Add Van &amp; Driver" instead — drivers sign in with a login ID and PIN, not an email.</p>}
+            {!isEdit && <p className="text-xs text-blue-600 mt-1.5 font-medium">Drivers register themselves and are approved from the Pending Driver Applications list above — they aren't created here.</p>}
           </Field>
 
           {form.role && form.role !== 'DRIVER' && (
@@ -1052,9 +1296,6 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
 }
 
 // ─── DriverCredentialsModal ────────────────────────────────────────────────────
-// Shown once, immediately after a van + driver is created. This is the only
-// moment the PIN is visible on screen — after this it only exists as a hash
-// on the server, so make sure the admin has a chance to write it down.
 
 function DriverCredentialsModal({ credentials, onClose }) {
   const [showPassword, setShowPassword] = useState(false);
@@ -1222,6 +1463,85 @@ function QrOnlyModal({ van, onClose }) {
   );
 }
 
+// ─── LicensePhotoModal ──────────────────────────────────────────────────────
+
+function LicensePhotoModal({ driver, onClose }) {
+  useEffect(() => {
+    if (!driver) return;
+    const fn = (e) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', fn);
+    return () => document.removeEventListener('keydown', fn);
+  }, [driver, onClose]);
+
+  if (!driver) return null;
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="license-photo-title"
+      className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4"
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <div className="bg-white rounded-2xl shadow-2xl max-w-lg w-full max-h-[90vh] flex flex-col overflow-hidden">
+        <div className="flex justify-between items-center p-4 border-b">
+          <h2 id="license-photo-title" className="text-sm font-bold text-gray-900">{driver.name} — Driver's License</h2>
+          <button onClick={onClose} aria-label="Close" className="text-gray-400 hover:text-gray-600 text-xl leading-none p-1">✕</button>
+        </div>
+        <div className="p-4 overflow-auto bg-gray-50">
+          <img src={driver.licensePhotoUrl} alt="Driver's license" className="w-full h-auto rounded-lg border" />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── RejectDriverModal ──────────────────────────────────────────────────────
+
+function RejectDriverModal({ target, reason, onReasonChange, onClose, onConfirm, isLoading, serverError }) {
+  useEffect(() => {
+    if (!target) return;
+    const fn = (e) => { if (e.key === 'Escape' && !isLoading) onClose(); };
+    document.addEventListener('keydown', fn);
+    return () => document.removeEventListener('keydown', fn);
+  }, [target, isLoading, onClose]);
+
+  if (!target) return null;
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="reject-modal-title"
+      className="fixed inset-0 bg-black/50 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4"
+      onClick={(e) => { if (e.target === e.currentTarget && !isLoading) onClose(); }}
+    >
+      <div className="bg-white rounded-t-2xl sm:rounded-2xl shadow-2xl w-full max-w-sm max-h-[95vh] sm:max-h-[90vh] flex flex-col">
+        <div className="p-5 sm:p-6 space-y-4">
+          <h2 id="reject-modal-title" className="text-base sm:text-lg font-black text-gray-900 text-center">Reject Application?</h2>
+          <p className="text-sm text-gray-500 text-center">
+            Rejecting <strong>{target.name}</strong>'s application. You can optionally add a reason.
+          </p>
+          <textarea
+            value={reason}
+            onChange={(e) => onReasonChange(e.target.value)}
+            placeholder="Reason (optional)"
+            rows={3}
+            className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-red-300 focus:border-red-300"
+          />
+          {serverError && <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700">⚠️ {serverError}</div>}
+        </div>
+        <div className="flex flex-col-reverse sm:flex-row gap-2 sm:gap-3 p-4 sm:p-5 border-t bg-gray-50 rounded-b-2xl">
+          <button onClick={onClose} disabled={isLoading} className="flex-1 py-2.5 sm:py-2 border border-gray-300 rounded-lg text-sm font-semibold text-gray-700 hover:bg-gray-100 transition disabled:opacity-40">Cancel</button>
+          <button onClick={onConfirm} disabled={isLoading} className="flex-1 py-2.5 sm:py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-sm font-black transition disabled:opacity-70 disabled:cursor-not-allowed">
+            {isLoading ? 'Rejecting…' : 'Confirm Reject'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── ConfirmDeleteModal ───────────────────────────────────────────────────────
 
 function ConfirmDeleteModal({ target, onClose, onConfirm, isLoading, serverError }) {
@@ -1292,6 +1612,32 @@ function StatCard({ title, value, color, icon }) {
       <div className="min-w-0 flex-1">
         <div className="text-[10px] sm:text-xs text-gray-500 font-semibold uppercase tracking-wide truncate">{title}</div>
         <div className={`text-lg sm:text-2xl font-black ${color}`}>{value ?? 0}</div>
+      </div>
+    </div>
+  );
+}
+
+// ── BreakdownCard — small analytics bar widget ──────────────────────────────
+function BreakdownCard({ title, entries }) {
+  const total = entries.reduce((sum, e) => sum + (e.count || 0), 0);
+  return (
+    <div className="bg-white p-3 sm:p-4 rounded-xl shadow-sm border border-gray-200">
+      <h3 className="text-xs font-bold text-gray-500 uppercase tracking-wide mb-3">{title}</h3>
+      <div className="space-y-2.5">
+        {entries.map((e) => {
+          const pct = total === 0 ? 0 : Math.round((e.count / total) * 100);
+          return (
+            <div key={e.label}>
+              <div className="flex justify-between text-xs mb-1">
+                <span className="font-semibold text-gray-600 capitalize">{e.label}</span>
+                <span className="text-gray-400">{e.count}</span>
+              </div>
+              <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden">
+                <div className={`h-full rounded-full ${e.colorClass}`} style={{ width: `${pct}%` }} />
+              </div>
+            </div>
+          );
+        })}
       </div>
     </div>
   );
