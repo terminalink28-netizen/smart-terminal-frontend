@@ -1,9 +1,9 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import apiClient from '../api/axios';
 
 const DRIVER_ID_RE = /^DRV-\d{3,}$/i;
-const PHONE_RE = /^(\+?63|0)9\d{9}$/; // PH mobile format: 09XXXXXXXXX or +639XXXXXXXXX
+const PHONE_RE = /^(\+?63|0)9\d{9}$/;
 const PIN_MIN = 4;
 const MAX_FILE_MB = 5;
 
@@ -20,7 +20,7 @@ export default function DriverRegister() {
   const fileInputRef = useRef(null);
 
   const [form, setForm] = useState({
-    name: '', driverId: '', contactNumber: '', pin: '', confirmPin: '',
+    name: '', driverId: '', contactNumber: '', pin: '', confirmPin: '', vanId: '',
   });
   const [licenseFile, setLicenseFile] = useState(null);
   const [previewUrl, setPreviewUrl] = useState(null);
@@ -28,6 +28,29 @@ export default function DriverRegister() {
   const [submitting, setSubmitting] = useState(false);
   const [serverError, setServerError] = useState('');
   const [submitted, setSubmitted] = useState(false);
+  const [assignedPlate, setAssignedPlate] = useState('');
+
+  const [availableVans, setAvailableVans] = useState([]);
+  const [vansLoading, setVansLoading] = useState(true);
+  const [vansError, setVansError] = useState('');
+
+  useEffect(() => {
+    const ctrl = new AbortController();
+    (async () => {
+      setVansLoading(true);
+      setVansError('');
+      try {
+        const { data } = await apiClient.get('/drivers/available-vans', { signal: ctrl.signal });
+        setAvailableVans(Array.isArray(data) ? data : []);
+      } catch (err) {
+        if (err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') return;
+        setVansError('Could not load available vans. Pull to refresh or try again shortly.');
+      } finally {
+        setVansLoading(false);
+      }
+    })();
+    return () => ctrl.abort();
+  }, []);
 
   const change = (e) => {
     const { name, value } = e.target;
@@ -55,7 +78,7 @@ export default function DriverRegister() {
     if (file.type.startsWith('image/')) {
       setPreviewUrl(URL.createObjectURL(file));
     } else {
-      setPreviewUrl(null); // PDF — no inline preview
+      setPreviewUrl(null);
     }
   };
 
@@ -83,6 +106,8 @@ export default function DriverRegister() {
 
     if (form.confirmPin !== form.pin) e.confirmPin = 'PINs do not match.';
 
+    if (!form.vanId) e.vanId = 'Select the van you\'ll be driving.';
+
     if (!licenseFile) e.license = "A photo of your driver's license is required.";
 
     return e;
@@ -105,15 +130,27 @@ export default function DriverRegister() {
       payload.append('driverId', form.driverId.trim().toUpperCase());
       payload.append('contactNumber', form.contactNumber.trim());
       payload.append('pin', form.pin);
+      payload.append('vanId', form.vanId);
       payload.append('licensePhoto', licenseFile);
 
-      await apiClient.post('/drivers/register', payload, {
+      const { data } = await apiClient.post('/drivers/register', payload, {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
 
+      setAssignedPlate(data?.driver?.assignedVan?.plateNumber ?? '');
       setSubmitted(true);
     } catch (err) {
-      setServerError(extractErrorMessage(err));
+      const msg = extractErrorMessage(err);
+      setServerError(msg);
+      // If the van was taken by someone else moments ago, refresh the list
+      // so the driver can immediately pick another one instead of retrying blind.
+      if (err?.response?.status === 409) {
+        try {
+          const { data } = await apiClient.get('/drivers/available-vans');
+          setAvailableVans(Array.isArray(data) ? data : []);
+          setForm((p) => ({ ...p, vanId: '' }));
+        } catch { /* ignore refresh failure */ }
+      }
     } finally {
       setSubmitting(false);
     }
@@ -126,8 +163,9 @@ export default function DriverRegister() {
           <div className="text-5xl mb-3" aria-hidden="true">✅</div>
           <h1 className="text-xl font-black text-slate-900">Registration submitted</h1>
           <p className="text-sm text-slate-500 mt-3 leading-relaxed">
-            An admin will review your details and license photo. Once approved, you can log in
-            with the Login ID and PIN you just created.
+            An admin will review your details and license photo.
+            {assignedPlate && <> You've been assigned to van <strong>{assignedPlate}</strong>.</>}
+            {' '}Once approved, you can log in with the Login ID and PIN you just created.
           </p>
           <button
             onClick={() => navigate('/login')}
@@ -139,6 +177,8 @@ export default function DriverRegister() {
       </div>
     );
   }
+
+  const noVansAvailable = !vansLoading && !vansError && availableVans.length === 0;
 
   return (
     <div className="min-h-screen bg-slate-100 flex items-center justify-center px-4 py-8">
@@ -153,6 +193,12 @@ export default function DriverRegister() {
         {serverError && (
           <div className="mb-4 bg-red-50 border border-red-200 text-red-700 text-sm rounded-lg p-3">
             ⚠️ {serverError}
+          </div>
+        )}
+
+        {noVansAvailable && (
+          <div className="mb-4 bg-amber-50 border border-amber-200 text-amber-800 text-sm rounded-lg p-3">
+            No vans are available to assign right now. Please contact the admin to register a van before applying, then come back.
           </div>
         )}
 
@@ -179,6 +225,26 @@ export default function DriverRegister() {
               placeholder="09171234567" autoComplete="tel"
               className={inputCls(errors.contactNumber)}
             />
+          </FormField>
+
+          <FormField label="Assign Yourself a Van" required error={errors.vanId} hint="You'll be the driver on record for this van once approved">
+            {vansLoading ? (
+              <div className="text-sm text-slate-400 py-2">Loading available vans…</div>
+            ) : vansError ? (
+              <div className="text-sm text-red-500 py-1">{vansError}</div>
+            ) : (
+              <select
+                name="vanId" value={form.vanId} onChange={change} disabled={noVansAvailable}
+                className={`${inputCls(errors.vanId)} bg-white disabled:bg-gray-100 disabled:text-gray-400`}
+              >
+                <option value="">— Select a van —</option>
+                {availableVans.map((v) => (
+                  <option key={v.id} value={v.id}>
+                    {v.plateNumber} — {v.capacity} pax
+                  </option>
+                ))}
+              </select>
+            )}
           </FormField>
 
           <div className="grid grid-cols-2 gap-3">
@@ -230,9 +296,9 @@ export default function DriverRegister() {
 
           <button
             type="submit"
-            disabled={submitting}
+            disabled={submitting || noVansAvailable}
             className={`w-full py-3 rounded-lg font-bold text-white transition mt-2 ${
-              submitting ? 'bg-slate-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'
+              submitting || noVansAvailable ? 'bg-slate-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'
             }`}
           >
             {submitting ? 'Submitting…' : 'Submit application'}
