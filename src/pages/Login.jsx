@@ -88,8 +88,12 @@ export default function Login() {
 
       navigate(nextPath, { replace: true });
     } catch (err) {
+      // Surface pending/rejected driver applications with their own
+      // messaging rather than a generic "invalid credentials" line, since
+      // the backend returns a distinct 403 for those states.
+      const backendMessage = err?.response?.data?.error;
       setError(
-        err?.response?.data?.error ||
+        backendMessage ||
           err?.message ||
           'Unable to login. Please try again.'
       );
@@ -127,7 +131,7 @@ export default function Login() {
               value={identifier}
               onChange={(e) => setIdentifier(e.target.value)}
               autoComplete="username"
-              placeholder="Email address or plate number"
+              placeholder="Email address or Driver ID"
               className="w-full border border-slate-300 rounded-lg px-4 py-3 focus:outline-none focus:ring-2 focus:ring-blue-500"
               disabled={loading}
               required
@@ -164,22 +168,22 @@ export default function Login() {
           </button>
         </form>
 
-        <div className="mt-6 text-center space-y-2">
-  <button
-    type="button"
-    onClick={() => navigate('/')}
-    className="text-sm text-blue-600 hover:text-blue-800 font-medium block w-full"
-  >
-    View Public Tracking
-  </button>
-  <button
-    type="button"
-    onClick={() => navigate('/register')}
-    className="text-sm text-slate-500 hover:text-slate-700 font-medium block w-full"
-  >
-    New driver? Register here
-  </button>
-</div>
+        <div className="mt-6 flex flex-col items-center gap-2">
+          <button
+            type="button"
+            onClick={() => navigate('/')}
+            className="text-sm text-blue-600 hover:text-blue-800 font-medium"
+          >
+            View Public Tracking
+          </button>
+          <button
+            type="button"
+            onClick={() => navigate('/register')}
+            className="text-sm text-slate-500 hover:text-slate-700 font-medium"
+          >
+            New driver? Register here
+          </button>
+        </div>
       </div>
     </div>
   );
