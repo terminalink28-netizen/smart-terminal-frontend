@@ -1,17 +1,26 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { QRCodeSVG } from 'qrcode.react';
+import { MapContainer, TileLayer, Marker, Popup } from 'react-leaflet';
+import L from 'leaflet';
+import 'leaflet/dist/leaflet.css';
 import apiClient from '../api/axios';
 import { socket } from '../api/socket';
+
+// Fix default marker icons breaking under bundlers (Vite/CRA don't resolve
+// Leaflet's relative image paths correctly out of the box).
+delete L.Icon.Default.prototype._getIconUrl;
+L.Icon.Default.mergeOptions({
+  iconRetinaUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png',
+  iconUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
+  shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
+});
 
 // ─── constants ────────────────────────────────────────────────────────────────
 
 const GPS_OPTIONS = { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 };
 
-// GPS is only locked (disabled) when there is nothing to broadcast
 const GPS_LOCKED_STATUSES = ['SCHEDULED', 'COMPLETED', 'CANCELLED'];
 
-// Friendly, plain-language copy for each status — shown to the driver
-// instead of raw backend enum values like "ARRIVING".
 const STATUS_COPY = {
   SCHEDULED:  { label: 'Scheduled',           icon: '🗓️' },
   BOARDING:   { label: 'Boarding Passengers', icon: '🧍' },
@@ -34,11 +43,6 @@ const STATUS_STYLES = {
   SCHEDULED:  'bg-yellow-100 text-yellow-800 border border-yellow-200',
 };
 
-// The forward-moving trip lifecycle a driver walks through manually.
-// Each entry knows what button to show to advance to the *next* step.
-// ARRIVING is handled separately (see CompletionQrPanel) — that final
-// step is confirmed by the dispatcher scanning the van's QR code rather
-// than a driver self-tap button.
 const STATUS_FLOW = [
   { key: 'BOARDING',  next: 'DEPARTING', actionLabel: '🚦 Ready to Depart',      actionHint: 'Tap once all passengers are seated.' },
   { key: 'DEPARTING', next: 'DEPARTED',  actionLabel: '🚐 Confirm Departure',    actionHint: "Tap the moment you actually pull out." },
@@ -61,20 +65,22 @@ const DESTINATION = 'Virac Central Terminal';
 const DEFAULT_ROUTE_DURATION = 60;
 const DELAY_OPTIONS = [5, 10, 15, 30];
 
-// Statuses where the ETA panel is relevant (boarding + all en-route states)
 const ETA_ACTIVE_STATUSES = ['BOARDING', 'DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'];
-
-// Used to build the visual step tracker (includes the final COMPLETED dot,
-// even though there's no button for it — it's confirmed by QR scan).
 const STEPPER_KEYS = ['BOARDING', 'DEPARTING', 'DEPARTED', 'ARRIVING', 'COMPLETED'];
 
 const GPS_STATE = { IDLE: 'IDLE', ACQUIRING: 'ACQUIRING', LIVE: 'LIVE', ERROR: 'ERROR' };
 
-// Speed/position trust thresholds — mirrors the backend's gating so the
-// driver sees an honest reading of what will actually be broadcast.
-const MAX_PLAUSIBLE_SPEED_MPS = 55;      // ~198 km/h ceiling
-const MIN_DT_FOR_FALLBACK_SECONDS = 2;    // don't compute speed from fixes closer than this
-const MIN_DISTANCE_FOR_FALLBACK_M = 3;    // ignore GPS jitter smaller than this
+const MAX_PLAUSIBLE_SPEED_MPS = 55;
+const MIN_DT_FOR_FALLBACK_SECONDS = 2;
+const MIN_DISTANCE_FOR_FALLBACK_M = 3;
+
+// Catanduanes / Virac approximate center — adjust if you have exact terminal coords.
+const MAP_CENTER = [13.5763, 124.2306];
+const MAP_DEFAULT_ZOOM = 11;
+
+// ── socket event names for fleet map — verify against your socket.js ──────
+const EVT_VAN_LOCATION = 'van_location_update'; // per-van incremental broadcast
+const EVT_LIVE_SNAPSHOT = 'live_vans';          // optional initial array snapshot
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -88,7 +94,6 @@ function geolocationErrorMessage(err) {
   }
 }
 
-/** Great-circle distance between two lat/lng points, in meters. */
 function haversineMeters(lat1, lng1, lat2, lng2) {
   const R = 6371000;
   const toRad = (d) => (d * Math.PI) / 180;
@@ -121,8 +126,6 @@ function StatusBadge({ status }) {
   );
 }
 
-// A simple horizontal progress tracker so the driver can see, at a glance,
-// where they are in the trip and what's still ahead.
 function TripProgressStepper({ status }) {
   const idx = STEPPER_KEYS.indexOf(status);
   if (idx === -1) return null;
@@ -251,9 +254,46 @@ function BoardingPanel({ seatCounts, onDecrTotal, onIncrTotal, onDecrAvail, onIn
   );
 }
 
-// ── LiveTrackingCard ────────────────────────────────────────────────────────
-// A Life360-style live tracking card: big current-speed readout, a pulsing
-// "live" indicator, and a small stat row for peak speed / GPS accuracy.
+// ── FleetMap — shows all currently-broadcasting vans; own van highlighted ──
+
+function FleetMap({ vans, ownVanId }) {
+  const list = Object.values(vans);
+  return (
+    <section className="rounded-xl overflow-hidden border border-gray-200 shadow-sm" aria-label="Live fleet map">
+      <div className="bg-slate-800 text-white text-xs font-bold uppercase tracking-wide px-3 py-2 flex items-center justify-between">
+        <span>🗺️ Live Fleet Map</span>
+        <span className="text-slate-300 font-normal normal-case">
+          {list.length} van{list.length === 1 ? '' : 's'} active
+        </span>
+      </div>
+      <div style={{ height: '220px' }}>
+        <MapContainer center={MAP_CENTER} zoom={MAP_DEFAULT_ZOOM} style={{ height: '100%', width: '100%' }} scrollWheelZoom={false}>
+          <TileLayer
+            attribution='&copy; OpenStreetMap contributors'
+            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+          />
+          {list.map((v) => (
+            <Marker key={v.vanId} position={[v.lat, v.lng]}>
+              <Popup>
+                <div className="text-xs">
+                  <div className="font-bold">
+                    {v.plateNumber ?? v.vanId}{v.vanId === ownVanId ? ' (You)' : ''}
+                  </div>
+                  {v.speedKmh != null && <div>{v.speedKmh} km/h</div>}
+                </div>
+              </Popup>
+            </Marker>
+          ))}
+        </MapContainer>
+      </div>
+      {list.length === 0 && (
+        <p className="text-xs text-gray-400 text-center py-2 bg-gray-50 border-t border-gray-100">
+          No vans currently broadcasting location.
+        </p>
+      )}
+    </section>
+  );
+}
 
 function LiveTrackingCard({ trip, gpsState, gpsError, lastCoords, maxSpeedKmh, onStart, onStop }) {
   const isLocked = !trip || GPS_LOCKED_STATUSES.includes(trip.status);
@@ -322,7 +362,6 @@ function LiveTrackingCard({ trip, gpsState, gpsError, lastCoords, maxSpeedKmh, o
     );
   }
 
-  // IDLE or ERROR
   return (
     <section className="bg-white border-2 border-dashed border-blue-200 rounded-xl p-5 text-center">
       <p className="text-3xl mb-2" aria-hidden="true">📍</p>
@@ -368,14 +407,6 @@ function ETACountdown({ eta }) {
   );
 }
 
-// ── CompletionQrPanel ───────────────────────────────────────────────────────
-// Shown instead of a self-tap button once the trip reaches ARRIVING. The
-// driver hands their phone (or holds it up) to the dispatcher, who scans
-// this code with the existing QRScannerModal to confirm the trip is done.
-// The token is the van's permanent scan token — the same one printed on
-// the van's physical sticker — so the dispatcher's scanner needs no
-// special-casing to handle it.
-
 function CompletionQrPanel({ van, onRefresh }) {
   if (!van?.qrToken) {
     return (
@@ -404,12 +435,6 @@ function CompletionQrPanel({ van, onRefresh }) {
     </section>
   );
 }
-
-// ── StatusControlPanel ──────────────────────────────────────────────────────
-// Boarding → Departing → Departed are self-tap steps. Arriving → Completed
-// is confirmed by the dispatcher scanning the van's QR code instead (see
-// CompletionQrPanel above), since that's the moment a second person should
-// verify the trip actually happened.
 
 function StatusControlPanel({ trip, delayMinutes, eta, statusUpdating, onAdvance, onAddDelay, onRefresh }) {
   if (!trip) return null;
@@ -626,15 +651,12 @@ export default function DriverDashboard() {
   const [departureTime, setDepartureTime] = useState(null);
   const [delayMinutes, setDelayMinutes]   = useState(0);
   const [statusUpdating, setStatusUpdating] = useState(false);
+  const [fleetVans, setFleetVans]         = useState({}); // { [vanId]: { vanId, plateNumber, lat, lng, speedKmh } }
 
   const seatSyncedRef = useRef(false);
   const watchIdRef    = useRef(null);
   const tripIdRef     = useRef(null);
-  // Tracks the last accepted GPS fix so we can derive speed from position
-  // deltas when the device itself doesn't report coords.speed.
-  const lastFixRef    = useRef(null); // { lat, lng, timestamp }
-
-  // ── Derived ────────────────────────────────────────────────────────────────
+  const lastFixRef    = useRef(null);
 
   const routeDurationMinutes = useMemo(() => {
     if (!trip?.route?.name) return DEFAULT_ROUTE_DURATION;
@@ -647,13 +669,6 @@ export default function DriverDashboard() {
     if (!departureTime) return null;
     return new Date(departureTime.getTime() + (routeDurationMinutes + delayMinutes) * 60_000);
   }, [departureTime, routeDurationMinutes, delayMinutes]);
-
-  // ── data fetching ──────────────────────────────────────────────────────────
-  //
-  // `silent` lets background reconciliation (e.g. after a QR-completion
-  // socket event) refresh state without hijacking the screen with the
-  // full-page loading spinner — that spinner should only ever appear on
-  // first mount or when the user explicitly taps "Refresh."
 
   const fetchMyTrip = useCallback(async (signal, { silent = false } = {}) => {
     if (!silent) setLoading(true);
@@ -679,8 +694,6 @@ export default function DriverDashboard() {
     }
   }, []);
 
-  // ── GPS helpers ────────────────────────────────────────────────────────────
-
   const clearWatch = useCallback(() => {
     if (watchIdRef.current !== null) {
       navigator.geolocation.clearWatch(watchIdRef.current);
@@ -693,12 +706,6 @@ export default function DriverDashboard() {
     lastFixRef.current = null;
     setGpsState(GPS_STATE.IDLE);
     setLastCoords(null);
-    // Deliberately NOT calling socket.disconnect() here. This socket is also
-    // used to listen for trip_status_changed (the dispatcher's completion
-    // QR scan) — disconnecting it just because GPS broadcasting stopped
-    // would silently break that listener until the driver starts sharing
-    // location again. The socket now only fully disconnects on unmount or
-    // explicit logout (see handleLogout).
   }, [clearWatch]);
 
   const startLocationSharing = useCallback(() => {
@@ -726,14 +733,11 @@ export default function DriverDashboard() {
         const { latitude: lat, longitude: lng, speed, accuracy } = position.coords;
         const timestamp = position.timestamp;
 
-        // 1. Prefer the device's own speed reading when it's a real, sane number.
         let resolvedSpeed =
           typeof speed === 'number' && speed >= 0 && speed <= MAX_PLAUSIBLE_SPEED_MPS
             ? speed
             : null;
 
-        // 2. Fall back to computing speed from the distance/time between the
-        //    last two accepted fixes, when the device doesn't give us one.
         if (resolvedSpeed === null && lastFixRef.current) {
           const dtSeconds = (timestamp - lastFixRef.current.timestamp) / 1000;
           if (dtSeconds >= MIN_DT_FOR_FALLBACK_SECONDS) {
@@ -780,9 +784,6 @@ export default function DriverDashboard() {
     );
   }, [clearWatch]);
 
-  // ── Status control: generic step-forward for Boarding/Departing/Departed ──
-  // (ARRIVING → COMPLETED happens via dispatcher QR scan, not this function.)
-
   const handleAdvanceStatus = useCallback(async (newStatus) => {
     if (!tripIdRef.current || !newStatus || statusUpdating) return;
     setStatusUpdating(true);
@@ -812,8 +813,6 @@ export default function DriverDashboard() {
     setDelayMinutes((prev) => prev + minutes);
   }, []);
 
-  // ── seat counter actions ───────────────────────────────────────────────────
-
   const decreaseTotalSeats = useCallback(() => {
     setSeatCounts((prev) => {
       const nextTotal = Math.max(1, prev.total - 1);
@@ -825,11 +824,9 @@ export default function DriverDashboard() {
   const decreaseAvailableSeats = useCallback(() => setSeatCounts((prev) => ({ ...prev, available: Math.max(0, prev.available - 1) })), []);
   const increaseAvailableSeats = useCallback(() => setSeatCounts((prev) => ({ ...prev, available: Math.min(prev.total, prev.available + 1) })), []);
 
-  // ── auth ───────────────────────────────────────────────────────────────────
-
   const handleLogout = useCallback(async () => {
     stopLocationSharing();
-    socket.disconnect(); // explicit now — stopLocationSharing no longer disconnects
+    socket.disconnect();
 
     try {
       await apiClient.post('/auth/logout');
@@ -847,8 +844,6 @@ export default function DriverDashboard() {
     window.location.replace('/login');
   }, [stopLocationSharing]);
 
-  // ── self-start callback ────────────────────────────────────────────────────
-
   const handleTripStarted = useCallback((newTrip) => {
     tripIdRef.current     = newTrip.id;
     seatSyncedRef.current = false;
@@ -864,34 +859,62 @@ export default function DriverDashboard() {
     setSeatCounts({ total: capacity, available: capacity });
   }, []);
 
-  // ── effects ────────────────────────────────────────────────────────────────
-
   useEffect(() => {
     const controller = new AbortController();
     fetchMyTrip(controller.signal);
     return () => { controller.abort(); stopLocationSharing(); socket.disconnect(); };
   }, [fetchMyTrip, stopLocationSharing]);
 
-  // Always join the 'active_trips' room and listen for trip status updates
-  // — independent of GPS sharing. Without this, this socket never joins the
-  // room the backend broadcasts trip_status_changed to (see socket.js's
-  // subscribe_to_map handler), so a dispatcher's QR scan completing this
-  // trip would never reach this screen at all, regardless of whether the
-  // driver is currently sharing live location.
+  // Join the map room, listen for trip status changes AND fleet location
+  // broadcasts — independent of whether this driver is currently sharing GPS.
   useEffect(() => {
     socket.connect();
     socket.emit('subscribe_to_map');
 
     const handleConnect = () => {
-      // Re-join after any reconnect (dropped connection, server restart,
-      // Render cold-start, etc.) — subscriptions don't survive a reconnect
-      // automatically.
       socket.emit('subscribe_to_map');
     };
     socket.on('connect', handleConnect);
 
+    const handleVanLocation = (payload) => {
+      if (!payload?.vanId || typeof payload.lat !== 'number' || typeof payload.lng !== 'number') return;
+      setFleetVans((prev) => ({
+        ...prev,
+        [payload.vanId]: {
+          vanId: payload.vanId,
+          plateNumber: payload.plateNumber ?? prev[payload.vanId]?.plateNumber,
+          lat: payload.lat,
+          lng: payload.lng,
+          speedKmh: msToKmh(payload.speed),
+        },
+      }));
+    };
+    socket.on(EVT_VAN_LOCATION, handleVanLocation);
+
+    const handleSnapshot = (list) => {
+      if (!Array.isArray(list)) return;
+      setFleetVans((prev) => {
+        const next = { ...prev };
+        list.forEach((v) => {
+          if (v?.vanId && typeof v.lat === 'number' && typeof v.lng === 'number') {
+            next[v.vanId] = {
+              vanId: v.vanId,
+              plateNumber: v.plateNumber,
+              lat: v.lat,
+              lng: v.lng,
+              speedKmh: msToKmh(v.speed),
+            };
+          }
+        });
+        return next;
+      });
+    };
+    socket.on(EVT_LIVE_SNAPSHOT, handleSnapshot);
+
     return () => {
       socket.off('connect', handleConnect);
+      socket.off(EVT_VAN_LOCATION, handleVanLocation);
+      socket.off(EVT_LIVE_SNAPSHOT, handleSnapshot);
     };
   }, []);
 
@@ -933,7 +956,6 @@ export default function DriverDashboard() {
     return () => socket.off('disconnect', handleDisconnect);
   }, [gpsState, clearWatch]);
 
-  // Listen for the dispatcher's QR scan completing this trip in real time.
   useEffect(() => {
     const handleRemoteStatusChange = (payload) => {
       if (!payload?.tripId || payload.tripId !== tripIdRef.current) return;
@@ -941,19 +963,22 @@ export default function DriverDashboard() {
       if (!updatedTrip) return;
 
       if (updatedTrip.status === 'COMPLETED') {
-        // The dispatcher just scanned this van's QR and closed out the trip.
-        // Jump straight to the "ready to load again at the terminal" screen
-        // instead of rendering a dead-end COMPLETED state (StatusControlPanel
-        // has no button/action for it) or flashing a full-page spinner.
         stopLocationSharing();
+        // Remove this van from the fleet map — its trip is over.
+        const finishedVanId = updatedTrip.van?.id;
+        if (finishedVanId) {
+          setFleetVans((prev) => {
+            const next = { ...prev };
+            delete next[finishedVanId];
+            return next;
+          });
+        }
         tripIdRef.current = null;
         setTrip(null);
         setDepartureTime(null);
         setDelayMinutes(0);
         setMaxSpeedKmh(0);
 
-        // Reconcile with the server in the background in case anything else
-        // changed — but don't block or replace the UI while doing it.
         fetchMyTrip(undefined, { silent: true });
         return;
       }
@@ -963,8 +988,6 @@ export default function DriverDashboard() {
     socket.on('trip_status_changed', handleRemoteStatusChange);
     return () => socket.off('trip_status_changed', handleRemoteStatusChange);
   }, [stopLocationSharing, fetchMyTrip]);
-
-  // ── render: loading ────────────────────────────────────────────────────────
 
   if (loading) {
     return (
@@ -1008,6 +1031,8 @@ export default function DriverDashboard() {
             Logout
           </button>
         </header>
+
+        <FleetMap vans={fleetVans} ownVanId={trip?.van?.id} />
 
         {!trip ? (
           <TripSetupScreen onTripStarted={handleTripStarted} onRefresh={() => fetchMyTrip()} />
