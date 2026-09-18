@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
 import apiClient from '../api/axios';
 
 // ─── Module-level constants ───────────────────────────────────────────────────
@@ -10,10 +9,8 @@ const EMPTY_DATA = {
   vans: [],
 };
 
-const EMPTY_STAFF_FORM = { name: '', email: '', role: '', driverId: '', password: '' };
-// Van form: the driver's "login secret" is now labeled as a PIN in the UI,
-// but the wire-format field name stays `driverPin` for backend compatibility.
-const EMPTY_VAN_FORM   = { plateNumber: '', capacity: '', status: 'IDLE', driverName: '', driverPassword: '' };
+const EMPTY_STAFF_FORM = { name: '', email: '', role: '', password: '' };
+const EMPTY_VAN_FORM   = { plateNumber: '', capacity: '', status: 'IDLE' };
 
 const VAN_STATUSES = ['IDLE', 'DISPATCHED', 'MAINTENANCE', 'OUT_OF_SERVICE'];
 
@@ -22,15 +19,11 @@ const AUDIT_REFRESH_MS  = 24 * 60 * 60 * 1000;
 const AUDIT_MAX_STORED  = 5000;
 const AUDIT_PAGE_SIZE   = 50;
 
-const EMAIL_RE     = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const DRIVER_ID_RE = /^DRV-\d{3,}$/i;
-const PLATE_RE     = /^[A-Z0-9\- ]{4,15}$/i;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const PLATE_RE = /^[A-Z0-9\- ]{4,15}$/i;
 
-// Minimum PIN length. The random generator produces 4–8 digit PINs,
-// so this must be 4 or lower for generated values to pass validation.
 const PASSWORD_MIN = 4;
 
-// ── Analytics color maps ──────────────────────────────────────────────────
 const VAN_STATUS_BAR_COLORS = {
   IDLE: 'bg-yellow-400',
   DISPATCHED: 'bg-green-500',
@@ -87,31 +80,14 @@ const handleAuthFailure = (err) => {
   return false;
 };
 
-// Pulls a driver login ID out of whatever shape the backend returns.
-function extractDriverId(responseData) {
-  return (
-    responseData?.driver?.driverId ??
-    responseData?.driver?.driver_id_string ??
-    responseData?.driverId ??
-    responseData?.driver_id_string ??
-    responseData?.van?.driver?.driverId ??
-    responseData?.van?.driver?.driver_id_string ??
-    null
-  );
-}
-
 // ─── Random PIN Generator ─────────────────────────────────────────────────────
-// Produces a numeric PIN 4–8 digits long, retrying if it lands on a
-// well-known weak pattern.
 
 const WEAK_PASSWORD_PATTERNS = new Set([
-  // Repeated single digit
   '0000','1111','2222','3333','4444','5555','6666','7777','8888','9999',
   '00000','11111','22222','33333','44444','55555','66666','77777','88888','99999',
   '000000','111111','222222','333333','444444','555555','666666','777777','888888','999999',
   '0000000','1111111','2222222','3333333','4444444','5555555','6666666','7777777','8888888','9999999',
   '00000000','11111111','22222222','33333333','44444444','55555555','66666666','77777777','88888888','99999999',
-  // Sequential ascending / descending
   '0123','1234','2345','3456','4567','5678','6789',
   '3210','4321','5432','6543','7654','8765','9876',
   '01234','12345','23456','34567','45678','56789',
@@ -122,7 +98,6 @@ const WEAK_PASSWORD_PATTERNS = new Set([
   '6543210','7654321','8765432','9876543',
   '01234567','12345678','23456789',
   '76543210','87654321','98765432',
-  // Common repeated-pattern PINs
   '1212','2121','1122','2211','1010','0101',
   '123123','112233','121212','696969','101010',
   '12341234','12121212','11112222',
@@ -165,16 +140,15 @@ export default function AdminDashboard() {
   const [reloadToken, setReloadToken] = useState(0);
   const [loggingOut, setLoggingOut] = useState(false);
 
-  const [staffModal, setStaffModal] = useState(null);
+  const [isStaffModalOpen, setIsStaffModalOpen] = useState(false);
   const [mutationLoading, setMutationLoading] = useState(false);
   const [mutationError, setMutationError]     = useState('');
   const [togglingId, setTogglingId]           = useState(null);
 
-  const [vanModal, setVanModal]         = useState(null);
+  const [isVanModalOpen, setIsVanModalOpen] = useState(false);
   const [vanMutationLoading, setVanMutationLoading] = useState(false);
   const [vanMutationError, setVanMutationError]     = useState('');
 
-  const [driverCredentials, setDriverCredentials] = useState(null);
   const [viewingQrVan, setViewingQrVan] = useState(null);
 
   const [pendingDelete, setPendingDelete] = useState(null);
@@ -242,7 +216,6 @@ export default function AdminDashboard() {
     return () => ctrl.abort();
   }, [fetchAdminData, reloadToken]);
 
-  // ── Pending drivers: fetch ───────────────────────────────────────────────
   const fetchPendingDrivers = useCallback(async (signal) => {
     setPendingLoading(true);
     setPendingError('');
@@ -340,13 +313,11 @@ export default function AdminDashboard() {
     }
   }, []);
 
-  const openAddStaffModal = useCallback(() => { setMutationError(''); setStaffModal({ mode: 'add' }); }, []);
-  const openEditStaffModal = useCallback((user) => { setMutationError(''); setStaffModal({ mode: 'edit', user }); }, []);
-  const closeStaffModal = useCallback(() => { if (mutationLoading) return; setMutationError(''); setStaffModal(null); }, [mutationLoading]);
+  const openAddStaffModal = useCallback(() => { setMutationError(''); setIsStaffModalOpen(true); }, []);
+  const closeStaffModal = useCallback(() => { if (mutationLoading) return; setMutationError(''); setIsStaffModalOpen(false); }, [mutationLoading]);
 
-  const openAddVanModal = useCallback(() => { setVanMutationError(''); setVanModal({ mode: 'add' }); }, []);
-  const openEditVanModal = useCallback((van) => { setVanMutationError(''); setVanModal({ mode: 'edit', van }); }, []);
-  const closeVanModal = useCallback(() => { if (vanMutationLoading) return; setVanMutationError(''); setVanModal(null); }, [vanMutationLoading]);
+  const openAddVanModal = useCallback(() => { setVanMutationError(''); setIsVanModalOpen(true); }, []);
+  const closeVanModal = useCallback(() => { if (vanMutationLoading) return; setVanMutationError(''); setIsVanModalOpen(false); }, [vanMutationLoading]);
 
   const openDeleteUserModal = useCallback((user) => {
     setMutationError('');
@@ -367,14 +338,9 @@ export default function AdminDashboard() {
     setMutationLoading(true);
     setMutationError('');
     try {
-      if (staffModal?.mode === 'edit') {
-        await apiClient.patch(`/admin/users/${staffModal.user.id}`, formData);
-        showToast('success', `${formData.name}'s account has been updated.`);
-      } else {
-        await apiClient.post('/admin/users', formData);
-        showToast('success', `${formData.name} has been added as ${formData.role}.`);
-      }
-      setStaffModal(null);
+      await apiClient.post('/admin/users', formData);
+      showToast('success', `${formData.name} has been added as ${formData.role}.`);
+      setIsStaffModalOpen(false);
       setReloadToken((n) => n + 1);
     } catch (err) {
       if (handleAuthFailure(err)) return;
@@ -383,32 +349,17 @@ export default function AdminDashboard() {
     } finally {
       setMutationLoading(false);
     }
-  }, [staffModal, showToast]);
+  }, [showToast]);
 
   const handleSubmitVan = useCallback(async (formData) => {
     setVanMutationLoading(true);
     setVanMutationError('');
     try {
-      if (vanModal?.mode === 'edit') {
-        await apiClient.patch(`/admin/vans/${vanModal.van.id}`, formData);
-        showToast('success', `${formData.plateNumber} has been updated.`);
-        setVanModal(null);
-      } else {
-        const { data: res } = await apiClient.post('/admin/vans', formData);
-        const driverId = extractDriverId(res);
-
-        showToast('success', `${formData.plateNumber} and its driver have been successfully registered.`);
-        setVanModal(null);
-
-        setDriverCredentials({
-          plateNumber: formData.plateNumber,
-          driverName: formData.driverName,
-          driverId,
-          // `formData.driverPin` is the wire-format field name the API expects.
-          password: formData.driverPin,
-          qrToken: res?.qrToken ?? null,
-        });
-      }
+      const { data: res } = await apiClient.post('/admin/vans', formData);
+      showToast('success', `${formData.plateNumber} has been registered.`);
+      setIsVanModalOpen(false);
+      // Show the new van's QR right away so the admin can print the sticker.
+      setViewingQrVan(res);
       setReloadToken((n) => n + 1);
     } catch (err) {
       if (handleAuthFailure(err)) return;
@@ -417,7 +368,7 @@ export default function AdminDashboard() {
     } finally {
       setVanMutationLoading(false);
     }
-  }, [vanModal, showToast]);
+  }, [showToast]);
 
   const handleConfirmDelete = useCallback(async () => {
     if (!pendingDelete) return;
@@ -457,7 +408,6 @@ export default function AdminDashboard() {
     }
   }, [togglingId, showToast]);
 
-  // ── Pending drivers: approve / reject ────────────────────────────────────
   const handleApproveDriver = useCallback(async (driver) => {
     if (driverActionId !== null) return;
     setDriverActionId(driver.id);
@@ -510,6 +460,13 @@ export default function AdminDashboard() {
     }
   }, [rejectTarget, rejectReason, showToast]);
 
+  // Pending drivers already have their own section above — keep them out of
+  // the main staff table so nobody appears twice.
+  const staffTableData = useMemo(
+    () => data.staff.filter((u) => !(u.role === 'DRIVER' && u.approvalStatus === 'PENDING')),
+    [data.staff],
+  );
+
   const filteredVans = useMemo(() => {
     const q = vanSearch.trim().toLowerCase();
     if (!q) return data.vans;
@@ -526,15 +483,15 @@ export default function AdminDashboard() {
 
   const filteredStaff = useMemo(() => {
     const q = staffSearch.trim().toLowerCase();
-    if (!q) return data.staff;
-    return data.staff.filter((user) => (
+    if (!q) return staffTableData;
+    return staffTableData.filter((user) => (
       String(user.name ?? '').toLowerCase().includes(q) ||
       String(user.email ?? '').toLowerCase().includes(q) ||
       String(user.driverId ?? '').toLowerCase().includes(q) ||
       String(user.contactNumber ?? '').toLowerCase().includes(q) ||
       String(user.role ?? '').toLowerCase().includes(q)
     ));
-  }, [data.staff, staffSearch]);
+  }, [staffTableData, staffSearch]);
 
   const auditActionOptions = useMemo(() => {
     const set = new Set();
@@ -607,6 +564,8 @@ export default function AdminDashboard() {
     return counts;
   }, [data.vans]);
 
+  // `data.staff` already includes every driver (pending/approved/rejected),
+  // so this reads straight off it — no separate addition needed.
   const driverApprovalBreakdown = useMemo(() => {
     const counts = { APPROVED: 0, PENDING: 0, REJECTED: 0 };
     data.staff.forEach((u) => {
@@ -614,12 +573,8 @@ export default function AdminDashboard() {
       const status = u.approvalStatus ?? 'APPROVED';
       if (counts[status] !== undefined) counts[status] += 1;
     });
-    // Applications still in the pending queue haven't landed in `staff` yet
-    // (they're not full driver accounts until approved), so fold them in
-    // here for an accurate live snapshot.
-    counts.PENDING += pendingDrivers.length;
     return counts;
-  }, [data.staff, pendingDrivers]);
+  }, [data.staff]);
 
   if (loading) return <PageState loading title="Loading Command Center…" />;
 
@@ -796,7 +751,7 @@ export default function AdminDashboard() {
                 onClick={openAddVanModal}
                 className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-1.5 rounded-lg transition shadow-sm whitespace-nowrap self-stretch sm:self-auto"
               >
-                ＋ Add Van &amp; Driver
+                ＋ Add Van
               </button>
             </div>
 
@@ -812,7 +767,7 @@ export default function AdminDashboard() {
             )}
 
             <div className="overflow-x-auto -mx-3 sm:mx-0">
-              <table className="w-full text-sm text-left min-w-[480px]">
+              <table className="w-full text-sm text-left min-w-[420px]">
                 <thead className="bg-gray-50 text-gray-500 text-xs uppercase tracking-wide">
                   <tr>
                     <th className="p-3">Plate</th>
@@ -827,7 +782,7 @@ export default function AdminDashboard() {
                       colSpan={4}
                       message={
                         data.vans.length === 0
-                          ? 'No vans yet. Tap "Add Van & Driver" to register the first one.'
+                          ? 'No vans yet. Tap "Add Van" to register the first one.'
                           : 'No vans match your search.'
                       }
                     />
@@ -844,7 +799,6 @@ export default function AdminDashboard() {
                         <td className="p-3">
                           <div className="flex gap-1.5 justify-end">
                             <button onClick={() => setViewingQrVan(van)} title="View this van's scan QR" className="text-xs font-semibold px-2 py-1 rounded border border-purple-300 text-purple-700 bg-purple-50 hover:bg-purple-100 transition">QR</button>
-                            <button onClick={() => openEditVanModal(van)} className="text-xs font-semibold px-2 py-1 rounded border border-blue-300 text-blue-700 bg-blue-50 hover:bg-blue-100 transition">Edit</button>
                             <button onClick={() => openDeleteVanModal(van)} className="text-xs font-semibold px-2 py-1 rounded border border-red-300 text-red-600 bg-red-50 hover:bg-red-100 transition">Delete</button>
                           </div>
                         </td>
@@ -861,7 +815,7 @@ export default function AdminDashboard() {
             <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2 sm:gap-3 mb-3 border-b pb-3">
               <h2 className="text-base sm:text-lg font-bold text-gray-800 flex items-center gap-2">
                 System Users &amp; Drivers
-                <span className="text-xs font-bold bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full">{data.staff.length}</span>
+                <span className="text-xs font-bold bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full">{staffTableData.length}</span>
               </h2>
               <button
                 onClick={openAddStaffModal}
@@ -871,7 +825,7 @@ export default function AdminDashboard() {
               </button>
             </div>
 
-            {data.staff.length > 0 && (
+            {staffTableData.length > 0 && (
               <div className="mb-3">
                 <SearchInput
                   value={staffSearch}
@@ -898,7 +852,7 @@ export default function AdminDashboard() {
                     <EmptyTableRow
                       colSpan={5}
                       message={
-                        data.staff.length === 0
+                        staffTableData.length === 0
                           ? 'No staff accounts yet. Tap "Add Staff Account" to create one.'
                           : 'No staff match your search.'
                       }
@@ -906,6 +860,7 @@ export default function AdminDashboard() {
                   ) : filteredStaff.map((user) => {
                     const isBusy = togglingId === user.id;
                     const anyToggling = togglingId !== null;
+                    const isRejectedDriver = user.role === 'DRIVER' && user.approvalStatus === 'REJECTED';
                     return (
                       <tr key={user.id} className={`border-b hover:bg-gray-50 transition-opacity ${isBusy ? 'opacity-50' : ''}`}>
                         <td className="p-3">
@@ -915,16 +870,21 @@ export default function AdminDashboard() {
                         <td className="p-3 text-gray-600 whitespace-nowrap">{user.contactNumber || '—'}</td>
                         <td className="p-3"><RoleBadge role={user.role} /></td>
                         <td className="p-3">
-                          <span className={`px-2 py-0.5 rounded text-xs font-bold ${user.isActive ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-500'}`}>
-                            {user.isActive ? 'Active' : 'Disabled'}
-                          </span>
+                          {isRejectedDriver ? (
+                            <span className="px-2 py-0.5 rounded text-xs font-bold bg-red-100 text-red-700">Rejected</span>
+                          ) : (
+                            <span className={`px-2 py-0.5 rounded text-xs font-bold ${user.isActive ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-500'}`}>
+                              {user.isActive ? 'Active' : 'Disabled'}
+                            </span>
+                          )}
                         </td>
                         <td className="p-3">
                           <div className="flex flex-wrap gap-1.5 justify-end">
-                            <button onClick={() => openEditStaffModal(user)} disabled={isBusy || anyToggling} className="text-xs font-semibold px-2 py-1 rounded border border-blue-300 text-blue-700 bg-blue-50 hover:bg-blue-100 transition disabled:opacity-40 disabled:cursor-not-allowed">Edit</button>
-                            <button onClick={() => handleToggleActive(user)} disabled={isBusy || anyToggling} className={`text-xs font-semibold px-2 py-1 rounded border transition disabled:opacity-40 disabled:cursor-not-allowed ${user.isActive ? 'border-yellow-300 text-yellow-700 bg-yellow-50 hover:bg-yellow-100' : 'border-green-300 text-green-700 bg-green-50 hover:bg-green-100'}`}>
-                              {isBusy ? '…' : user.isActive ? 'Disable' : 'Enable'}
-                            </button>
+                            {!isRejectedDriver && (
+                              <button onClick={() => handleToggleActive(user)} disabled={isBusy || anyToggling} className={`text-xs font-semibold px-2 py-1 rounded border transition disabled:opacity-40 disabled:cursor-not-allowed ${user.isActive ? 'border-yellow-300 text-yellow-700 bg-yellow-50 hover:bg-yellow-100' : 'border-green-300 text-green-700 bg-green-50 hover:bg-green-100'}`}>
+                                {isBusy ? '…' : user.isActive ? 'Disable' : 'Enable'}
+                              </button>
+                            )}
                             <button onClick={() => openDeleteUserModal(user)} disabled={isBusy || anyToggling} className="text-xs font-semibold px-2 py-1 rounded border border-red-300 text-red-600 bg-red-50 hover:bg-red-100 transition disabled:opacity-40 disabled:cursor-not-allowed">Delete</button>
                           </div>
                         </td>
@@ -946,9 +906,8 @@ export default function AdminDashboard() {
         onClearFilters={clearAuditFilters} lastSync={lastAuditSync} onRefresh={() => fetchAuditLogs()} onLoadMore={() => setAuditVisible((n) => n + AUDIT_PAGE_SIZE)}
         onClearHistory={handleClearAuditHistory} onExportCsv={handleExportAuditCsv}
       />
-      <StaffFormModal state={staffModal} onClose={closeStaffModal} onSubmit={handleSubmitStaff} isLoading={mutationLoading} serverError={mutationError} onClearError={() => setMutationError('')} />
-      <VanFormModal state={vanModal} onClose={closeVanModal} onSubmit={handleSubmitVan} isLoading={vanMutationLoading} serverError={vanMutationError} onClearError={() => setVanMutationError('')} />
-      <DriverCredentialsModal credentials={driverCredentials} onClose={() => setDriverCredentials(null)} />
+      <StaffFormModal isOpen={isStaffModalOpen} onClose={closeStaffModal} onSubmit={handleSubmitStaff} isLoading={mutationLoading} serverError={mutationError} onClearError={() => setMutationError('')} />
+      <VanFormModal isOpen={isVanModalOpen} onClose={closeVanModal} onSubmit={handleSubmitVan} isLoading={vanMutationLoading} serverError={vanMutationError} onClearError={() => setVanMutationError('')} />
       <QrOnlyModal van={viewingQrVan} onClose={() => setViewingQrVan(null)} />
       <ConfirmDeleteModal target={pendingDelete} onClose={closeDeleteModal} onConfirm={handleConfirmDelete} isLoading={anyMutationBusy} serverError={pendingDelete?.kind === 'van' ? vanMutationError : mutationError} />
       <LicensePhotoModal driver={licensePhotoView} onClose={() => setLicensePhotoView(null)} />
@@ -965,13 +924,9 @@ export default function AdminDashboard() {
   );
 }
 
-// ─── StaffFormModal (Admins & Dispatchers ONLY) ───────────────────────────────
+// ─── StaffFormModal (Add only — Admin & Dispatcher accounts) ─────────────────
 
-function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onClearError }) {
-  const isOpen   = state != null;
-  const isEdit   = state?.mode === 'edit';
-  const original = state?.user ?? null;
-
+function StaffFormModal({ isOpen, onClose, onSubmit, isLoading, serverError, onClearError }) {
   const [form, setForm]     = useState(EMPTY_STAFF_FORM);
   const [errors, setErrors] = useState({});
   const [passwordVisible, setPasswordVisible] = useState(false);
@@ -979,18 +934,14 @@ function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onCl
 
   useEffect(() => {
     if (isOpen) {
-      setForm(
-        isEdit && original
-          ? { name: original.name ?? '', email: original.email ?? '', role: original.role ?? '', driverId: original.driverId ?? '', password: '' }
-          : EMPTY_STAFF_FORM,
-      );
+      setForm(EMPTY_STAFF_FORM);
       setErrors({});
       setPasswordVisible(false);
       onClearError();
       const id = setTimeout(() => nameRef.current?.focus(), 60);
       return () => clearTimeout(id);
     }
-  }, [isOpen, isEdit, original, onClearError]);
+  }, [isOpen, onClearError]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -1024,15 +975,11 @@ function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onCl
 
     if (!form.role) e.role = 'Role is required.';
 
-    if (form.role && form.role !== 'DRIVER') {
-      if (!em) e.email = 'Email address is required.';
-      else if (!EMAIL_RE.test(em)) e.email = 'Enter a valid email address.';
-    }
+    if (!em) e.email = 'Email address is required.';
+    else if (!EMAIL_RE.test(em)) e.email = 'Enter a valid email address.';
 
-    if (!isEdit) {
-      if (!form.password) e.password = 'A PIN is required.';
-      else if (form.password.length < PASSWORD_MIN) e.password = `PIN must be at least ${PASSWORD_MIN} characters.`;
-    }
+    if (!form.password) e.password = 'A PIN is required.';
+    else if (form.password.length < PASSWORD_MIN) e.password = `PIN must be at least ${PASSWORD_MIN} characters.`;
 
     return e;
   };
@@ -1044,8 +991,8 @@ function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onCl
     onSubmit({
       name: form.name.trim(),
       role: form.role,
-      ...(!isEdit && { password: form.password }),
-      ...(form.role !== 'DRIVER' && { email: form.email.trim() }),
+      email: form.email.trim(),
+      password: form.password,
     });
   };
 
@@ -1061,7 +1008,7 @@ function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onCl
     >
       <div className="bg-white rounded-t-2xl sm:rounded-2xl shadow-2xl w-full max-w-md max-h-[95vh] sm:max-h-[90vh] flex flex-col">
         <div className="flex justify-between items-center p-4 sm:p-5 border-b">
-          <h2 id="staff-modal-title" className="text-base sm:text-lg font-bold text-gray-900">{isEdit ? 'Edit Account' : 'Add Staff Account'}</h2>
+          <h2 id="staff-modal-title" className="text-base sm:text-lg font-bold text-gray-900">Add Staff Account</h2>
           <button onClick={onClose} disabled={isLoading} aria-label="Close" className="text-gray-400 hover:text-gray-600 disabled:opacity-40 text-xl leading-none p-1">✕</button>
         </div>
         {serverError && <div className="mx-4 sm:mx-5 mt-4 p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg text-sm">⚠️ {serverError}</div>}
@@ -1071,48 +1018,42 @@ function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onCl
           </Field>
 
           <Field label="Role" required error={errors.role}>
-            <select name="role" value={form.role} onChange={change} disabled={isEdit} className={`${inputCls(errors.role)} bg-white disabled:opacity-60 disabled:cursor-not-allowed`}>
+            <select name="role" value={form.role} onChange={change} className={`${inputCls(errors.role)} bg-white`}>
               <option value="">— Select a role —</option>
               <option value="ADMIN">Admin</option>
               <option value="DISPATCHER">Dispatcher</option>
-              {isEdit && form.role === 'DRIVER' && <option value="DRIVER">Driver</option>}
             </select>
-            {!isEdit && <p className="text-xs text-blue-600 mt-1.5 font-medium">Drivers register themselves and are approved from the Pending Driver Applications list above — they aren't created here.</p>}
+            <p className="text-xs text-blue-600 mt-1.5 font-medium">Drivers register themselves and are approved from the Pending Driver Applications list above — they aren't created here.</p>
           </Field>
 
-          {form.role && form.role !== 'DRIVER' && (
-            <Field label="Email Address" required error={errors.email}>
-              <input name="email" type="email" value={form.email} onChange={change} placeholder="staff@terminal.gov.ph" autoComplete="email" className={inputCls(errors.email)} />
-            </Field>
-          )}
+          <Field label="Email Address" required error={errors.email}>
+            <input name="email" type="email" value={form.email} onChange={change} placeholder="staff@terminal.gov.ph" autoComplete="email" className={inputCls(errors.email)} />
+          </Field>
 
-          {!isEdit && form.role && (
-            <Field
-              label="PIN"
-              required
-              error={errors.password}
-              hint={`At least ${PASSWORD_MIN} characters. Use the generator for a quick, non-obvious PIN.`}
-              action={<GeneratePasswordButton onGenerate={handleGeneratePassword} />}
-            >
-              <PasswordInput
-                name="password"
-                value={form.password}
-                onChange={change}
-                placeholder="Enter a PIN"
-                autoComplete="new-password"
-                hasError={errors.password}
-                maxLength={128}
-                visible={passwordVisible}
-                onToggleVisible={() => setPasswordVisible((v) => !v)}
-              />
-            </Field>
-          )}
-          {isEdit && <p className="text-xs text-gray-400">To reset this user's PIN, use the dedicated reset flow — it isn't changed here.</p>}
+          <Field
+            label="PIN"
+            required
+            error={errors.password}
+            hint={`At least ${PASSWORD_MIN} characters. Use the generator for a quick, non-obvious PIN.`}
+            action={<GeneratePasswordButton onGenerate={handleGeneratePassword} />}
+          >
+            <PasswordInput
+              name="password"
+              value={form.password}
+              onChange={change}
+              placeholder="Enter a PIN"
+              autoComplete="new-password"
+              hasError={errors.password}
+              maxLength={128}
+              visible={passwordVisible}
+              onToggleVisible={() => setPasswordVisible((v) => !v)}
+            />
+          </Field>
         </div>
         <div className="flex flex-col-reverse sm:flex-row gap-2 sm:gap-3 p-4 sm:p-5 border-t bg-gray-50 rounded-b-2xl">
           <button onClick={onClose} disabled={isLoading} className="flex-1 py-2.5 sm:py-2 border border-gray-300 rounded-lg text-sm font-semibold text-gray-700 hover:bg-gray-100 transition disabled:opacity-40">Cancel</button>
           <button onClick={submit} disabled={isLoading} className="flex-1 py-2.5 sm:py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-bold transition disabled:opacity-70 disabled:cursor-not-allowed">
-            {isLoading ? (isEdit ? 'Saving…' : 'Creating…') : (isEdit ? 'Save Changes' : 'Create Account')}
+            {isLoading ? 'Creating…' : 'Create Account'}
           </button>
         </div>
       </div>
@@ -1120,28 +1061,22 @@ function StaffFormModal({ state, onClose, onSubmit, isLoading, serverError, onCl
   );
 }
 
-// ─── VanFormModal (Combined Van + Driver) ─────────────────────────────────────
+// ─── VanFormModal (Add only) ───────────────────────────────────────────────
 
-function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClearError }) {
-  const isOpen   = state != null;
-  const isEdit   = state?.mode === 'edit';
-  const original = state?.van ?? null;
-
+function VanFormModal({ isOpen, onClose, onSubmit, isLoading, serverError, onClearError }) {
   const [form, setForm]     = useState(EMPTY_VAN_FORM);
   const [errors, setErrors] = useState({});
-  const [driverPasswordVisible, setDriverPasswordVisible] = useState(false);
   const plateRef             = useRef(null);
 
   useEffect(() => {
     if (isOpen) {
-      setForm(isEdit && original ? { plateNumber: original.plateNumber ?? '', capacity: String(original.capacity ?? ''), status: original.status ?? 'IDLE', driverName: '', driverPassword: '' } : EMPTY_VAN_FORM);
+      setForm(EMPTY_VAN_FORM);
       setErrors({});
-      setDriverPasswordVisible(false);
       onClearError();
       const id = setTimeout(() => plateRef.current?.focus(), 60);
       return () => clearTimeout(id);
     }
-  }, [isOpen, isEdit, original, onClearError]);
+  }, [isOpen, onClearError]);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -1154,14 +1089,6 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
     const { name, value } = e.target;
     setForm((p) => ({ ...p, [name]: value }));
     setErrors((p) => ({ ...p, [name]: '' }));
-    if (serverError) onClearError();
-  };
-
-  const handleGenerateDriverPassword = () => {
-    const pw = generateRandomPassword();
-    setForm((p) => ({ ...p, driverPassword: pw }));
-    setErrors((p) => ({ ...p, driverPassword: '' }));
-    setDriverPasswordVisible(true);
     if (serverError) onClearError();
   };
 
@@ -1178,12 +1105,6 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
 
     if (!form.status) e.status = 'Status is required.';
 
-    if (!isEdit) {
-      if (!form.driverName.trim()) e.driverName = "Driver's full name is required.";
-      if (!form.driverPassword) e.driverPassword = 'A PIN is required.';
-      else if (form.driverPassword.length < PASSWORD_MIN) e.driverPassword = `PIN must be at least ${PASSWORD_MIN} characters.`;
-    }
-
     return e;
   };
 
@@ -1191,20 +1112,11 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
     const e = validate();
     if (Object.keys(e).length > 0) { setErrors(e); return; }
 
-    const payload = {
+    onSubmit({
       plateNumber: form.plateNumber.trim().toUpperCase(),
       capacity: Number(form.capacity),
       status: form.status,
-    };
-
-    if (!isEdit) {
-      payload.driverName = form.driverName.trim();
-      // NOTE: the backend wire-format field is still called `driverPin`,
-      // but the UI now presents it as a PIN rather than a password.
-      payload.driverPin = form.driverPassword;
-    }
-
-    onSubmit(payload);
+    });
   };
 
   if (!isOpen) return null;
@@ -1219,184 +1131,37 @@ function VanFormModal({ state, onClose, onSubmit, isLoading, serverError, onClea
     >
       <div className="bg-white rounded-t-2xl sm:rounded-2xl shadow-2xl w-full max-w-md max-h-[95vh] sm:max-h-[90vh] flex flex-col">
         <div className="flex justify-between items-center p-4 sm:p-5 border-b bg-slate-50">
-          <h2 id="van-modal-title" className="text-base sm:text-lg font-black text-gray-900">{isEdit ? 'Edit Van' : 'Add Van & Driver'}</h2>
+          <h2 id="van-modal-title" className="text-base sm:text-lg font-black text-gray-900">Add Van</h2>
           <button onClick={onClose} disabled={isLoading} aria-label="Close" className="text-gray-400 hover:text-gray-600 disabled:opacity-40 text-xl leading-none p-1">✕</button>
         </div>
 
         {serverError && <div className="mx-4 sm:mx-5 mt-4 p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg text-sm font-medium">⚠️ {serverError}</div>}
 
-        <div className="p-4 sm:p-5 overflow-y-auto space-y-6">
-          {/* VAN DETAILS */}
-          <div>
-            <h3 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-3 border-b pb-1">Van Information</h3>
-            <div className="space-y-4">
-              <Field label="Plate Number" required error={errors.plateNumber}>
-                <input ref={plateRef} name="plateNumber" type="text" value={form.plateNumber} onChange={change} placeholder="e.g. ABC-1234" autoComplete="off" maxLength={15} disabled={isEdit} className={`${inputCls(errors.plateNumber)} uppercase disabled:bg-gray-100 disabled:text-gray-500`} />
-              </Field>
+        <div className="p-4 sm:p-5 overflow-y-auto space-y-4">
+          <Field label="Plate Number" required error={errors.plateNumber}>
+            <input ref={plateRef} name="plateNumber" type="text" value={form.plateNumber} onChange={change} placeholder="e.g. ABC-1234" autoComplete="off" maxLength={15} className={`${inputCls(errors.plateNumber)} uppercase`} />
+          </Field>
 
-              <div className="grid grid-cols-2 gap-3 sm:gap-4">
-                <Field label="Capacity" required error={errors.capacity} hint="Seats (1-30).">
-                  <input name="capacity" type="number" min={1} max={30} value={form.capacity} onChange={change} placeholder="e.g. 14" className={inputCls(errors.capacity)} />
-                </Field>
-                <Field label="Status" required error={errors.status}>
-                  <select name="status" value={form.status} onChange={change} className={`${inputCls(errors.status)} bg-white`}>
-                    {VAN_STATUSES.map((s) => <option key={s} value={s}>{s.replace('_', ' ')}</option>)}
-                  </select>
-                </Field>
-              </div>
-            </div>
+          <div className="grid grid-cols-2 gap-3 sm:gap-4">
+            <Field label="Capacity" required error={errors.capacity} hint="Seats (1-30).">
+              <input name="capacity" type="number" min={1} max={30} value={form.capacity} onChange={change} placeholder="e.g. 14" className={inputCls(errors.capacity)} />
+            </Field>
+            <Field label="Status" required error={errors.status}>
+              <select name="status" value={form.status} onChange={change} className={`${inputCls(errors.status)} bg-white`}>
+                {VAN_STATUSES.map((s) => <option key={s} value={s}>{s.replace('_', ' ')}</option>)}
+              </select>
+            </Field>
           </div>
 
-          {/* DRIVER DETAILS (Only during creation) */}
-          {!isEdit && (
-            <div>
-              <h3 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-3 border-b pb-1">Assigned Driver</h3>
-              <p className="text-xs text-blue-600 mb-3 font-medium">
-                A new driver account will be created — not by email, but with a login ID the system generates
-                automatically. You'll see that ID right after you submit this form, so you can hand it to the driver
-                along with the PIN below. You'll also get a scannable QR code for this van at the same time.
-              </p>
-              <div className="space-y-4">
-                <Field label="Driver's Full Name" required error={errors.driverName}>
-                  <input name="driverName" type="text" value={form.driverName} onChange={change} placeholder="e.g. Juan dela Cruz" autoComplete="off" maxLength={60} className={inputCls(errors.driverName)} />
-                </Field>
-                <Field
-                  label="Driver PIN"
-                  required
-                  error={errors.driverPassword}
-                  hint={`What the driver will type in to sign in. At least ${PASSWORD_MIN} characters — use the generator for a quick, non-obvious one.`}
-                  action={<GeneratePasswordButton onGenerate={handleGenerateDriverPassword} />}
-                >
-                  <PasswordInput
-                    name="driverPassword"
-                    value={form.driverPassword}
-                    onChange={change}
-                    placeholder="Enter a PIN"
-                    autoComplete="new-password"
-                    hasError={errors.driverPassword}
-                    maxLength={128}
-                    visible={driverPasswordVisible}
-                    onToggleVisible={() => setDriverPasswordVisible((v) => !v)}
-                  />
-                </Field>
-              </div>
-            </div>
-          )}
+          <p className="text-xs text-blue-600 font-medium">
+            Once registered, you'll see the van's scannable QR code right away. Driver assignment happens automatically as drivers are approved and start trips.
+          </p>
         </div>
 
         <div className="flex flex-col-reverse sm:flex-row gap-2 sm:gap-3 p-4 sm:p-5 border-t bg-gray-50 rounded-b-2xl">
           <button onClick={onClose} disabled={isLoading} className="flex-1 py-2.5 sm:py-2 border border-gray-300 rounded-lg text-sm font-semibold text-gray-700 hover:bg-gray-100 transition disabled:opacity-40">Cancel</button>
           <button onClick={submit} disabled={isLoading} className="flex-[2] py-2.5 sm:py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-sm font-bold transition disabled:opacity-70 disabled:cursor-not-allowed">
-            {isLoading ? (isEdit ? 'Saving…' : 'Creating…') : (isEdit ? 'Save Changes' : 'Add Van & Driver')}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ─── DriverCredentialsModal ────────────────────────────────────────────────────
-
-function DriverCredentialsModal({ credentials, onClose }) {
-  const [showPassword, setShowPassword] = useState(false);
-
-  useEffect(() => {
-    if (!credentials) { setShowPassword(false); return; }
-    const fn = (e) => { if (e.key === 'Escape') onClose(); };
-    document.addEventListener('keydown', fn);
-    return () => document.removeEventListener('keydown', fn);
-  }, [credentials, onClose]);
-
-  if (!credentials) return null;
-
-  const { plateNumber, driverName, driverId, password, qrToken } = credentials;
-  const missingId = !driverId;
-  const maskedPassword = password ? '•'.repeat(Math.min(password.length, 16)) : '—';
-
-  return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="driver-creds-title"
-      className="fixed inset-0 bg-black/50 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4"
-    >
-      <div className="bg-white rounded-t-2xl sm:rounded-2xl shadow-2xl w-full max-w-sm max-h-[95vh] sm:max-h-[90vh] flex flex-col">
-        <div className="p-5 sm:p-6 space-y-4 text-center overflow-y-auto">
-          <div className="text-4xl" aria-hidden="true">✅</div>
-          <h2 id="driver-creds-title" className="text-base sm:text-lg font-black text-gray-900">Driver Account Created</h2>
-          <p className="text-sm text-gray-500">
-            Give <strong>{driverName}</strong> these details — this is the only time the PIN will be shown.
-          </p>
-
-          <div className="bg-gray-50 border border-gray-200 rounded-xl p-3 sm:p-4 text-left space-y-3">
-            <div>
-              <div className="text-xs font-bold text-gray-400 uppercase tracking-wide">Van</div>
-              <div className="font-bold text-gray-900">{plateNumber}</div>
-            </div>
-
-            <div>
-              <div className="text-xs font-bold text-gray-400 uppercase tracking-wide mb-0.5">Login ID</div>
-              {missingId ? (
-                <div className="text-sm text-amber-700">
-                  Not returned by the server. Check the vans list or your database for this driver's ID.
-                </div>
-              ) : (
-                <div className="flex items-center gap-2">
-                  <div className="font-mono font-bold text-gray-900 text-sm sm:text-base flex-1 break-all">{driverId}</div>
-                  <CopyButton text={driverId} label="Copy" />
-                </div>
-              )}
-            </div>
-
-            <div>
-              <div className="text-xs font-bold text-gray-400 uppercase tracking-wide mb-0.5">PIN</div>
-              <div className="flex items-center gap-2">
-                <div className="font-mono font-bold text-gray-900 text-sm sm:text-base flex-1 break-all">
-                  {showPassword ? (password ?? '—') : maskedPassword}
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setShowPassword((s) => !s)}
-                  aria-label={showPassword ? 'Hide PIN' : 'Show PIN'}
-                  title={showPassword ? 'Hide PIN' : 'Show PIN'}
-                  className="shrink-0 text-xs font-bold px-2 py-1.5 rounded border border-gray-300 text-gray-600 bg-white hover:bg-gray-100 transition"
-                >
-                  {showPassword ? '🙈' : '👁'}
-                </button>
-                <CopyButton text={password ?? ''} label="Copy" disabled={!password} />
-              </div>
-            </div>
-
-            {qrToken && (
-              <div className="pt-3 border-t border-gray-200">
-                <div className="text-xs font-bold text-gray-400 uppercase tracking-wide mb-1">
-                  Van QR Code — print once, works for every future trip
-                </div>
-                <div className="flex items-center gap-2">
-                  <code className="flex-1 text-[11px] bg-white border border-gray-200 rounded px-2 py-1.5 break-all font-mono">
-                    {qrToken}
-                  </code>
-                  <CopyButton text={qrToken} label="Copy" />
-                </div>
-                <img
-                  src={`https://api.qrserver.com/v1/create-qr-code/?size=160x160&data=${encodeURIComponent(qrToken)}`}
-                  alt="Van QR preview"
-                  className="mt-3 mx-auto rounded-lg border border-gray-200 max-w-full"
-                />
-                <p className="text-xs text-gray-400 mt-2">
-                  Paste the text above into any QR generator, or right-click the preview image to save it directly.
-                </p>
-              </div>
-            )}
-          </div>
-
-          <p className="text-xs text-gray-400">
-            The driver enters the Login ID and PIN above on the driver sign-in screen — no email needed.
-          </p>
-        </div>
-        <div className="p-4 sm:p-5 border-t bg-gray-50 rounded-b-2xl">
-          <button onClick={onClose} className="w-full py-2.5 sm:py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-bold transition">
-            Got it, close
+            {isLoading ? 'Creating…' : 'Add Van'}
           </button>
         </div>
       </div>
@@ -1617,7 +1382,6 @@ function StatCard({ title, value, color, icon }) {
   );
 }
 
-// ── BreakdownCard — small analytics bar widget ──────────────────────────────
 function BreakdownCard({ title, entries }) {
   const total = entries.reduce((sum, e) => sum + (e.count || 0), 0);
   return (
@@ -1882,7 +1646,7 @@ function AuditTrailModal({
 
 function AuditActionBadge({ action }) {
   const key = (action ?? '').toUpperCase();
-  const styles = { CREATE: 'bg-green-100 text-green-800', UPDATE: 'bg-blue-100 text-blue-800', DELETE: 'bg-red-100 text-red-800', LOGIN: 'bg-purple-100 text-purple-800', LOGOUT: 'bg-gray-100 text-gray-600' };
+  const styles = { CREATE: 'bg-green-100 text-green-800', UPDATE: 'bg-blue-100 text-blue-800', DELETE: 'bg-red-100 text-red-800', APPROVE: 'bg-green-100 text-green-800', REJECT: 'bg-red-100 text-red-800', DISABLE: 'bg-orange-100 text-orange-800', ENABLE: 'bg-green-100 text-green-800', LOGIN: 'bg-purple-100 text-purple-800', LOGOUT: 'bg-gray-100 text-gray-600' };
   const matched = Object.keys(styles).find((k) => key.includes(k));
   return <span className={`px-2 py-0.5 rounded text-xs font-bold whitespace-nowrap ${matched ? styles[matched] : 'bg-gray-100 text-gray-600'}`}>{action ?? 'UNKNOWN'}</span>;
 }
