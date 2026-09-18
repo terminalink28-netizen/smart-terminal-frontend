@@ -164,15 +164,22 @@ export default function Login() {
           </button>
         </form>
 
-        <div className="mt-6 text-center">
-          <button
-            type="button"
-            onClick={() => navigate('/')}
-            className="text-sm text-blue-600 hover:text-blue-800 font-medium"
-          >
-            View Public Tracking
-          </button>
-        </div>
+        <div className="mt-6 text-center space-y-2">
+  <button
+    type="button"
+    onClick={() => navigate('/')}
+    className="text-sm text-blue-600 hover:text-blue-800 font-medium block w-full"
+  >
+    View Public Tracking
+  </button>
+  <button
+    type="button"
+    onClick={() => navigate('/register')}
+    className="text-sm text-slate-500 hover:text-slate-700 font-medium block w-full"
+  >
+    New driver? Register here
+  </button>
+</div>
       </div>
     </div>
   );
