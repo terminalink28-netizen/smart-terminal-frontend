@@ -18,24 +18,17 @@ const BOARDING_STATUSES = ['BOARDING'];
 const DRIVING_STATUSES = ['DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'];
 const MAP_VISIBLE_STATUSES = [...BOARDING_STATUSES, ...DRIVING_STATUSES];
 
-const SPEED_SMOOTHING_ALPHA = 0.4;
 const STOPPED_THRESHOLD_KMH = 2;
 const LOW_ACCURACY_THRESHOLD_M = 75;
-
-// A fix worse than this is not plotted at all — we'd rather show "no GPS"
-// than draw a van a few hundred metres away from where it actually is.
 const UNUSABLE_ACCURACY_M = 250;
-
-// Re-query OSRM only after the van has actually travelled this far, instead
-// of on every single GPS ping.
 const ROUTE_RECALC_DISTANCE_M = 250;
 
 const STATUS_CONFIG = {
-  BOARDING: { label: 'Boarding', cls: 'bg-green-100 text-green-800 border-green-200' },
-  DEPARTING: { label: 'Departing', cls: 'bg-amber-100 text-amber-800 border-amber-200' },
-  DEPARTED: { label: 'En Route', cls: 'bg-blue-100 text-blue-800 border-blue-200' },
-  ARRIVING: { label: 'Arriving Soon', cls: 'bg-emerald-100 text-emerald-800 border-emerald-200' },
-  DELAYED: { label: 'Delayed', cls: 'bg-orange-100 text-orange-800 border-orange-200' },
+  BOARDING:  { label: 'Boarding',      cls: 'bg-green-100 text-green-800 border-green-200'   },
+  DEPARTING: { label: 'Departing',     cls: 'bg-amber-100 text-amber-800 border-amber-200'   },
+  DEPARTED:  { label: 'En Route',      cls: 'bg-blue-100 text-blue-800 border-blue-200'      },
+  ARRIVING:  { label: 'Arriving Soon', cls: 'bg-emerald-100 text-emerald-800 border-emerald-200' },
+  DELAYED:   { label: 'Delayed',       cls: 'bg-orange-100 text-orange-800 border-orange-200' },
 };
 
 const STATUS_MARKER_STYLE = {
@@ -46,6 +39,8 @@ const STATUS_MARKER_STYLE = {
   DELAYED:   { glyph: '⏱️', color: '#ea580c' },
 };
 const DEFAULT_MARKER_STYLE = { glyph: '🚐', color: '#6b7280' };
+
+// ─── Pure helpers ────────────────────────────────────────────────────────────
 
 function msToKmh(mps) {
   if (typeof mps !== 'number' || Number.isNaN(mps)) return null;
@@ -62,22 +57,19 @@ function relativeTime(ts) {
   return 'over an hour ago';
 }
 
+function isHomeTerminal(name) {
+  return typeof name === 'string' && name.trim().toLowerCase() === HOME_TERMINAL_NAME.toLowerCase();
+}
+
 function shortPlaceName(name) {
   if (isHomeTerminal(name)) return HOME_TERMINAL_SHORT;
   return (name ?? 'Unknown').replace(/\s*Terminal$/i, '');
 }
 
-function isHomeTerminal(name) {
-  return typeof name === 'string' && name.trim().toLowerCase() === HOME_TERMINAL_NAME.toLowerCase();
-}
-
 function formatScheduledTime(iso) {
   if (!iso) return null;
-  try {
-    return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-  } catch {
-    return null;
-  }
+  try { return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }
+  catch { return null; }
 }
 
 function formatDuration(seconds) {
@@ -102,8 +94,7 @@ function haversineMeters(a, b) {
   const dLng = ((b.lng - a.lng) * Math.PI) / 180;
   const lat1 = (a.lat * Math.PI) / 180;
   const lat2 = (b.lat * Math.PI) / 180;
-  const h =
-    Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
   return 2 * R * Math.asin(Math.sqrt(h));
 }
 
@@ -113,34 +104,49 @@ function accuracyTone(accuracy) {
   return { text: 'text-emerald-600', ring: '#16a34a' };
 }
 
+/** Normalises a fix from either HTTP (`liveLocation`) or socket (`van_moved`). */
+function normaliseFix(input) {
+  if (!input) return null;
+  const lat = typeof input.lat === 'number' ? input.lat : null;
+  const lng = typeof input.lng === 'number' ? input.lng : null;
+  if (lat === null || lng === null) return null;
+
+  const rawSpeed = typeof input.speed === 'number' ? input.speed : null;
+  const smoothedSpeed = typeof input.smoothedSpeed === 'number' ? input.smoothedSpeed : rawSpeed;
+
+  const lastSeen =
+    typeof input.timestamp === 'number' ? input.timestamp :
+    typeof input.lastSeen === 'number'  ? input.lastSeen  :
+    Date.now();
+
+  return {
+    lat, lng,
+    speed: rawSpeed,
+    smoothedSpeed,
+    accuracy: typeof input.accuracy === 'number' ? input.accuracy : null,
+    heading: typeof input.heading === 'number' ? input.heading : null,
+    positionTrusted: input.positionTrusted !== false,
+    lastSeen,
+  };
+}
+
+// ─── Icons ───────────────────────────────────────────────────────────────────
+
 const statusIconCache = new Map();
 function getVanIconForStatus(status) {
   if (statusIconCache.has(status)) return statusIconCache.get(status);
-
   const { glyph, color } = STATUS_MARKER_STYLE[status] ?? DEFAULT_MARKER_STYLE;
-
   const icon = L.divIcon({
     className: '',
     html: `
       <div style="
-        font-size:18px;
-        background:white;
-        border-radius:50%;
-        padding:4px;
-        border:3px solid ${color};
-        width:36px;
-        height:36px;
-        display:flex;
-        align-items:center;
-        justify-content:center;
+        font-size:18px;background:white;border-radius:50%;padding:4px;
+        border:3px solid ${color};width:36px;height:36px;
+        display:flex;align-items:center;justify-content:center;
         box-shadow:0 4px 12px ${color}59;
-      ">${glyph}</div>
-    `,
-    iconSize: [36, 36],
-    iconAnchor: [18, 18],
-    popupAnchor: [0, -22],
+      ">${glyph}</div>`,
+    iconSize: [36, 36], iconAnchor: [18, 18], popupAnchor: [0, -22],
   });
-
   statusIconCache.set(status, icon);
   return icon;
 }
@@ -149,65 +155,39 @@ const hubIcon = L.divIcon({
   className: '',
   html: `
     <div style="
-      font-size:16px;
-      background:#1e3a2f;
-      border-radius:50%;
-      padding:5px;
-      border:3px solid #6ee7b7;
-      width:34px;
-      height:34px;
-      display:flex;
-      align-items:center;
-      justify-content:center;
+      font-size:16px;background:#1e3a2f;border-radius:50%;padding:5px;
+      border:3px solid #6ee7b7;width:34px;height:34px;
+      display:flex;align-items:center;justify-content:center;
       box-shadow:0 4px 8px rgba(0,0,0,0.3);
-    ">🏛️</div>
-  `,
-  iconSize: [34, 34],
-  iconAnchor: [17, 17],
-  popupAnchor: [0, -20],
+    ">🏛️</div>`,
+  iconSize: [34, 34], iconAnchor: [17, 17], popupAnchor: [0, -20],
 });
 
-/**
- * Fits the map to all live vans exactly once, on the first batch of
- * positions. After that the user (or MapFollower) owns the viewport —
- * re-fitting on every GPS ping would yank the map around constantly.
- */
+// ─── Map helpers ─────────────────────────────────────────────────────────────
+
 function MapBoundsFitter({ positions }) {
   const map = useMap();
   const hasFittedRef = useRef(false);
 
   useEffect(() => {
     if (hasFittedRef.current || !positions.length) return;
-
     try {
       const bounds = L.latLngBounds([VIRAC_HUB, ...positions]);
       map.fitBounds(bounds, { padding: [50, 50], maxZoom: 13 });
       hasFittedRef.current = true;
-    } catch {
-      // ignore malformed coords
-    }
+    } catch { /* ignore malformed coords */ }
   }, [map, positions]);
 
   return null;
 }
 
-/**
- * Pans the map to a van the moment the user selects it, so the marker is
- * always on screen. Does not keep re-centring afterwards, so the user can
- * freely pan/zoom while watching.
- */
 function MapFollower({ tripId, position }) {
   const map = useMap();
   const lastTripRef = useRef(null);
 
   useEffect(() => {
-    if (!tripId) {
-      lastTripRef.current = null;
-      return;
-    }
-    if (!position) return;
+    if (!tripId || !position) { lastTripRef.current = null; return; }
     if (lastTripRef.current === tripId) return;
-
     lastTripRef.current = tripId;
     map.panTo(position, { animate: true, duration: 0.6 });
   }, [map, tripId, position]);
@@ -215,42 +195,32 @@ function MapFollower({ tripId, position }) {
   return null;
 }
 
+// ─── Small components ────────────────────────────────────────────────────────
+
 function ETACountdown({ etaIso }) {
   const [label, setLabel] = useState('');
-
   useEffect(() => {
     if (!etaIso) return;
-
     const tick = () => {
       const diff = new Date(etaIso).getTime() - Date.now();
-      if (diff <= 0) {
-        setLabel('Arriving now');
-        return;
-      }
-
+      if (diff <= 0) { setLabel('Arriving now'); return; }
       const h = Math.floor(diff / 3_600_000);
       const m = Math.floor((diff % 3_600_000) / 60_000);
       const s = Math.floor((diff % 60_000) / 1_000);
-
       setLabel(h > 0 ? `${h}h ${m}m away` : m > 0 ? `${m}m ${s}s away` : `${s}s away`);
     };
-
     tick();
     const id = setInterval(tick, 1000);
     return () => clearInterval(id);
   }, [etaIso]);
-
   if (!etaIso || !label) return null;
-
   return <span className="tabular-nums font-bold text-indigo-700">{label}</span>;
 }
 
 function EmptyState({ icon, text }) {
   return (
     <div className="text-center py-5 rounded-xl border-2 border-dashed border-gray-100">
-      <div className="text-2xl mb-1" aria-hidden="true">
-        {icon}
-      </div>
+      <div className="text-2xl mb-1" aria-hidden="true">{icon}</div>
       <p className="text-sm text-gray-400 font-medium">{text}</p>
     </div>
   );
@@ -259,27 +229,20 @@ function EmptyState({ icon, text }) {
 async function fetchOsrmRoute(startCoords, endCoords, signal) {
   const [startLat, startLng] = startCoords;
   const [endLat, endLng] = endCoords;
-
   const url = `${OSRM_BASE_URL}/${startLng},${startLat};${endLng},${endLat}?overview=full&geometries=geojson&steps=false`;
   const res = await fetch(url, { signal });
-
-  if (!res.ok) {
-    throw new Error(`OSRM request failed (${res.status})`);
-  }
-
+  if (!res.ok) throw new Error(`OSRM request failed (${res.status})`);
   const data = await res.json();
   const route = data?.routes?.[0];
-
-  if (!route?.geometry?.coordinates?.length) {
-    return null;
-  }
-
+  if (!route?.geometry?.coordinates?.length) return null;
   return {
     coords: route.geometry.coordinates.map(([lng, lat]) => [lat, lng]),
     distanceMeters: route.distance ?? null,
     durationSeconds: route.duration ?? null,
   };
 }
+
+// ─── Component ───────────────────────────────────────────────────────────────
 
 export default function PublicTracking() {
   const navigate = useNavigate();
@@ -294,28 +257,35 @@ export default function PublicTracking() {
   const [liveEtas, setLiveEtas] = useState({});
   const [selectedTripId, setSelectedTripId] = useState(null);
   const [selectedRoute, setSelectedRoute] = useState({
-    coords: [],
-    loading: false,
-    error: '',
-    distanceMeters: null,
-    durationSeconds: null,
+    coords: [], loading: false, error: '', distanceMeters: null, durationSeconds: null,
   });
 
-  // Keeps the selection readable from inside socket callbacks without
-  // putting `selectedTripId` in the socket effect's dependency array.
   const selectedTripIdRef = useRef(selectedTripId);
-  useEffect(() => {
-    selectedTripIdRef.current = selectedTripId;
-  }, [selectedTripId]);
+  useEffect(() => { selectedTripIdRef.current = selectedTripId; }, [selectedTripId]);
 
-  // Remembers where the currently-drawn route started, so we only rebuild
-  // it once the van has actually moved a meaningful distance.
   const routeStartRef = useRef({ tripId: null, start: null });
 
+  // ── HTTP fetch: seeds liveData from `liveLocation` so markers appear
+  //    immediately, without waiting for a socket round-trip.
   const fetchActiveTrips = useCallback(async (signal) => {
     try {
       const res = await apiClient.get('/trips/live', { signal });
-      setActiveTrips(Array.isArray(res.data) ? res.data : []);
+      const trips = Array.isArray(res.data) ? res.data : [];
+      setActiveTrips(trips);
+
+      setLiveData((prev) => {
+        const next = { ...prev };
+        for (const trip of trips) {
+          const fix = normaliseFix(trip.liveLocation);
+          if (!fix) continue;
+          const existing = next[trip.id];
+          if (!existing || (fix.lastSeen ?? 0) > (existing.lastSeen ?? 0)) {
+            next[trip.id] = fix;
+          }
+        }
+        return next;
+      });
+
       setError('');
     } catch (err) {
       if (err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') return;
@@ -324,77 +294,50 @@ export default function PublicTracking() {
     }
   }, []);
 
+  // ── Socket lifecycle ──
   useEffect(() => {
     const controller = new AbortController();
     setLoading(true);
 
     fetchActiveTrips(controller.signal).finally(() => setLoading(false));
 
-    const onConnect = () => setSocketStatus('connected');
+    const onConnect = () => {
+      setSocketStatus('connected');
+      // Re-subscribe on every (re)connect so we always get a fresh snapshot.
+      socket.emit('subscribe_to_map');
+    };
     const onDisconnect = () => setSocketStatus('disconnected');
 
-    // The server seeds us with whatever fixes it already has. Every field
-    // comes straight from the driver's phone — nothing is inferred here.
     const onInitialLocations = (payload = []) => {
       if (!Array.isArray(payload)) return;
-
-      try {
-        const seeded = payload.map(([tripId, data]) => {
-          const lastSeenMs = data?.timestamp ? new Date(data.timestamp).getTime() : Date.now();
-          const rawSpeed = typeof data?.speed === 'number' ? data.speed : null;
-          return [
-            tripId,
-            {
-              ...data,
-              speed: rawSpeed,
-              smoothedSpeed: rawSpeed,
-              heading: typeof data?.heading === 'number' ? data.heading : null,
-              accuracy: typeof data?.accuracy === 'number' ? data.accuracy : null,
-              positionTrusted: data?.positionTrusted !== false,
-              lastSeen: lastSeenMs,
-            },
-          ];
-        });
-        setLiveData(Object.fromEntries(seeded));
-      } catch {
-        // ignore malformed payloads
-      }
+      setLiveData((prev) => {
+        const next = { ...prev };
+        for (const pair of payload) {
+          if (!Array.isArray(pair) || pair.length < 2) continue;
+          const [tripId, raw] = pair;
+          const fix = normaliseFix(raw);
+          if (!fix) continue;
+          const existing = next[tripId];
+          if (!existing || (fix.lastSeen ?? 0) > (existing.lastSeen ?? 0)) {
+            next[tripId] = fix;
+          }
+        }
+        return next;
+      });
     };
 
     const onVanMoved = (data) => {
-      if (!data?.tripId || typeof data.lat !== 'number' || typeof data.lng !== 'number') return;
-
-      setLiveData((prev) => {
-        const prevEntry = prev[data.tripId] ?? {};
-        const rawSpeed = typeof data.speed === 'number' ? data.speed : null;
-
-        const smoothedSpeed =
-          rawSpeed === null
-            ? prevEntry.smoothedSpeed ?? null
-            : prevEntry.smoothedSpeed == null
-            ? rawSpeed
-            : prevEntry.smoothedSpeed * (1 - SPEED_SMOOTHING_ALPHA) + rawSpeed * SPEED_SMOOTHING_ALPHA;
-
-        return {
-          ...prev,
-          [data.tripId]: {
-            ...prevEntry,
-            lat: data.lat,
-            lng: data.lng,
-            speed: rawSpeed,
-            smoothedSpeed,
-            heading: typeof data.heading === 'number' ? data.heading : prevEntry.heading ?? null,
-            accuracy: typeof data.accuracy === 'number' ? data.accuracy : null,
-            positionTrusted: data.positionTrusted !== false,
-            lastSeen: Date.now(),
-          },
-        };
-      });
+      if (!data?.tripId) return;
+      const fix = normaliseFix(data);
+      if (!fix) return;
+      setLiveData((prev) => ({
+        ...prev,
+        [data.tripId]: { ...(prev[data.tripId] ?? {}), ...fix, lastSeen: Date.now() },
+      }));
     };
 
     const onSeatUpdate = (data) => {
       if (!data?.tripId || typeof data.availableSeats !== 'number') return;
-
       setLiveData((prev) => ({
         ...prev,
         [data.tripId]: {
@@ -407,7 +350,6 @@ export default function PublicTracking() {
 
     const onTripStatusChanged = ({ tripId, trip } = {}) => {
       if (!tripId) return;
-
       const isFinished = trip?.status === 'COMPLETED' || trip?.status === 'CANCELLED';
 
       setActiveTrips((prev) => {
@@ -440,6 +382,17 @@ export default function PublicTracking() {
       setActiveTrips((prev) => (prev.some((t) => t.id === trip.id) ? prev : [...prev, trip]));
     };
 
+    const onTripRemoved = ({ tripId } = {}) => {
+      if (!tripId) return;
+      setActiveTrips((prev) => prev.filter((t) => t.id !== tripId));
+      setLiveData((prev) => {
+        if (!(tripId in prev)) return prev;
+        const next = { ...prev };
+        delete next[tripId];
+        return next;
+      });
+    };
+
     const onEtaUpdate = ({ tripId, eta, delayMinutes } = {}) => {
       if (!tripId || !eta) return;
       setLiveEtas((prev) => ({
@@ -457,6 +410,7 @@ export default function PublicTracking() {
     socket.on('seat_update_broadcast', onSeatUpdate);
     socket.on('trip_status_changed', onTripStatusChanged);
     socket.on('trip_dispatched', onTripDispatched);
+    socket.on('trip_removed', onTripRemoved);
     socket.on('eta_update', onEtaUpdate);
 
     return () => {
@@ -468,22 +422,22 @@ export default function PublicTracking() {
       socket.off('seat_update_broadcast', onSeatUpdate);
       socket.off('trip_status_changed', onTripStatusChanged);
       socket.off('trip_dispatched', onTripDispatched);
+      socket.off('trip_removed', onTripRemoved);
       socket.off('eta_update', onEtaUpdate);
       socket.disconnect();
     };
-    // NOTE: `selectedTripId` is deliberately NOT a dependency — selecting a
-    // van must not tear down and rebuild the whole socket connection.
   }, [fetchActiveTrips, reloadToken]);
 
+  // ── Poll fallback every 30s in case the socket drops silently ──
   useEffect(() => {
     const id = setInterval(() => {
       const ctrl = new AbortController();
       fetchActiveTrips(ctrl.signal);
     }, REFETCH_INTERVAL_MS);
-
     return () => clearInterval(id);
   }, [fetchActiveTrips]);
 
+  // ── Force relative-time labels to re-render ──
   useEffect(() => {
     const id = setInterval(() => setTick((t) => t + 1), 15_000);
     return () => clearInterval(id);
@@ -505,42 +459,36 @@ export default function PublicTracking() {
   );
 
   /**
-   * Resolves a trip's map position from the driver's phone GPS only.
-   *
-   *   position   -> [lat, lng] when we have a fresh, trustworthy fix, else null
-   *   hasFix     -> a coordinate arrived, regardless of quality
-   *   isStale    -> the last fix is older than the staleness window
-   *   isTrusted  -> the phone reported an accuracy good enough to plot
+   * A trip's plottable position — the driver's phone fix, or null.
+   * A fix is plottable only when lat/lng arrived AND it's fresh AND
+   * accuracy is null or ≤ UNUSABLE_ACCURACY_M AND the backend didn't
+   * flag it untrusted.
    */
-  const resolveTripPosition = useCallback(
-    (trip) => {
-      const data = liveData[trip.id];
-      const hasFix = typeof data?.lat === 'number' && typeof data?.lng === 'number';
-      const accuracy = typeof data?.accuracy === 'number' ? data.accuracy : null;
+  const resolveTripPosition = useCallback((trip) => {
+    const data = liveData[trip.id];
+    if (!data) return { position: null, hasFix: false, isStale: false, isTrusted: false, accuracy: null };
 
-      const isStale =
-        hasFix && data?.lastSeen && Date.now() - data.lastSeen > GPS_STALE_THRESHOLD_MS;
+    const hasFix = typeof data.lat === 'number' && typeof data.lng === 'number';
+    const accuracy = typeof data.accuracy === 'number' ? data.accuracy : null;
+    const isStale = hasFix && data.lastSeen && Date.now() - data.lastSeen > GPS_STALE_THRESHOLD_MS;
+    const isTrusted =
+      data.positionTrusted !== false &&
+      (accuracy === null || accuracy <= UNUSABLE_ACCURACY_M);
+    const canPlot = hasFix && !isStale && isTrusted;
 
-      const isTrusted =
-        data?.positionTrusted !== false &&
-        (accuracy === null || accuracy <= UNUSABLE_ACCURACY_M);
+    return {
+      position: canPlot ? [data.lat, data.lng] : null,
+      hasFix: Boolean(hasFix),
+      isStale: Boolean(isStale),
+      isTrusted,
+      accuracy,
+    };
+  }, [liveData]);
 
-      const canPlot = hasFix && !isStale && isTrusted;
-
-      return {
-        position: canPlot ? [data.lat, data.lng] : null,
-        hasFix: Boolean(hasFix),
-        isStale: Boolean(isStale),
-        isTrusted,
-        accuracy,
-      };
-    },
-    [liveData]
+  const activeVanPositions = useMemo(
+    () => mapTrips.map((trip) => resolveTripPosition(trip).position).filter(Boolean),
+    [mapTrips, resolveTripPosition]
   );
-
-  const activeVanPositions = useMemo(() => {
-    return mapTrips.map((trip) => resolveTripPosition(trip).position).filter(Boolean);
-  }, [mapTrips, resolveTripPosition]);
 
   const selectedTrip = useMemo(
     () => activeTrips.find((t) => t.id === selectedTripId) ?? null,
@@ -558,23 +506,11 @@ export default function PublicTracking() {
     return resolveTripPosition(selectedTrip).position;
   }, [selectedTrip, resolveTripPosition]);
 
-  /**
-   * Builds the planned road route for the selected trip. The line always
-   * starts from the van's real live fix when one exists — never from a
-   * guessed municipal coordinate. OSRM is only re-queried once the van has
-   * moved more than ROUTE_RECALC_DISTANCE_M, so we don't hammer the public
-   * router on every GPS ping.
-   */
+  // ── Route line: rebuild only when the van moves meaningfully ──
   useEffect(() => {
     if (!selectedTripId || !selectedTrip) {
       routeStartRef.current = { tripId: null, start: null };
-      setSelectedRoute({
-        coords: [],
-        loading: false,
-        error: '',
-        distanceMeters: null,
-        durationSeconds: null,
-      });
+      setSelectedRoute({ coords: [], loading: false, error: '', distanceMeters: null, durationSeconds: null });
       return;
     }
 
@@ -593,13 +529,7 @@ export default function PublicTracking() {
     const endCoords = destCoords ?? VIRAC_HUB;
 
     if (!startCoords || !endCoords) {
-      setSelectedRoute({
-        coords: [],
-        loading: false,
-        error: 'Route coordinates are unavailable.',
-        distanceMeters: null,
-        durationSeconds: null,
-      });
+      setSelectedRoute({ coords: [], loading: false, error: 'Route coordinates are unavailable.', distanceMeters: null, durationSeconds: null });
       return;
     }
 
@@ -611,30 +541,20 @@ export default function PublicTracking() {
         { lat: startCoords[0], lng: startCoords[1] }
       ) > ROUTE_RECALC_DISTANCE_M;
 
-    // Same trip, van hasn't moved meaningfully — keep the existing line.
     if (prev.tripId === selectedTripId && !movedFarEnough) return;
 
     routeStartRef.current = { tripId: selectedTripId, start: startCoords };
 
     const controller = new AbortController();
-
     setSelectedRoute((p) => ({ ...p, loading: true, error: '' }));
 
     fetchOsrmRoute(startCoords, endCoords, controller.signal)
       .then((route) => {
         if (controller.signal.aborted) return;
-
         if (!route) {
-          setSelectedRoute({
-            coords: [],
-            loading: false,
-            error: 'Unable to build road route for this trip.',
-            distanceMeters: null,
-            durationSeconds: null,
-          });
+          setSelectedRoute({ coords: [], loading: false, error: 'Unable to build road route for this trip.', distanceMeters: null, durationSeconds: null });
           return;
         }
-
         setSelectedRoute({
           coords: route.coords,
           loading: false,
@@ -646,27 +566,17 @@ export default function PublicTracking() {
       .catch((err) => {
         if (controller.signal.aborted) return;
         console.error('[PublicTracking] route fetch failed', err);
-        setSelectedRoute({
-          coords: [],
-          loading: false,
-          error: 'Unable to load road route.',
-          distanceMeters: null,
-          durationSeconds: null,
-        });
+        setSelectedRoute({ coords: [], loading: false, error: 'Unable to load road route.', distanceMeters: null, durationSeconds: null });
       });
 
     return () => controller.abort();
-  }, [
-    selectedTripId,
-    selectedTrip,
-    selectedTripLive?.lat,
-    selectedTripLive?.lng,
-  ]);
+  }, [selectedTripId, selectedTrip, selectedTripLive?.lat, selectedTripLive?.lng]);
 
   const selectedRoutePositions = selectedRoute.coords;
   const mapFocusPositions =
     selectedRoutePositions.length > 0 ? selectedRoutePositions : activeVanPositions;
 
+  // ── Renders ──
   if (loading) {
     return (
       <div className="h-screen flex items-center justify-center bg-slate-50">
@@ -710,26 +620,20 @@ export default function PublicTracking() {
           </div>
 
           <div className="flex items-center gap-3">
-            <div
-              className={`hidden sm:flex items-center gap-1.5 text-xs font-bold px-2.5 py-1 rounded-full border ${
-                socketStatus === 'connected'
-                  ? 'bg-emerald-500/20 border-emerald-400/40 text-emerald-100'
-                  : socketStatus === 'disconnected'
-                  ? 'bg-red-500/20 border-red-400/40 text-red-200'
-                  : 'bg-yellow-500/20 border-yellow-400/40 text-yellow-200'
-              }`}
-            >
+            <div className={`hidden sm:flex items-center gap-1.5 text-xs font-bold px-2.5 py-1 rounded-full border ${
+              socketStatus === 'connected'
+                ? 'bg-emerald-500/20 border-emerald-400/40 text-emerald-100'
+                : socketStatus === 'disconnected'
+                ? 'bg-red-500/20 border-red-400/40 text-red-200'
+                : 'bg-yellow-500/20 border-yellow-400/40 text-yellow-200'
+            }`}>
               {socketStatus === 'connected' && (
                 <span className="relative flex h-1.5 w-1.5">
                   <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-300 opacity-75" />
                   <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-emerald-300" />
                 </span>
               )}
-              {socketStatus === 'connected'
-                ? 'LIVE'
-                : socketStatus === 'disconnected'
-                ? '✕ Offline'
-                : '○ Connecting'}
+              {socketStatus === 'connected' ? 'LIVE' : socketStatus === 'disconnected' ? '✕ Offline' : '○ Connecting'}
             </div>
 
             <button
@@ -745,10 +649,7 @@ export default function PublicTracking() {
       {socketStatus === 'disconnected' && (
         <div className="bg-amber-50 border-b border-amber-200 px-4 py-2 text-center text-sm text-amber-800 font-medium z-10 shrink-0">
           ⚠️ Live updates paused — reconnecting…{' '}
-          <button
-            onClick={() => setReloadToken((n) => n + 1)}
-            className="ml-1 underline font-bold hover:text-amber-900"
-          >
+          <button onClick={() => setReloadToken((n) => n + 1)} className="ml-1 underline font-bold hover:text-amber-900">
             Reload
           </button>
         </div>
@@ -787,8 +688,6 @@ export default function PublicTracking() {
               const { position, isTrusted } = resolveTripPosition(trip);
               const isSelected = selectedTripId === trip.id;
 
-              // No fresh, trustworthy phone fix → no marker at all.
-              // We never fall back to a guessed position.
               if (!position) return null;
 
               const accuracy = data?.accuracy;
@@ -801,20 +700,13 @@ export default function PublicTracking() {
                     <Circle
                       center={position}
                       radius={accuracy}
-                      pathOptions={{
-                        color: tone.ring,
-                        fillColor: tone.ring,
-                        fillOpacity: 0.08,
-                        weight: 1,
-                      }}
+                      pathOptions={{ color: tone.ring, fillColor: tone.ring, fillOpacity: 0.08, weight: 1 }}
                     />
                   )}
                   <Marker
                     position={position}
                     icon={getVanIconForStatus(trip.status)}
-                    eventHandlers={{
-                      click: () => setSelectedTripId(trip.id),
-                    }}
+                    eventHandlers={{ click: () => setSelectedTripId(trip.id) }}
                   >
                     <Popup minWidth={200}>
                       <div className="space-y-1.5 py-0.5">
@@ -842,11 +734,7 @@ export default function PublicTracking() {
                           {!isTrusted && ' · unverified fix'}
                         </div>
                         <div className="flex items-center justify-between gap-2">
-                          <span
-                            className={`text-xs font-bold px-2 py-0.5 rounded border ${
-                              STATUS_CONFIG[trip.status]?.cls ?? STATUS_CONFIG.DEPARTED.cls
-                            }`}
-                          >
+                          <span className={`text-xs font-bold px-2 py-0.5 rounded border ${STATUS_CONFIG[trip.status]?.cls ?? STATUS_CONFIG.DEPARTED.cls}`}>
                             {STATUS_CONFIG[trip.status]?.label ?? trip.status}
                           </span>
                           <button
@@ -871,13 +759,7 @@ export default function PublicTracking() {
             {selectedTripId && selectedRoutePositions.length > 1 && (
               <Polyline
                 positions={selectedRoutePositions}
-                pathOptions={{
-                  color: '#059669',
-                  weight: 5,
-                  opacity: 0.9,
-                  lineCap: 'round',
-                  lineJoin: 'round',
-                }}
+                pathOptions={{ color: '#059669', weight: 5, opacity: 0.9, lineCap: 'round', lineJoin: 'round' }}
               />
             )}
           </MapContainer>
@@ -936,16 +818,11 @@ export default function PublicTracking() {
                       >
                         <div className="flex justify-between items-start gap-3">
                           <div className="min-w-0 flex-1">
-                            <div
-                              className={`text-base leading-tight ${
-                                trip.driver?.name
-                                  ? 'font-black text-gray-900'
-                                  : 'font-medium italic text-gray-400'
-                              }`}
-                            >
+                            <div className={`text-base leading-tight ${
+                              trip.driver?.name ? 'font-black text-gray-900' : 'font-medium italic text-gray-400'
+                            }`}>
                               {trip.driver?.name ?? 'No driver assigned'}
                             </div>
-
                             <div className="text-xs text-gray-500 uppercase tracking-widest mt-1 truncate">
                               <span className="text-emerald-700 font-black">
                                 {trip.van?.plateNumber ?? 'Unknown plate'}
@@ -953,15 +830,13 @@ export default function PublicTracking() {
                             </div>
                           </div>
 
-                          <div
-                            className={`shrink-0 text-center px-3 py-2 rounded-lg min-w-[56px] ${
-                              isFull
-                                ? 'bg-gray-200 text-gray-500'
-                                : seatsLeft === 0
-                                ? 'bg-gray-100 text-gray-400'
-                                : 'bg-white shadow-sm border border-emerald-100 text-emerald-700'
-                            }`}
-                          >
+                          <div className={`shrink-0 text-center px-3 py-2 rounded-lg min-w-[56px] ${
+                            isFull
+                              ? 'bg-gray-200 text-gray-500'
+                              : seatsLeft === 0
+                              ? 'bg-gray-100 text-gray-400'
+                              : 'bg-white shadow-sm border border-emerald-100 text-emerald-700'
+                          }`}>
                             <div className="text-xl font-black leading-none">{seatsLeft}</div>
                             <div className="text-[9px] font-bold uppercase mt-0.5">
                               {isFull ? 'Full' : 'Left'}
@@ -1040,11 +915,7 @@ export default function PublicTracking() {
                             </div>
                           </div>
 
-                          <span
-                            className={`shrink-0 text-xs font-bold px-2 py-1 rounded border ${
-                              STATUS_CONFIG[trip.status]?.cls ?? STATUS_CONFIG.DEPARTED.cls
-                            }`}
-                          >
+                          <span className={`shrink-0 text-xs font-bold px-2 py-1 rounded border ${STATUS_CONFIG[trip.status]?.cls ?? STATUS_CONFIG.DEPARTED.cls}`}>
                             {STATUS_CONFIG[trip.status]?.label ?? trip.status}
                           </span>
                         </div>
@@ -1062,7 +933,7 @@ export default function PublicTracking() {
                               )}
                             </span>
                             {data?.lastSeen && (
-                              <span className="text-[10px] text-blue-400 font-normal" key={tick}>
+                              <span key={tick} className="text-[10px] text-blue-400 font-normal">
                                 {relativeTime(data.lastSeen)}
                               </span>
                             )}
@@ -1078,9 +949,7 @@ export default function PublicTracking() {
                           </div>
                         ) : (
                           <div className="text-xs flex items-center gap-1.5 bg-yellow-50 text-yellow-700 px-3 py-2 rounded-lg font-semibold">
-                            <span className="animate-spin inline-block" aria-hidden="true">
-                              ⏳
-                            </span>
+                            <span className="animate-spin inline-block" aria-hidden="true">⏳</span>
                             Establishing GPS link…
                           </div>
                         )}
@@ -1144,7 +1013,7 @@ export default function PublicTracking() {
                       <>
                         <p>
                           <span className="font-semibold text-gray-900">Current speed:</span>{' '}
-                          {speedLabel(selectedTripLive.smoothedSpeed)}
+                          {speedLabel(selectedTripLive?.smoothedSpeed)}
                         </p>
                         {typeof selectedTripLive?.accuracy === 'number' && (
                           <p>
@@ -1156,8 +1025,7 @@ export default function PublicTracking() {
                           </p>
                         )}
                         <p className="text-xs text-gray-400">
-                          Last fix {relativeTime(selectedTripLive?.lastSeen) ?? 'just now'} · direct from
-                          driver's phone
+                          Last fix {relativeTime(selectedTripLive?.lastSeen) ?? 'just now'} · direct from driver's phone
                         </p>
                       </>
                     ) : (
@@ -1169,8 +1037,7 @@ export default function PublicTracking() {
                     {selectedTripLive?.availableSeats !== undefined && (
                       <p>
                         <span className="font-semibold text-gray-900">Seats:</span>{' '}
-                        {selectedTripLive.availableSeats}/
-                        {selectedTripLive.totalSeats ?? selectedTrip.van?.capacity ?? '?'} available
+                        {selectedTripLive.availableSeats}/{selectedTripLive.totalSeats ?? selectedTrip.van?.capacity ?? '?'} available
                       </p>
                     )}
                   </div>
@@ -1179,10 +1046,7 @@ export default function PublicTracking() {
                     <div className="pt-2 border-t border-gray-100 space-y-1">
                       <p className="text-xs font-bold text-indigo-700">
                         🕒 ETA {HOME_TERMINAL_SHORT}:{' '}
-                        {new Date(selectedTripEta.eta).toLocaleTimeString([], {
-                          hour: '2-digit',
-                          minute: '2-digit',
-                        })}
+                        {new Date(selectedTripEta.eta).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                       </p>
                       <p className="text-xs text-indigo-500">
                         <ETACountdown etaIso={selectedTripEta.eta} />
@@ -1212,8 +1076,7 @@ export default function PublicTracking() {
                       Road route loaded
                       {selectedRoute.distanceMeters != null && selectedRoute.durationSeconds != null && (
                         <>
-                          {' '}
-                          · {Math.round(selectedRoute.distanceMeters / 1000)} km ·{' '}
+                          {' '}· {Math.round(selectedRoute.distanceMeters / 1000)} km ·{' '}
                           {formatDuration(selectedRoute.durationSeconds)}
                         </>
                       )}
