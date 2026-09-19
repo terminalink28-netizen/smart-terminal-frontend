@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { QRCodeSVG } from 'qrcode.react';
 import { MapContainer, TileLayer, Marker, Popup } from 'react-leaflet';
 import L from 'leaflet';
@@ -147,6 +147,18 @@ const hubIcon = L.divIcon({
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
+/** Reads the current user id from localStorage (set at login). */
+function getStoredUserId() {
+  try {
+    const raw = localStorage.getItem('user');
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return parsed?.id ?? parsed?.userId ?? null;
+  } catch {
+    return null;
+  }
+}
+
 function geolocationErrorMessage(err) {
   if (!err) return 'GPS error. Please try again.';
   switch (err.code) {
@@ -275,10 +287,10 @@ function TripManifest({ trip, eta, delayMinutes }) {
       </div>
       <dl className="grid grid-cols-2 gap-y-3 text-sm">
         {fields.map(({ label, value }) => (
-          <>
-            <dt key={`dt-${label}`} className="text-slate-500">{label}</dt>
-            <dd key={`dd-${label}`} className="font-semibold text-slate-900">{value}</dd>
-          </>
+          <Fragment key={label}>
+            <dt className="text-slate-500">{label}</dt>
+            <dd className="font-semibold text-slate-900">{value}</dd>
+          </Fragment>
         ))}
       </dl>
     </section>
@@ -318,9 +330,6 @@ function BoardingPanel({ seatCounts, onDecrTotal, onIncrTotal, onDecrAvail, onIn
 }
 
 // ── FleetMap ───────────────────────────────────────────────────────────────
-// Shows a van only once its real GPS fix has arrived — no municipality or
-// terminal-coordinate fallback. A boarding van that hasn't tapped "Share
-// live location" yet just doesn't appear until it does.
 
 function FleetMap({ fleetTrips, fleetLiveData, ownTripId }) {
   const now = Date.now();
@@ -390,7 +399,25 @@ function FleetMap({ fleetTrips, fleetLiveData, ownTripId }) {
   );
 }
 
-function LiveTrackingCard({ trip, gpsState, gpsError, lastCoords, maxSpeedKmh, onStart, onStop }) {
+/**
+ * LiveTrackingCard — now auto-aware.
+ *
+ * When the backend pushes `start_tracking` (which happens automatically the
+ * moment the trip enters BOARDING), the parent calls startLocationSharing()
+ * directly. This card just reflects whatever state we're in. The manual
+ * "Share live location" button remains as an explicit fallback in case the
+ * auto-start didn't fire (e.g. socket was offline at the moment of boarding).
+ */
+function LiveTrackingCard({
+  trip,
+  gpsState,
+  gpsError,
+  lastCoords,
+  maxSpeedKmh,
+  autoArmed,
+  onStart,
+  onStop,
+}) {
   const isLocked = !trip || GPS_LOCKED_STATUSES.includes(trip.status);
 
   if (isLocked) {
@@ -420,7 +447,9 @@ function LiveTrackingCard({ trip, gpsState, gpsError, lastCoords, maxSpeedKmh, o
       <section className="bg-gradient-to-br from-blue-600 to-indigo-700 rounded-2xl p-6 text-white shadow-lg" aria-label="Live speed tracking">
         <div className="flex items-center justify-center gap-2 mb-1">
           <span className="w-2.5 h-2.5 bg-green-400 rounded-full animate-pulse" aria-hidden="true" />
-          <span className="text-xs font-bold uppercase tracking-widest text-blue-100">Live tracking active</span>
+          <span className="text-xs font-bold uppercase tracking-widest text-blue-100">
+            Live tracking active · auto-shared
+          </span>
         </div>
 
         <div className="text-center my-4">
@@ -460,8 +489,22 @@ function LiveTrackingCard({ trip, gpsState, gpsError, lastCoords, maxSpeedKmh, o
   return (
     <section className="bg-white border-2 border-dashed border-blue-200 rounded-xl p-5 text-center">
       <p className="text-3xl mb-2" aria-hidden="true">📍</p>
-      <p className="text-sm font-bold text-gray-800 mb-1">Share your live location</p>
-      <p className="text-xs text-gray-500 mb-4">Passengers and dispatch will see your position and speed in real time — just like a delivery tracker.</p>
+      {autoArmed ? (
+        <>
+          <p className="text-sm font-bold text-gray-800 mb-1">Waiting for boarding…</p>
+          <p className="text-xs text-gray-500 mb-4">
+            Your location will start sharing automatically the moment your trip
+            enters boarding. You don't need to do anything.
+          </p>
+        </>
+      ) : (
+        <>
+          <p className="text-sm font-bold text-gray-800 mb-1">Share your live location</p>
+          <p className="text-xs text-gray-500 mb-4">
+            Passengers and dispatch will see your position and speed in real time.
+          </p>
+        </>
+      )}
       {gpsError && (
         <div role="alert" className="flex items-start gap-2 text-sm text-red-700 bg-red-50 border border-red-200 p-3 rounded-xl mb-4 text-left">
           <span className="text-base leading-none mt-0.5" aria-hidden="true">⚠️</span>
@@ -470,8 +513,11 @@ function LiveTrackingCard({ trip, gpsState, gpsError, lastCoords, maxSpeedKmh, o
       )}
       <button onClick={onStart} aria-label="Share live GPS location"
         className="w-full bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white font-bold text-base py-4 px-4 rounded-xl shadow-lg border-b-4 border-blue-800 transition-colors active:border-b-0 active:translate-y-0.5">
-        📍 Share live location
+        📍 Start sharing now
       </button>
+      <p className="text-[11px] text-gray-400 mt-2">
+        Auto-start will kick in when the trip moves to boarding.
+      </p>
     </section>
   );
 }
@@ -747,6 +793,10 @@ export default function DriverDashboard() {
   const [delayMinutes, setDelayMinutes]   = useState(0);
   const [statusUpdating, setStatusUpdating] = useState(false);
 
+  // Set when the backend tells us to auto-start tracking (fires when the
+  // trip enters BOARDING). Cleared once we've actually started the watch.
+  const [pendingAutoStart, setPendingAutoStart] = useState(null);
+
   // ── Fleet map state — mirrors PublicTracking.jsx's data model exactly ────
   const [fleetTrips, setFleetTrips]       = useState([]);
   const [fleetLiveData, setFleetLiveData] = useState({});
@@ -755,6 +805,7 @@ export default function DriverDashboard() {
   const watchIdRef    = useRef(null);
   const tripIdRef     = useRef(null);
   const lastFixRef    = useRef(null);
+  const userIdRef     = useRef(getStoredUserId());
 
   const routeDurationMinutes = useMemo(() => {
     if (!trip?.route?.name) return DEFAULT_ROUTE_DURATION;
@@ -793,12 +844,34 @@ export default function DriverDashboard() {
   }, []);
 
   // Fetches the same public live-trips list PublicTracking.jsx uses, so the
-  // fleet map has plate numbers and driver names to show for every van, not
-  // just raw GPS dots.
+  // fleet map has plate numbers and driver names to show for every van, and
+  // seeds fleetLiveData from `liveLocation` so markers appear on first paint
+  // without waiting for a socket event.
   const fetchFleetTrips = useCallback(async (signal) => {
     try {
       const response = await apiClient.get('/trips/live', { signal });
-      setFleetTrips(Array.isArray(response.data) ? response.data : []);
+      const trips = Array.isArray(response.data) ? response.data : [];
+      setFleetTrips(trips);
+
+      setFleetLiveData((prev) => {
+        const next = { ...prev };
+        for (const t of trips) {
+          const loc = t.liveLocation;
+          if (!loc || typeof loc.lat !== 'number' || typeof loc.lng !== 'number') continue;
+          const newLastSeen = typeof loc.timestamp === 'number' ? loc.timestamp : Date.now();
+          const existing = next[t.id];
+          if (!existing || newLastSeen > (existing.lastSeen ?? 0)) {
+            next[t.id] = {
+              lat: loc.lat,
+              lng: loc.lng,
+              speed: typeof loc.speed === 'number' ? loc.speed : null,
+              accuracy: typeof loc.accuracy === 'number' ? loc.accuracy : null,
+              lastSeen: newLastSeen,
+            };
+          }
+        }
+        return next;
+      });
     } catch (err) {
       if (err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') return;
       console.error('[DriverDashboard] fetchFleetTrips error:', err);
@@ -866,14 +939,15 @@ export default function DriverDashboard() {
 
         lastFixRef.current = { lat, lng, timestamp };
 
-        socket.emit('driver_gps_update', {
+        // The event name the backend socket layer listens for. Payload shape
+        // matches what PublicTracking.jsx renders on the public map.
+        socket.emit('driver_location', {
           tripId: tripIdRef.current,
           lat,
           lng,
           speed: resolvedSpeed,
           accuracy: typeof accuracy === 'number' ? accuracy : null,
           heading: typeof position.coords.heading === 'number' ? position.coords.heading : null,
-          timestamp,
         });
 
         setLastCoords({ lat, lng, accuracy, speed: resolvedSpeed });
@@ -998,16 +1072,25 @@ export default function DriverDashboard() {
     return () => { controller.abort(); clearInterval(id); };
   }, [fetchFleetTrips]);
 
-  // Socket wiring for the fleet map — uses the SAME event names the backend
-  // actually emits (confirmed against PublicTracking.jsx): 'initial_locations'
-  // (array snapshot keyed by tripId) and 'van_moved' (per-trip updates), plus
-  // 'trip_status_changed' / 'trip_dispatched' to keep the trip list current.
+  // ── Socket wiring ────────────────────────────────────────────────────────
+  // On connect we:
+  //   1. subscribe to the public map (so the fleet map receives van_moved),
+  //   2. register as a driver so the backend can target us with
+  //      start_tracking / stop_tracking (auto GPS control).
   useEffect(() => {
-    socket.connect();
-    socket.emit('subscribe_to_map');
+    const emitRegistration = () => {
+      socket.emit('subscribe_to_map');
+      const uid = userIdRef.current ?? getStoredUserId();
+      if (uid) {
+        userIdRef.current = uid;
+        socket.emit('register_driver', { userId: uid });
+      }
+    };
 
-    const handleConnect = () => socket.emit('subscribe_to_map');
-    socket.on('connect', handleConnect);
+    socket.connect();
+    emitRegistration();
+
+    socket.on('connect', emitRegistration);
 
     const onInitialLocations = (payload = []) => {
       if (!Array.isArray(payload)) return;
@@ -1071,14 +1154,51 @@ export default function DriverDashboard() {
     };
     socket.on('trip_status_changed', onFleetTripStatusChanged);
 
+    // ── Auto GPS control ──────────────────────────────────────────────────
+    // The backend fires `start_tracking` the instant our trip enters
+    // BOARDING (self-start, dispatcher create, or status change). We queue
+    // a pending auto-start, and an effect below flips the actual watch on
+    // once our trip is loaded and matches.
+    const onStartTracking = ({ tripId } = {}) => {
+      if (!tripId) return;
+      console.log('[DriverDashboard] start_tracking received for trip', tripId);
+      setPendingAutoStart(tripId);
+    };
+    socket.on('start_tracking', onStartTracking);
+
+    const onStopTracking = ({ tripId } = {}) => {
+      // If the payload doesn't specify a trip, stop whatever we're running.
+      if (tripId && tripIdRef.current && tripId !== tripIdRef.current) return;
+      console.log('[DriverDashboard] stop_tracking received');
+      setPendingAutoStart(null);
+      stopLocationSharing();
+    };
+    socket.on('stop_tracking', onStopTracking);
+
     return () => {
-      socket.off('connect', handleConnect);
+      socket.off('connect', emitRegistration);
       socket.off('initial_locations', onInitialLocations);
       socket.off('van_moved', onVanMoved);
       socket.off('trip_dispatched', onFleetTripDispatched);
       socket.off('trip_status_changed', onFleetTripStatusChanged);
+      socket.off('start_tracking', onStartTracking);
+      socket.off('stop_tracking', onStopTracking);
     };
-  }, []);
+  }, [stopLocationSharing]);
+
+  // Once our trip is loaded and its id matches the pending auto-start, turn
+  // on GPS. This handles the race where start_tracking arrives before
+  // fetchMyTrip has finished.
+  useEffect(() => {
+    if (!pendingAutoStart) return;
+    if (trip?.id !== pendingAutoStart) return;
+    if (gpsState === GPS_STATE.LIVE || gpsState === GPS_STATE.ACQUIRING) {
+      setPendingAutoStart(null);
+      return;
+    }
+    setPendingAutoStart(null);
+    startLocationSharing();
+  }, [pendingAutoStart, trip?.id, gpsState, startLocationSharing]);
 
   useEffect(() => {
     const tripId     = trip?.id;
@@ -1107,7 +1227,7 @@ export default function DriverDashboard() {
     if (gpsState !== GPS_STATE.LIVE) return;
     const handleDisconnect = (reason) => {
       if (reason === 'io server disconnect') {
-        setGpsError('Disconnected by server. Tap "Share live location" to reconnect.');
+        setGpsError('Disconnected by server. Tap "Start sharing now" to reconnect.');
         setGpsState(GPS_STATE.ERROR);
         clearWatch();
       } else {
@@ -1175,6 +1295,13 @@ export default function DriverDashboard() {
     );
   }
 
+  // Auto-start is "armed" when we have a BOARDING trip and haven't started
+  // sharing yet — that's when the backend will push start_tracking.
+  const autoArmed =
+    trip?.status === 'BOARDING' &&
+    gpsState !== GPS_STATE.LIVE &&
+    gpsState !== GPS_STATE.ACQUIRING;
+
   return (
     <div className="min-h-screen bg-gray-100 p-4 font-sans flex flex-col">
       <div className="max-w-md w-full mx-auto bg-white rounded-2xl shadow-md overflow-hidden p-6 flex-1 flex flex-col gap-5">
@@ -1236,6 +1363,7 @@ export default function DriverDashboard() {
                 gpsError={gpsError}
                 lastCoords={lastCoords}
                 maxSpeedKmh={maxSpeedKmh}
+                autoArmed={autoArmed}
                 onStart={startLocationSharing}
                 onStop={stopLocationSharing}
               />
