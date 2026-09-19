@@ -11,6 +11,12 @@ const REFETCH_INTERVAL_MS = 30_000;
 const GPS_STALE_THRESHOLD_MS = 120_000;
 const OSRM_BASE_URL = 'https://router.project-osrm.org/route/v1/driving';
 
+// The official name of the home terminal. Used for exact-match comparisons
+// (route direction, fallback coordinates) — NOT a substring check, since
+// this name doesn't contain any single word safe to match loosely.
+const HOME_TERMINAL_NAME = 'Provincial Integrated Transport Terminal and Business Complex';
+const HOME_TERMINAL_SHORT = 'Terminal';
+
 const BOARDING_STATUSES = ['BOARDING'];
 const DRIVING_STATUSES = ['DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'];
 const MAP_VISIBLE_STATUSES = [...BOARDING_STATUSES, ...DRIVING_STATUSES];
@@ -30,6 +36,19 @@ const STATUS_CONFIG = {
   DELAYED: { label: 'Delayed', cls: 'bg-orange-100 text-orange-800 border-orange-200' },
 };
 
+// ── Per-status marker styling ───────────────────────────────────────────
+// Each trip status gets its own icon glyph + color, so a glance at the map
+// tells you whether a van is boarding, departing, en route, arriving, or
+// delayed — without needing to open the popup.
+const STATUS_MARKER_STYLE = {
+  BOARDING:  { glyph: '🧍', color: '#16a34a' }, // green  — loading passengers
+  DEPARTING: { glyph: '🚦', color: '#d97706' }, // amber  — about to pull out
+  DEPARTED:  { glyph: '🚐', color: '#2563eb' }, // blue   — en route
+  ARRIVING:  { glyph: '📍', color: '#059669' }, // emerald — approaching terminal
+  DELAYED:   { glyph: '⏱️', color: '#ea580c' }, // orange — delayed
+};
+const DEFAULT_MARKER_STYLE = { glyph: '🚐', color: '#6b7280' };
+
 function msToKmh(mps) {
   if (typeof mps !== 'number' || Number.isNaN(mps)) return null;
   return Math.round(mps * 3.6);
@@ -45,12 +64,19 @@ function relativeTime(ts) {
   return 'over an hour ago';
 }
 
+// The home terminal's name is intentionally excluded from the generic
+// "strip trailing Terminal" rule below — it gets its own short label
+// (HOME_TERMINAL_SHORT) since the full name is too long for inline UI.
 function shortPlaceName(name) {
+  if (isHomeTerminal(name)) return HOME_TERMINAL_SHORT;
   return (name ?? 'Unknown').replace(/\s*Terminal$/i, '');
 }
 
-function isViracHub(name) {
-  return typeof name === 'string' && name.toLowerCase().includes('virac');
+// Exact match (case-insensitive, trimmed) against the official terminal
+// name — replaces the old substring check, which relied on the name
+// containing "virac" and silently breaks against any other naming.
+function isHomeTerminal(name) {
+  return typeof name === 'string' && name.trim().toLowerCase() === HOME_TERMINAL_NAME.toLowerCase();
 }
 
 function formatScheduledTime(iso) {
@@ -84,27 +110,41 @@ function speedLabel(smoothedSpeedMps) {
   return `${kmh} km/h`;
 }
 
-const vanIcon = L.divIcon({
-  className: '',
-  html: `
-    <div style="
-      font-size:18px;
-      background:white;
-      border-radius:50%;
-      padding:4px;
-      border:3px solid #16a34a;
-      width:36px;
-      height:36px;
-      display:flex;
-      align-items:center;
-      justify-content:center;
-      box-shadow:0 4px 12px rgba(22,163,74,0.35);
-    ">🚐</div>
-  `,
-  iconSize: [36, 36],
-  iconAnchor: [18, 18],
-  popupAnchor: [0, -22],
-});
+// Cached per status so Leaflet isn't asked to rebuild an identical divIcon
+// on every render — there are only 5 possible statuses, so this cache
+// never grows past 5 entries.
+const statusIconCache = new Map();
+
+function getVanIconForStatus(status) {
+  if (statusIconCache.has(status)) return statusIconCache.get(status);
+
+  const { glyph, color } = STATUS_MARKER_STYLE[status] ?? DEFAULT_MARKER_STYLE;
+
+  const icon = L.divIcon({
+    className: '',
+    html: `
+      <div style="
+        font-size:18px;
+        background:white;
+        border-radius:50%;
+        padding:4px;
+        border:3px solid ${color};
+        width:36px;
+        height:36px;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        box-shadow:0 4px 12px ${color}59;
+      ">${glyph}</div>
+    `,
+    iconSize: [36, 36],
+    iconAnchor: [18, 18],
+    popupAnchor: [0, -22],
+  });
+
+  statusIconCache.set(status, icon);
+  return icon;
+}
 
 const hubIcon = L.divIcon({
   className: '',
@@ -421,7 +461,7 @@ export default function PublicTracking() {
         if (trip.status === 'BOARDING') {
           const originName = trip.route?.origin;
           return getCoordinatesForDestination(originName) ?? 
-                 (isViracHub(originName) ? VIRAC_HUB : null);
+                 (isHomeTerminal(originName) ? VIRAC_HUB : null);
         }
         return null;
       })
@@ -468,7 +508,7 @@ export default function PublicTracking() {
 
     const plannedStart =
       getCoordinatesForDestination(selectedTrip.route?.origin) ??
-      (isViracHub(selectedTrip.route?.origin) ? VIRAC_HUB : null) ??
+      (isHomeTerminal(selectedTrip.route?.origin) ? VIRAC_HUB : null) ??
       VIRAC_HUB;
 
     const startCoords = liveStart ?? plannedStart;
@@ -644,8 +684,8 @@ export default function PublicTracking() {
 
             <Marker position={VIRAC_HUB} icon={hubIcon}>
               <Popup>
-                <div className="min-w-[160px] space-y-1">
-                  <p className="font-bold text-gray-800 text-sm">Virac Central Terminal</p>
+                <div className="min-w-[180px] space-y-1">
+                  <p className="font-bold text-gray-800 text-sm leading-snug">{HOME_TERMINAL_NAME}</p>
                   <p className="text-xs text-gray-500">
                     {boardingTrips.length} boarding · {drivingTrips.length} on road
                   </p>
@@ -664,7 +704,7 @@ export default function PublicTracking() {
               } else if (trip.status === 'BOARDING') {
                 const originName = trip.route?.origin;
                 position = getCoordinatesForDestination(originName) ?? 
-                           (isViracHub(originName) ? VIRAC_HUB : null);
+                           (isHomeTerminal(originName) ? VIRAC_HUB : null);
               }
 
               if (!position) return null;
@@ -690,7 +730,7 @@ export default function PublicTracking() {
                   )}
                   <Marker
                     position={position}
-                    icon={vanIcon}
+                    icon={getVanIconForStatus(trip.status)}
                     eventHandlers={{
                       click: () => setSelectedTripId(trip.id),
                     }}
@@ -978,8 +1018,8 @@ export default function PublicTracking() {
                       <span className="font-semibold text-gray-900">Direction:</span>{' '}
                       {selectedTrip.status === 'BOARDING'
                         ? 'Loading at terminal'
-                        : isViracHub(selectedTrip.route?.destination)
-                        ? 'Returning to Virac'
+                        : isHomeTerminal(selectedTrip.route?.destination)
+                        ? 'Returning to Terminal'
                         : 'Heading out'}
                     </p>
                     {typeof selectedTripLive?.lat === 'number' && typeof selectedTripLive?.lng === 'number' && (
@@ -1010,7 +1050,7 @@ export default function PublicTracking() {
                   {selectedTripEta && (
                     <div className="pt-2 border-t border-gray-100 space-y-1">
                       <p className="text-xs font-bold text-indigo-700">
-                        🕒 ETA Virac:{' '}
+                        🕒 ETA {HOME_TERMINAL_SHORT}:{' '}
                         {new Date(selectedTripEta.eta).toLocaleTimeString([], {
                           hour: '2-digit',
                           minute: '2-digit',
@@ -1052,9 +1092,9 @@ export default function PublicTracking() {
                     </div>
                   )}
 
-                  {formatScheduledTime(selectedTrip.scheduledAt) && (
+                  {formatScheduledTime(selectedTrip.scheduledTime) && (
                     <div className="text-xs text-gray-500">
-                      Scheduled departure: {formatScheduledTime(selectedTrip.scheduledAt)}
+                      Scheduled departure: {formatScheduledTime(selectedTrip.scheduledTime)}
                     </div>
                   )}
                 </div>
