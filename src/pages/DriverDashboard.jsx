@@ -318,11 +318,9 @@ function BoardingPanel({ seatCounts, onDecrTotal, onIncrTotal, onDecrAvail, onIn
 }
 
 // ── FleetMap ───────────────────────────────────────────────────────────────
-// Combines the public /trips/live list (for plate/driver names) with the
-// same socket events PublicTracking.jsx listens to (initial_locations,
-// van_moved) so positions update live. Previously this component listened
-// for events the backend never emits — that was the actual reason vans
-// never showed up here.
+// Shows a van only once its real GPS fix has arrived — no municipality or
+// terminal-coordinate fallback. A boarding van that hasn't tapped "Share
+// live location" yet just doesn't appear until it does.
 
 function FleetMap({ fleetTrips, fleetLiveData, ownTripId }) {
   const now = Date.now();
@@ -334,19 +332,11 @@ function FleetMap({ fleetTrips, fleetLiveData, ownTripId }) {
       const hasGps = typeof live?.lat === 'number' && typeof live?.lng === 'number';
       const isStale = hasGps && live?.lastSeen && now - live.lastSeen > FLEET_GPS_STALE_THRESHOLD_MS;
 
-      let position = null;
-      if (hasGps && !isStale) {
-        position = [live.lat, live.lng];
-      } else if (trip.status === 'BOARDING') {
-        const originName = trip.route?.origin;
-        position = getCoordinatesForDestination(originName) ?? (isHomeTerminal(originName) ? VIRAC_HUB : null);
-      }
-
-      if (!position) return null;
+      if (!hasGps || isStale) return null;
 
       return {
         tripId: trip.id,
-        position,
+        position: [live.lat, live.lng],
         status: trip.status,
         plateNumber: trip.van?.plateNumber,
         driverName: trip.driver?.name,
@@ -393,7 +383,7 @@ function FleetMap({ fleetTrips, fleetLiveData, ownTripId }) {
       </div>
       {markers.length === 0 && (
         <p className="text-xs text-gray-400 text-center py-2 bg-gray-50 border-t border-gray-100">
-          No vans currently active.
+          No vans currently broadcasting live GPS.
         </p>
       )}
     </section>
