@@ -10,7 +10,6 @@ const EMPTY_DATA = {
 };
 
 const EMPTY_STAFF_FORM = { name: '', email: '', role: '', password: '' };
-const EMPTY_VAN_FORM   = { plateNumber: '', capacity: '', status: 'IDLE' };
 
 const VAN_STATUSES = ['IDLE', 'DISPATCHED', 'MAINTENANCE', 'OUT_OF_SERVICE'];
 
@@ -20,7 +19,6 @@ const AUDIT_MAX_STORED  = 5000;
 const AUDIT_PAGE_SIZE   = 50;
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const PLATE_RE = /^[A-Z0-9\- ]{4,15}$/i;
 
 const PASSWORD_MIN = 4;
 
@@ -145,7 +143,6 @@ export default function AdminDashboard() {
   const [mutationError, setMutationError]     = useState('');
   const [togglingId, setTogglingId]           = useState(null);
 
-  const [isVanModalOpen, setIsVanModalOpen] = useState(false);
   const [vanMutationLoading, setVanMutationLoading] = useState(false);
   const [vanMutationError, setVanMutationError]     = useState('');
 
@@ -316,9 +313,6 @@ export default function AdminDashboard() {
   const openAddStaffModal = useCallback(() => { setMutationError(''); setIsStaffModalOpen(true); }, []);
   const closeStaffModal = useCallback(() => { if (mutationLoading) return; setMutationError(''); setIsStaffModalOpen(false); }, [mutationLoading]);
 
-  const openAddVanModal = useCallback(() => { setVanMutationError(''); setIsVanModalOpen(true); }, []);
-  const closeVanModal = useCallback(() => { if (vanMutationLoading) return; setVanMutationError(''); setIsVanModalOpen(false); }, [vanMutationLoading]);
-
   const openDeleteUserModal = useCallback((user) => {
     setMutationError('');
     setPendingDelete({ kind: 'user', id: user.id, label: user.name ?? 'this user', sublabel: user.email || user.driverId || '', role: user.role });
@@ -348,25 +342,6 @@ export default function AdminDashboard() {
       setMutationError(describeApiError(err, 'Failed to save this account. Please check the details and try again.'));
     } finally {
       setMutationLoading(false);
-    }
-  }, [showToast]);
-
-  const handleSubmitVan = useCallback(async (formData) => {
-    setVanMutationLoading(true);
-    setVanMutationError('');
-    try {
-      const { data: res } = await apiClient.post('/admin/vans', formData);
-      showToast('success', `${formData.plateNumber} has been registered.`);
-      setIsVanModalOpen(false);
-      // Show the new van's QR right away so the admin can print the sticker.
-      setViewingQrVan(res);
-      setReloadToken((n) => n + 1);
-    } catch (err) {
-      if (handleAuthFailure(err)) return;
-      console.error('Failed to save van:', err);
-      setVanMutationError(describeApiError(err, 'Failed to save this van. Please check the details and try again.'));
-    } finally {
-      setVanMutationLoading(false);
     }
   }, [showToast]);
 
@@ -460,8 +435,6 @@ export default function AdminDashboard() {
     }
   }, [rejectTarget, rejectReason, showToast]);
 
-  // Pending drivers already have their own section above — keep them out of
-  // the main staff table so nobody appears twice.
   const staffTableData = useMemo(
     () => data.staff.filter((u) => !(u.role === 'DRIVER' && u.approvalStatus === 'PENDING')),
     [data.staff],
@@ -564,8 +537,6 @@ export default function AdminDashboard() {
     return counts;
   }, [data.vans]);
 
-  // `data.staff` already includes every driver (pending/approved/rejected),
-  // so this reads straight off it — no separate addition needed.
   const driverApprovalBreakdown = useMemo(() => {
     const counts = { APPROVED: 0, PENDING: 0, REJECTED: 0 };
     data.staff.forEach((u) => {
@@ -711,6 +682,7 @@ export default function AdminDashboard() {
                       <div className="font-bold text-gray-800">{driver.name}</div>
                       <div className="text-xs text-gray-400 mt-0.5 flex flex-wrap gap-x-3">
                         <span>ID: {driver.driverId}</span>
+                        <span>Van: {driver.assignedVan?.plateNumber ?? '—'}</span>
                         <span>📞 {driver.contactNumber || '—'}</span>
                         <span>Applied {formatAuditTimestamp(driver.createdAt)}</span>
                       </div>
@@ -740,20 +712,17 @@ export default function AdminDashboard() {
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-6">
-          {/* ── Vans card ─────────────────────────────────────────────── */}
+          {/* ── Vans card — view/delete only, registration happens via driver signup ─ */}
           <div className="bg-white p-3 sm:p-4 rounded-xl shadow-sm border border-gray-200">
             <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2 sm:gap-3 mb-3 border-b pb-3">
               <h2 className="text-base sm:text-lg font-bold text-gray-800 flex items-center gap-2">
                 Registered Vans
                 <span className="text-xs font-bold bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full">{data.vans.length}</span>
               </h2>
-              <button
-                onClick={openAddVanModal}
-                className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-1.5 rounded-lg transition shadow-sm whitespace-nowrap self-stretch sm:self-auto"
-              >
-                ＋ Add Van
-              </button>
             </div>
+            <p className="text-xs text-blue-600 font-medium mb-3">
+              Vans are registered by drivers themselves during sign-up — this list is view-only.
+            </p>
 
             {data.vans.length > 0 && (
               <div className="mb-3">
@@ -782,7 +751,7 @@ export default function AdminDashboard() {
                       colSpan={4}
                       message={
                         data.vans.length === 0
-                          ? 'No vans yet. Tap "Add Van" to register the first one.'
+                          ? 'No vans registered yet.'
                           : 'No vans match your search.'
                       }
                     />
@@ -907,7 +876,6 @@ export default function AdminDashboard() {
         onClearHistory={handleClearAuditHistory} onExportCsv={handleExportAuditCsv}
       />
       <StaffFormModal isOpen={isStaffModalOpen} onClose={closeStaffModal} onSubmit={handleSubmitStaff} isLoading={mutationLoading} serverError={mutationError} onClearError={() => setMutationError('')} />
-      <VanFormModal isOpen={isVanModalOpen} onClose={closeVanModal} onSubmit={handleSubmitVan} isLoading={vanMutationLoading} serverError={vanMutationError} onClearError={() => setVanMutationError('')} />
       <QrOnlyModal van={viewingQrVan} onClose={() => setViewingQrVan(null)} />
       <ConfirmDeleteModal target={pendingDelete} onClose={closeDeleteModal} onConfirm={handleConfirmDelete} isLoading={anyMutationBusy} serverError={pendingDelete?.kind === 'van' ? vanMutationError : mutationError} />
       <LicensePhotoModal driver={licensePhotoView} onClose={() => setLicensePhotoView(null)} />
@@ -1023,7 +991,7 @@ function StaffFormModal({ isOpen, onClose, onSubmit, isLoading, serverError, onC
               <option value="ADMIN">Admin</option>
               <option value="DISPATCHER">Dispatcher</option>
             </select>
-            <p className="text-xs text-blue-600 mt-1.5 font-medium">Drivers register themselves and are approved from the Pending Driver Applications list above — they aren't created here.</p>
+            <p className="text-xs text-blue-600 mt-1.5 font-medium">Drivers register themselves (and their van) and are approved from the Pending Driver Applications list above — they aren't created here.</p>
           </Field>
 
           <Field label="Email Address" required error={errors.email}>
@@ -1054,114 +1022,6 @@ function StaffFormModal({ isOpen, onClose, onSubmit, isLoading, serverError, onC
           <button onClick={onClose} disabled={isLoading} className="flex-1 py-2.5 sm:py-2 border border-gray-300 rounded-lg text-sm font-semibold text-gray-700 hover:bg-gray-100 transition disabled:opacity-40">Cancel</button>
           <button onClick={submit} disabled={isLoading} className="flex-1 py-2.5 sm:py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-bold transition disabled:opacity-70 disabled:cursor-not-allowed">
             {isLoading ? 'Creating…' : 'Create Account'}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ─── VanFormModal (Add only) ───────────────────────────────────────────────
-
-function VanFormModal({ isOpen, onClose, onSubmit, isLoading, serverError, onClearError }) {
-  const [form, setForm]     = useState(EMPTY_VAN_FORM);
-  const [errors, setErrors] = useState({});
-  const plateRef             = useRef(null);
-
-  useEffect(() => {
-    if (isOpen) {
-      setForm(EMPTY_VAN_FORM);
-      setErrors({});
-      onClearError();
-      const id = setTimeout(() => plateRef.current?.focus(), 60);
-      return () => clearTimeout(id);
-    }
-  }, [isOpen, onClearError]);
-
-  useEffect(() => {
-    if (!isOpen) return;
-    const fn = (e) => { if (e.key === 'Escape' && !isLoading) onClose(); };
-    document.addEventListener('keydown', fn);
-    return () => document.removeEventListener('keydown', fn);
-  }, [isOpen, isLoading, onClose]);
-
-  const change = (e) => {
-    const { name, value } = e.target;
-    setForm((p) => ({ ...p, [name]: value }));
-    setErrors((p) => ({ ...p, [name]: '' }));
-    if (serverError) onClearError();
-  };
-
-  const validate = () => {
-    const e   = {};
-    const plt = form.plateNumber.trim();
-    const cap = Number(form.capacity);
-
-    if (!plt) e.plateNumber = 'Plate number is required.';
-    else if (!PLATE_RE.test(plt)) e.plateNumber = 'Use letters, numbers, spaces, or dashes only (4–15 chars).';
-
-    if (!form.capacity) e.capacity = 'Capacity is required.';
-    else if (!Number.isInteger(cap) || cap < 1 || cap > 30) e.capacity = 'Enter a whole number between 1 and 30.';
-
-    if (!form.status) e.status = 'Status is required.';
-
-    return e;
-  };
-
-  const submit = () => {
-    const e = validate();
-    if (Object.keys(e).length > 0) { setErrors(e); return; }
-
-    onSubmit({
-      plateNumber: form.plateNumber.trim().toUpperCase(),
-      capacity: Number(form.capacity),
-      status: form.status,
-    });
-  };
-
-  if (!isOpen) return null;
-
-  return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="van-modal-title"
-      className="fixed inset-0 bg-black/50 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4"
-      onClick={(e) => { if (e.target === e.currentTarget && !isLoading) onClose(); }}
-    >
-      <div className="bg-white rounded-t-2xl sm:rounded-2xl shadow-2xl w-full max-w-md max-h-[95vh] sm:max-h-[90vh] flex flex-col">
-        <div className="flex justify-between items-center p-4 sm:p-5 border-b bg-slate-50">
-          <h2 id="van-modal-title" className="text-base sm:text-lg font-black text-gray-900">Add Van</h2>
-          <button onClick={onClose} disabled={isLoading} aria-label="Close" className="text-gray-400 hover:text-gray-600 disabled:opacity-40 text-xl leading-none p-1">✕</button>
-        </div>
-
-        {serverError && <div className="mx-4 sm:mx-5 mt-4 p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg text-sm font-medium">⚠️ {serverError}</div>}
-
-        <div className="p-4 sm:p-5 overflow-y-auto space-y-4">
-          <Field label="Plate Number" required error={errors.plateNumber}>
-            <input ref={plateRef} name="plateNumber" type="text" value={form.plateNumber} onChange={change} placeholder="e.g. ABC-1234" autoComplete="off" maxLength={15} className={`${inputCls(errors.plateNumber)} uppercase`} />
-          </Field>
-
-          <div className="grid grid-cols-2 gap-3 sm:gap-4">
-            <Field label="Capacity" required error={errors.capacity} hint="Seats (1-30).">
-              <input name="capacity" type="number" min={1} max={30} value={form.capacity} onChange={change} placeholder="e.g. 14" className={inputCls(errors.capacity)} />
-            </Field>
-            <Field label="Status" required error={errors.status}>
-              <select name="status" value={form.status} onChange={change} className={`${inputCls(errors.status)} bg-white`}>
-                {VAN_STATUSES.map((s) => <option key={s} value={s}>{s.replace('_', ' ')}</option>)}
-              </select>
-            </Field>
-          </div>
-
-          <p className="text-xs text-blue-600 font-medium">
-            Once registered, you'll see the van's scannable QR code right away. Driver assignment happens automatically as drivers are approved and start trips.
-          </p>
-        </div>
-
-        <div className="flex flex-col-reverse sm:flex-row gap-2 sm:gap-3 p-4 sm:p-5 border-t bg-gray-50 rounded-b-2xl">
-          <button onClick={onClose} disabled={isLoading} className="flex-1 py-2.5 sm:py-2 border border-gray-300 rounded-lg text-sm font-semibold text-gray-700 hover:bg-gray-100 transition disabled:opacity-40">Cancel</button>
-          <button onClick={submit} disabled={isLoading} className="flex-[2] py-2.5 sm:py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-sm font-bold transition disabled:opacity-70 disabled:cursor-not-allowed">
-            {isLoading ? 'Creating…' : 'Add Van'}
           </button>
         </div>
       </div>
