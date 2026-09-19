@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { MapContainer, TileLayer, Marker, Popup, Circle, Polyline, useMap } from 'react-leaflet';
 import L from 'leaflet';
@@ -21,6 +21,14 @@ const MAP_VISIBLE_STATUSES = [...BOARDING_STATUSES, ...DRIVING_STATUSES];
 const SPEED_SMOOTHING_ALPHA = 0.4;
 const STOPPED_THRESHOLD_KMH = 2;
 const LOW_ACCURACY_THRESHOLD_M = 75;
+
+// A fix worse than this is not plotted at all — we'd rather show "no GPS"
+// than draw a van a few hundred metres away from where it actually is.
+const UNUSABLE_ACCURACY_M = 250;
+
+// Re-query OSRM only after the van has actually travelled this far, instead
+// of on every single GPS ping.
+const ROUTE_RECALC_DISTANCE_M = 250;
 
 const STATUS_CONFIG = {
   BOARDING: { label: 'Boarding', cls: 'bg-green-100 text-green-800 border-green-200' },
@@ -88,6 +96,23 @@ function speedLabel(smoothedSpeedMps) {
   return `${kmh} km/h`;
 }
 
+function haversineMeters(a, b) {
+  const R = 6_371_000;
+  const dLat = ((b.lat - a.lat) * Math.PI) / 180;
+  const dLng = ((b.lng - a.lng) * Math.PI) / 180;
+  const lat1 = (a.lat * Math.PI) / 180;
+  const lat2 = (b.lat * Math.PI) / 180;
+  const h =
+    Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+function accuracyTone(accuracy) {
+  if (typeof accuracy !== 'number') return { text: 'text-gray-400', ring: '#16a34a' };
+  if (accuracy > LOW_ACCURACY_THRESHOLD_M) return { text: 'text-amber-600', ring: '#f59e0b' };
+  return { text: 'text-emerald-600', ring: '#16a34a' };
+}
+
 const statusIconCache = new Map();
 function getVanIconForStatus(status) {
   if (statusIconCache.has(status)) return statusIconCache.get(status);
@@ -142,19 +167,50 @@ const hubIcon = L.divIcon({
   popupAnchor: [0, -20],
 });
 
+/**
+ * Fits the map to all live vans exactly once, on the first batch of
+ * positions. After that the user (or MapFollower) owns the viewport —
+ * re-fitting on every GPS ping would yank the map around constantly.
+ */
 function MapBoundsFitter({ positions }) {
   const map = useMap();
+  const hasFittedRef = useRef(false);
 
   useEffect(() => {
-    if (!positions.length) return;
+    if (hasFittedRef.current || !positions.length) return;
 
     try {
       const bounds = L.latLngBounds([VIRAC_HUB, ...positions]);
       map.fitBounds(bounds, { padding: [50, 50], maxZoom: 13 });
+      hasFittedRef.current = true;
     } catch {
       // ignore malformed coords
     }
   }, [map, positions]);
+
+  return null;
+}
+
+/**
+ * Pans the map to a van the moment the user selects it, so the marker is
+ * always on screen. Does not keep re-centring afterwards, so the user can
+ * freely pan/zoom while watching.
+ */
+function MapFollower({ tripId, position }) {
+  const map = useMap();
+  const lastTripRef = useRef(null);
+
+  useEffect(() => {
+    if (!tripId) {
+      lastTripRef.current = null;
+      return;
+    }
+    if (!position) return;
+    if (lastTripRef.current === tripId) return;
+
+    lastTripRef.current = tripId;
+    map.panTo(position, { animate: true, duration: 0.6 });
+  }, [map, tripId, position]);
 
   return null;
 }
@@ -245,9 +301,20 @@ export default function PublicTracking() {
     durationSeconds: null,
   });
 
+  // Keeps the selection readable from inside socket callbacks without
+  // putting `selectedTripId` in the socket effect's dependency array.
+  const selectedTripIdRef = useRef(selectedTripId);
+  useEffect(() => {
+    selectedTripIdRef.current = selectedTripId;
+  }, [selectedTripId]);
+
+  // Remembers where the currently-drawn route started, so we only rebuild
+  // it once the van has actually moved a meaningful distance.
+  const routeStartRef = useRef({ tripId: null, start: null });
+
   const fetchActiveTrips = useCallback(async (signal) => {
     try {
-      const res = await apiClient.get('/trips/live', { signal }); 
+      const res = await apiClient.get('/trips/live', { signal });
       setActiveTrips(Array.isArray(res.data) ? res.data : []);
       setError('');
     } catch (err) {
@@ -266,6 +333,8 @@ export default function PublicTracking() {
     const onConnect = () => setSocketStatus('connected');
     const onDisconnect = () => setSocketStatus('disconnected');
 
+    // The server seeds us with whatever fixes it already has. Every field
+    // comes straight from the driver's phone — nothing is inferred here.
     const onInitialLocations = (payload = []) => {
       if (!Array.isArray(payload)) return;
 
@@ -279,6 +348,7 @@ export default function PublicTracking() {
               ...data,
               speed: rawSpeed,
               smoothedSpeed: rawSpeed,
+              heading: typeof data?.heading === 'number' ? data.heading : null,
               accuracy: typeof data?.accuracy === 'number' ? data.accuracy : null,
               positionTrusted: data?.positionTrusted !== false,
               lastSeen: lastSeenMs,
@@ -313,6 +383,7 @@ export default function PublicTracking() {
             lng: data.lng,
             speed: rawSpeed,
             smoothedSpeed,
+            heading: typeof data.heading === 'number' ? data.heading : prevEntry.heading ?? null,
             accuracy: typeof data.accuracy === 'number' ? data.accuracy : null,
             positionTrusted: data.positionTrusted !== false,
             lastSeen: Date.now(),
@@ -360,7 +431,7 @@ export default function PublicTracking() {
           delete next[tripId];
           return next;
         });
-        if (selectedTripId === tripId) setSelectedTripId(null);
+        if (selectedTripIdRef.current === tripId) setSelectedTripId(null);
       }
     };
 
@@ -400,7 +471,9 @@ export default function PublicTracking() {
       socket.off('eta_update', onEtaUpdate);
       socket.disconnect();
     };
-  }, [fetchActiveTrips, reloadToken, selectedTripId]);
+    // NOTE: `selectedTripId` is deliberately NOT a dependency — selecting a
+    // van must not tear down and rebuild the whole socket connection.
+  }, [fetchActiveTrips, reloadToken]);
 
   useEffect(() => {
     const id = setInterval(() => {
@@ -431,25 +504,42 @@ export default function PublicTracking() {
     [activeTrips]
   );
 
-  // Resolves each trip's map position from LIVE GPS ONLY — no municipality
-  // or terminal-coordinate fallback. A trip with no fix yet, or one whose
-  // fix has gone stale, simply has no marker rather than a guessed one.
-  const resolveTripPosition = useCallback((trip) => {
-    const data = liveData[trip.id];
-    const hasGps = typeof data?.lat === 'number' && typeof data?.lng === 'number';
-    const isStale = hasGps && data?.lastSeen && Date.now() - data.lastSeen > GPS_STALE_THRESHOLD_MS;
+  /**
+   * Resolves a trip's map position from the driver's phone GPS only.
+   *
+   *   position   -> [lat, lng] when we have a fresh, trustworthy fix, else null
+   *   hasFix     -> a coordinate arrived, regardless of quality
+   *   isStale    -> the last fix is older than the staleness window
+   *   isTrusted  -> the phone reported an accuracy good enough to plot
+   */
+  const resolveTripPosition = useCallback(
+    (trip) => {
+      const data = liveData[trip.id];
+      const hasFix = typeof data?.lat === 'number' && typeof data?.lng === 'number';
+      const accuracy = typeof data?.accuracy === 'number' ? data.accuracy : null;
 
-    if (hasGps && !isStale) {
-      return { position: [data.lat, data.lng], isLiveFix: true, isStale: false };
-    }
+      const isStale =
+        hasFix && data?.lastSeen && Date.now() - data.lastSeen > GPS_STALE_THRESHOLD_MS;
 
-    return { position: null, isLiveFix: false, isStale };
-  }, [liveData]);
+      const isTrusted =
+        data?.positionTrusted !== false &&
+        (accuracy === null || accuracy <= UNUSABLE_ACCURACY_M);
+
+      const canPlot = hasFix && !isStale && isTrusted;
+
+      return {
+        position: canPlot ? [data.lat, data.lng] : null,
+        hasFix: Boolean(hasFix),
+        isStale: Boolean(isStale),
+        isTrusted,
+        accuracy,
+      };
+    },
+    [liveData]
+  );
 
   const activeVanPositions = useMemo(() => {
-    return mapTrips
-      .map((trip) => resolveTripPosition(trip).position)
-      .filter(Boolean);
+    return mapTrips.map((trip) => resolveTripPosition(trip).position).filter(Boolean);
   }, [mapTrips, resolveTripPosition]);
 
   const selectedTrip = useMemo(
@@ -459,25 +549,25 @@ export default function PublicTracking() {
 
   const selectedTripLive = selectedTripId ? liveData[selectedTripId] : null;
   const selectedTripEta = selectedTripId ? liveEtas[selectedTripId] ?? null : null;
-  const selectedStatusCfg = selectedTrip ? STATUS_CONFIG[selectedTrip.status] ?? STATUS_CONFIG.DEPARTED : null;
+  const selectedStatusCfg = selectedTrip
+    ? STATUS_CONFIG[selectedTrip.status] ?? STATUS_CONFIG.DEPARTED
+    : null;
 
-  // The route-preview line (planned road path) still uses the origin's
-  // planned coordinates as a starting point when no live fix exists yet —
-  // that's a route-drawing convenience, separate from the van marker's own
-  // position, which no longer falls back to a guess.
+  const selectedTripPosition = useMemo(() => {
+    if (!selectedTrip) return null;
+    return resolveTripPosition(selectedTrip).position;
+  }, [selectedTrip, resolveTripPosition]);
+
+  /**
+   * Builds the planned road route for the selected trip. The line always
+   * starts from the van's real live fix when one exists — never from a
+   * guessed municipal coordinate. OSRM is only re-queried once the van has
+   * moved more than ROUTE_RECALC_DISTANCE_M, so we don't hammer the public
+   * router on every GPS ping.
+   */
   useEffect(() => {
-    if (!selectedTripId) {
-      setSelectedRoute({
-        coords: [],
-        loading: false,
-        error: '',
-        distanceMeters: null,
-        durationSeconds: null,
-      });
-      return;
-    }
-
-    if (!selectedTrip) {
+    if (!selectedTripId || !selectedTrip) {
+      routeStartRef.current = { tripId: null, start: null };
       setSelectedRoute({
         coords: [],
         loading: false,
@@ -513,13 +603,22 @@ export default function PublicTracking() {
       return;
     }
 
+    const prev = routeStartRef.current;
+    const movedFarEnough =
+      !prev.start ||
+      haversineMeters(
+        { lat: prev.start[0], lng: prev.start[1] },
+        { lat: startCoords[0], lng: startCoords[1] }
+      ) > ROUTE_RECALC_DISTANCE_M;
+
+    // Same trip, van hasn't moved meaningfully — keep the existing line.
+    if (prev.tripId === selectedTripId && !movedFarEnough) return;
+
+    routeStartRef.current = { tripId: selectedTripId, start: startCoords };
+
     const controller = new AbortController();
 
-    setSelectedRoute((prev) => ({
-      ...prev,
-      loading: true,
-      error: '',
-    }));
+    setSelectedRoute((p) => ({ ...p, loading: true, error: '' }));
 
     fetchOsrmRoute(startCoords, endCoords, controller.signal)
       .then((route) => {
@@ -565,7 +664,8 @@ export default function PublicTracking() {
   ]);
 
   const selectedRoutePositions = selectedRoute.coords;
-  const mapFocusPositions = selectedRoutePositions.length > 0 ? selectedRoutePositions : activeVanPositions;
+  const mapFocusPositions =
+    selectedRoutePositions.length > 0 ? selectedRoutePositions : activeVanPositions;
 
   if (loading) {
     return (
@@ -605,7 +705,7 @@ export default function PublicTracking() {
           <div>
             <h1 className="text-xl font-black tracking-tight leading-none">TERMINALINK</h1>
             <p className="text-emerald-200 text-xs font-medium mt-0.5">
-              Real-time GPS & Passenger Tracking
+              Live GPS from the driver's phone
             </p>
           </div>
 
@@ -669,6 +769,7 @@ export default function PublicTracking() {
             />
 
             <MapBoundsFitter positions={mapFocusPositions} />
+            <MapFollower tripId={selectedTripId} position={selectedTripPosition} />
 
             <Marker position={VIRAC_HUB} icon={hubIcon}>
               <Popup>
@@ -683,24 +784,26 @@ export default function PublicTracking() {
 
             {mapTrips.map((trip) => {
               const data = liveData[trip.id];
-              const { position, isLiveFix } = resolveTripPosition(trip);
+              const { position, isTrusted } = resolveTripPosition(trip);
               const isSelected = selectedTripId === trip.id;
 
-              // No live fix → no marker at all (no guessed position).
+              // No fresh, trustworthy phone fix → no marker at all.
+              // We never fall back to a guessed position.
               if (!position) return null;
 
-              const showAccuracyCircle =
-                isLiveFix && typeof data?.accuracy === 'number' && data.accuracy > 0;
+              const accuracy = data?.accuracy;
+              const showAccuracyCircle = typeof accuracy === 'number' && accuracy > 0;
+              const tone = accuracyTone(accuracy);
 
               return (
                 <div key={trip.id}>
                   {showAccuracyCircle && (
                     <Circle
                       center={position}
-                      radius={data.accuracy}
+                      radius={accuracy}
                       pathOptions={{
-                        color: data.accuracy > LOW_ACCURACY_THRESHOLD_M ? '#f59e0b' : '#16a34a',
-                        fillColor: data.accuracy > LOW_ACCURACY_THRESHOLD_M ? '#f59e0b' : '#16a34a',
+                        color: tone.ring,
+                        fillColor: tone.ring,
                         fillOpacity: 0.08,
                         weight: 1,
                       }}
@@ -728,14 +831,22 @@ export default function PublicTracking() {
                         </div>
                         <div className="text-xs font-semibold text-gray-700">
                           {speedLabel(data?.smoothedSpeed)}
-                          {typeof data?.accuracy === 'number' && (
-                            <span className="text-gray-400 font-normal ml-1">
-                              (±{Math.round(data.accuracy)}m)
+                          {typeof accuracy === 'number' && (
+                            <span className={`font-normal ml-1 ${tone.text}`}>
+                              (±{Math.round(accuracy)}m)
                             </span>
                           )}
                         </div>
+                        <div className="text-[10px] text-gray-400">
+                          Updated {relativeTime(data?.lastSeen) ?? 'just now'}
+                          {!isTrusted && ' · unverified fix'}
+                        </div>
                         <div className="flex items-center justify-between gap-2">
-                          <span className={`text-xs font-bold px-2 py-0.5 rounded border ${STATUS_CONFIG[trip.status]?.cls ?? STATUS_CONFIG.DEPARTED.cls}`}>
+                          <span
+                            className={`text-xs font-bold px-2 py-0.5 rounded border ${
+                              STATUS_CONFIG[trip.status]?.cls ?? STATUS_CONFIG.DEPARTED.cls
+                            }`}
+                          >
                             {STATUS_CONFIG[trip.status]?.label ?? trip.status}
                           </span>
                           <button
@@ -808,6 +919,7 @@ export default function PublicTracking() {
                     const seatsLeft = data?.availableSeats ?? trip.van?.capacity ?? 0;
                     const isFull = seatsLeft === 0;
                     const isSelected = selectedTripId === trip.id;
+                    const gps = resolveTripPosition(trip);
 
                     return (
                       <button
@@ -826,7 +938,9 @@ export default function PublicTracking() {
                           <div className="min-w-0 flex-1">
                             <div
                               className={`text-base leading-tight ${
-                                trip.driver?.name ? 'font-black text-gray-900' : 'font-medium italic text-gray-400'
+                                trip.driver?.name
+                                  ? 'font-black text-gray-900'
+                                  : 'font-medium italic text-gray-400'
                               }`}
                             >
                               {trip.driver?.name ?? 'No driver assigned'}
@@ -855,8 +969,25 @@ export default function PublicTracking() {
                           </div>
                         </div>
 
-                        <div className="mt-2 text-xs text-gray-500 font-medium">
-                          Tap to view details
+                        <div className="mt-2 text-xs font-semibold">
+                          {gps.position ? (
+                            <span className="text-emerald-700 flex items-center gap-1.5">
+                              <span className="relative flex h-1.5 w-1.5">
+                                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+                                <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-emerald-500" />
+                              </span>
+                              Sharing live location
+                              {typeof gps.accuracy === 'number' && (
+                                <span className="text-emerald-500 font-normal">
+                                  ±{Math.round(gps.accuracy)}m
+                                </span>
+                              )}
+                            </span>
+                          ) : (
+                            <span className="text-gray-400 font-medium">
+                              Waiting for driver's GPS…
+                            </span>
+                          )}
                         </div>
                       </button>
                     );
@@ -881,10 +1012,12 @@ export default function PublicTracking() {
                 <div className="space-y-3">
                   {drivingTrips.map((trip) => {
                     const data = liveData[trip.id];
-                    const hasGps = typeof data?.lat === 'number' && typeof data?.lng === 'number';
-                    const isStale = hasGps && data?.lastSeen && Date.now() - data.lastSeen > GPS_STALE_THRESHOLD_MS;
-                    const isLowAccuracy = hasGps && typeof data?.accuracy === 'number' && data.accuracy > LOW_ACCURACY_THRESHOLD_M;
+                    const gps = resolveTripPosition(trip);
                     const isSelected = selectedTripId === trip.id;
+                    const isLowAccuracy =
+                      gps.hasFix &&
+                      typeof gps.accuracy === 'number' &&
+                      gps.accuracy > LOW_ACCURACY_THRESHOLD_M;
 
                     return (
                       <button
@@ -907,12 +1040,16 @@ export default function PublicTracking() {
                             </div>
                           </div>
 
-                          <span className={`shrink-0 text-xs font-bold px-2 py-1 rounded border ${STATUS_CONFIG[trip.status]?.cls ?? STATUS_CONFIG.DEPARTED.cls}`}>
+                          <span
+                            className={`shrink-0 text-xs font-bold px-2 py-1 rounded border ${
+                              STATUS_CONFIG[trip.status]?.cls ?? STATUS_CONFIG.DEPARTED.cls
+                            }`}
+                          >
                             {STATUS_CONFIG[trip.status]?.label ?? trip.status}
                           </span>
                         </div>
 
-                        {hasGps && !isStale ? (
+                        {gps.position ? (
                           <div className="text-xs flex items-center justify-between bg-blue-50 text-blue-700 px-3 py-2 rounded-lg font-semibold">
                             <span className="flex items-center gap-1.5">
                               <span className="relative flex h-1.5 w-1.5">
@@ -930,9 +1067,14 @@ export default function PublicTracking() {
                               </span>
                             )}
                           </div>
-                        ) : isStale ? (
+                        ) : gps.isStale ? (
                           <div className="text-xs flex items-center gap-1.5 bg-amber-50 text-amber-700 px-3 py-2 rounded-lg font-semibold">
                             ⚠️ GPS signal lost · last seen {relativeTime(data?.lastSeen)}
+                          </div>
+                        ) : gps.hasFix && !gps.isTrusted ? (
+                          <div className="text-xs flex items-center gap-1.5 bg-amber-50 text-amber-700 px-3 py-2 rounded-lg font-semibold">
+                            📡 GPS fix too weak to plot
+                            {typeof gps.accuracy === 'number' && ` (±${Math.round(gps.accuracy)}m)`}
                           </div>
                         ) : (
                           <div className="text-xs flex items-center gap-1.5 bg-yellow-50 text-yellow-700 px-3 py-2 rounded-lg font-semibold">
@@ -998,13 +1140,13 @@ export default function PublicTracking() {
                         ? 'Returning to Terminal'
                         : 'Heading out'}
                     </p>
-                    {typeof selectedTripLive?.lat === 'number' && typeof selectedTripLive?.lng === 'number' && (
+                    {selectedTripPosition ? (
                       <>
                         <p>
                           <span className="font-semibold text-gray-900">Current speed:</span>{' '}
                           {speedLabel(selectedTripLive.smoothedSpeed)}
                         </p>
-                        {typeof selectedTripLive.accuracy === 'number' && (
+                        {typeof selectedTripLive?.accuracy === 'number' && (
                           <p>
                             <span className="font-semibold text-gray-900">GPS accuracy:</span>{' '}
                             ±{Math.round(selectedTripLive.accuracy)}m
@@ -1013,12 +1155,22 @@ export default function PublicTracking() {
                             )}
                           </p>
                         )}
+                        <p className="text-xs text-gray-400">
+                          Last fix {relativeTime(selectedTripLive?.lastSeen) ?? 'just now'} · direct from
+                          driver's phone
+                        </p>
                       </>
+                    ) : (
+                      <p className="text-xs text-amber-700 bg-amber-50 border border-amber-100 rounded-lg px-3 py-2">
+                        No live GPS fix right now — the van's position isn't being plotted until the
+                        driver's phone reports an accurate location.
+                      </p>
                     )}
                     {selectedTripLive?.availableSeats !== undefined && (
                       <p>
                         <span className="font-semibold text-gray-900">Seats:</span>{' '}
-                        {selectedTripLive.availableSeats}/{selectedTripLive.totalSeats ?? selectedTrip.van?.capacity ?? '?'} available
+                        {selectedTripLive.availableSeats}/
+                        {selectedTripLive.totalSeats ?? selectedTrip.van?.capacity ?? '?'} available
                       </p>
                     )}
                   </div>
