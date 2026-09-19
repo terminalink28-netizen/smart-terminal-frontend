@@ -30,7 +30,6 @@ const STATUS_CONFIG = {
   DELAYED: { label: 'Delayed', cls: 'bg-orange-100 text-orange-800 border-orange-200' },
 };
 
-// ── Per-status marker styling — same palette used on DriverDashboard's map ──
 const STATUS_MARKER_STYLE = {
   BOARDING:  { glyph: '🧍', color: '#16a34a' },
   DEPARTING: { glyph: '🚦', color: '#d97706' },
@@ -335,10 +334,6 @@ export default function PublicTracking() {
       }));
     };
 
-    // Now also cleans up liveData/liveEtas for trips that just finished —
-    // previously these were left behind, which silently inflated the
-    // "ETA Live" sidebar counter with stale entries for trips no longer
-    // on the map at all.
     const onTripStatusChanged = ({ tripId, trip } = {}) => {
       if (!tripId) return;
 
@@ -436,12 +431,9 @@ export default function PublicTracking() {
     [activeTrips]
   );
 
-  // Resolves each trip's map position with a SINGLE shared rule, used both
-  // for the marker layer below and for bounds-fitting — previously the two
-  // used slightly different logic (bounds only fell back for BOARDING; the
-  // fallback also wasn't staleness-aware), which is exactly what caused
-  // vans to silently vanish once they left BOARDING without a GPS fix yet,
-  // or freeze in place forever once their GPS signal died.
+  // Resolves each trip's map position from LIVE GPS ONLY — no municipality
+  // or terminal-coordinate fallback. A trip with no fix yet, or one whose
+  // fix has gone stale, simply has no marker rather than a guessed one.
   const resolveTripPosition = useCallback((trip) => {
     const data = liveData[trip.id];
     const hasGps = typeof data?.lat === 'number' && typeof data?.lng === 'number';
@@ -451,14 +443,7 @@ export default function PublicTracking() {
       return { position: [data.lat, data.lng], isLiveFix: true, isStale: false };
     }
 
-    // No trustworthy live fix — fall back to the route's origin coordinates
-    // (or the terminal, if departing from there) regardless of status, so
-    // the van stays visible on the map while GPS is still being acquired
-    // or has gone stale, matching what the sidebar already communicates.
-    const originName = trip.route?.origin;
-    const fallback = getCoordinatesForDestination(originName) ?? (isHomeTerminal(originName) ? VIRAC_HUB : null);
-
-    return { position: fallback, isLiveFix: false, isStale };
+    return { position: null, isLiveFix: false, isStale };
   }, [liveData]);
 
   const activeVanPositions = useMemo(() => {
@@ -476,6 +461,10 @@ export default function PublicTracking() {
   const selectedTripEta = selectedTripId ? liveEtas[selectedTripId] ?? null : null;
   const selectedStatusCfg = selectedTrip ? STATUS_CONFIG[selectedTrip.status] ?? STATUS_CONFIG.DEPARTED : null;
 
+  // The route-preview line (planned road path) still uses the origin's
+  // planned coordinates as a starting point when no live fix exists yet —
+  // that's a route-drawing convenience, separate from the van marker's own
+  // position, which no longer falls back to a guess.
   useEffect(() => {
     if (!selectedTripId) {
       setSelectedRoute({
@@ -694,14 +683,12 @@ export default function PublicTracking() {
 
             {mapTrips.map((trip) => {
               const data = liveData[trip.id];
-              const { position, isLiveFix, isStale } = resolveTripPosition(trip);
+              const { position, isLiveFix } = resolveTripPosition(trip);
               const isSelected = selectedTripId === trip.id;
 
+              // No live fix → no marker at all (no guessed position).
               if (!position) return null;
 
-              // Only draw an accuracy circle for a live, non-stale GPS fix —
-              // not the origin-coordinate fallback used while acquiring a
-              // signal or after one has gone quiet.
               const showAccuracyCircle =
                 isLiveFix && typeof data?.accuracy === 'number' && data.accuracy > 0;
 
@@ -722,7 +709,6 @@ export default function PublicTracking() {
                   <Marker
                     position={position}
                     icon={getVanIconForStatus(trip.status)}
-                    opacity={isLiveFix ? 1 : 0.55}
                     eventHandlers={{
                       click: () => setSelectedTripId(trip.id),
                     }}
@@ -740,24 +726,14 @@ export default function PublicTracking() {
                             ? ' · En route'
                             : ` · ${STATUS_CONFIG[trip.status]?.label ?? trip.status}`}
                         </div>
-                        {isLiveFix ? (
-                          <div className="text-xs font-semibold text-gray-700">
-                            {speedLabel(data?.smoothedSpeed)}
-                            {typeof data?.accuracy === 'number' && (
-                              <span className="text-gray-400 font-normal ml-1">
-                                (±{Math.round(data.accuracy)}m)
-                              </span>
-                            )}
-                          </div>
-                        ) : isStale ? (
-                          <div className="text-xs font-semibold text-amber-600">
-                            ⚠️ GPS signal lost — showing last known route position
-                          </div>
-                        ) : (
-                          <div className="text-xs font-semibold text-yellow-600">
-                            ⏳ Establishing GPS link…
-                          </div>
-                        )}
+                        <div className="text-xs font-semibold text-gray-700">
+                          {speedLabel(data?.smoothedSpeed)}
+                          {typeof data?.accuracy === 'number' && (
+                            <span className="text-gray-400 font-normal ml-1">
+                              (±{Math.round(data.accuracy)}m)
+                            </span>
+                          )}
+                        </div>
                         <div className="flex items-center justify-between gap-2">
                           <span className={`text-xs font-bold px-2 py-0.5 rounded border ${STATUS_CONFIG[trip.status]?.cls ?? STATUS_CONFIG.DEPARTED.cls}`}>
                             {STATUS_CONFIG[trip.status]?.label ?? trip.status}
