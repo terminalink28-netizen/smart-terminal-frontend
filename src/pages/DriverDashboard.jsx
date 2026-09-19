@@ -5,21 +5,22 @@ import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import apiClient from '../api/axios';
 import { socket } from '../api/socket';
-
-// Fix default marker icons breaking under bundlers (Vite/CRA don't resolve
-// Leaflet's relative image paths correctly out of the box).
-delete L.Icon.Default.prototype._getIconUrl;
-L.Icon.Default.mergeOptions({
-  iconRetinaUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png',
-  iconUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
-  shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
-});
+import { VIRAC_HUB, getCoordinatesForDestination } from '../components/townCoordinates';
 
 // ─── constants ────────────────────────────────────────────────────────────────
 
 const GPS_OPTIONS = { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 };
 
 const GPS_LOCKED_STATUSES = ['SCHEDULED', 'COMPLETED', 'CANCELLED'];
+
+// The official terminal name — matches PublicTracking.jsx exactly so the
+// two screens never drift apart on naming again.
+const HOME_TERMINAL_NAME = 'Provincial Integrated Transport Terminal and Business Complex';
+const HOME_TERMINAL_SHORT = 'Terminal';
+
+function isHomeTerminal(name) {
+  return typeof name === 'string' && name.trim().toLowerCase() === HOME_TERMINAL_NAME.toLowerCase();
+}
 
 const STATUS_COPY = {
   SCHEDULED:  { label: 'Scheduled',           icon: '🗓️' },
@@ -46,7 +47,7 @@ const STATUS_STYLES = {
 const STATUS_FLOW = [
   { key: 'BOARDING',  next: 'DEPARTING', actionLabel: '🚦 Ready to Depart',      actionHint: 'Tap once all passengers are seated.' },
   { key: 'DEPARTING', next: 'DEPARTED',  actionLabel: '🚐 Confirm Departure',    actionHint: "Tap the moment you actually pull out." },
-  { key: 'DEPARTED',  next: 'ARRIVING',  actionLabel: '📍 Approaching Terminal', actionHint: "Tap when you're close to Virac Terminal." },
+  { key: 'DEPARTED',  next: 'ARRIVING',  actionLabel: '📍 Approaching Terminal', actionHint: "Tap when you're close to the terminal." },
 ];
 
 const MUNICIPALITIES = [
@@ -61,12 +62,12 @@ const MUNICIPALITIES = [
   { name: 'Pandan',     minutes: 145, emoji: '🌴' },
 ];
 
-const DESTINATION = 'Virac Central Terminal';
 const DEFAULT_ROUTE_DURATION = 60;
 const DELAY_OPTIONS = [5, 10, 15, 30];
 
 const ETA_ACTIVE_STATUSES = ['BOARDING', 'DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'];
 const STEPPER_KEYS = ['BOARDING', 'DEPARTING', 'DEPARTED', 'ARRIVING', 'COMPLETED'];
+const MAP_VISIBLE_STATUSES = ['BOARDING', 'DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'];
 
 const GPS_STATE = { IDLE: 'IDLE', ACQUIRING: 'ACQUIRING', LIVE: 'LIVE', ERROR: 'ERROR' };
 
@@ -74,13 +75,75 @@ const MAX_PLAUSIBLE_SPEED_MPS = 55;
 const MIN_DT_FOR_FALLBACK_SECONDS = 2;
 const MIN_DISTANCE_FOR_FALLBACK_M = 3;
 
-// Catanduanes / Virac approximate center — adjust if you have exact terminal coords.
-const MAP_CENTER = [13.5763, 124.2306];
-const MAP_DEFAULT_ZOOM = 11;
+const FLEET_REFETCH_INTERVAL_MS = 30_000;
+const FLEET_GPS_STALE_THRESHOLD_MS = 120_000;
 
-// ── socket event names for fleet map — verify against your socket.js ──────
-const EVT_VAN_LOCATION = 'van_location_update'; // per-van incremental broadcast
-const EVT_LIVE_SNAPSHOT = 'live_vans';          // optional initial array snapshot
+// ── Per-status marker styling — identical palette to PublicTracking.jsx ────
+const STATUS_MARKER_STYLE = {
+  BOARDING:  { glyph: '🧍', color: '#16a34a' },
+  DEPARTING: { glyph: '🚦', color: '#d97706' },
+  DEPARTED:  { glyph: '🚐', color: '#2563eb' },
+  ARRIVING:  { glyph: '📍', color: '#059669' },
+  DELAYED:   { glyph: '⏱️', color: '#ea580c' },
+};
+const DEFAULT_MARKER_STYLE = { glyph: '🚐', color: '#6b7280' };
+
+const statusIconCache = new Map();
+function getVanIconForStatus(status, isOwn) {
+  const cacheKey = `${status}-${isOwn ? 'own' : 'other'}`;
+  if (statusIconCache.has(cacheKey)) return statusIconCache.get(cacheKey);
+
+  const { glyph, color } = STATUS_MARKER_STYLE[status] ?? DEFAULT_MARKER_STYLE;
+  const borderWidth = isOwn ? 4 : 3;
+  const size = isOwn ? 40 : 36;
+
+  const icon = L.divIcon({
+    className: '',
+    html: `
+      <div style="
+        font-size:${isOwn ? '20px' : '18px'};
+        background:white;
+        border-radius:50%;
+        padding:4px;
+        border:${borderWidth}px solid ${color};
+        width:${size}px;
+        height:${size}px;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        box-shadow:0 4px 12px ${color}59;
+      ">${glyph}</div>
+    `,
+    iconSize: [size, size],
+    iconAnchor: [size / 2, size / 2],
+    popupAnchor: [0, -(size / 2 + 4)],
+  });
+
+  statusIconCache.set(cacheKey, icon);
+  return icon;
+}
+
+const hubIcon = L.divIcon({
+  className: '',
+  html: `
+    <div style="
+      font-size:16px;
+      background:#1e3a2f;
+      border-radius:50%;
+      padding:5px;
+      border:3px solid #6ee7b7;
+      width:34px;
+      height:34px;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      box-shadow:0 4px 8px rgba(0,0,0,0.3);
+    ">🏛️</div>
+  `,
+  iconSize: [34, 34],
+  iconAnchor: [17, 17],
+  popupAnchor: [0, -20],
+});
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -179,14 +242,14 @@ function TripManifest({ trip, eta, delayMinutes }) {
   const origin = trip.route?.origin ?? trip.route?.name?.split('→')[0]?.trim() ?? 'Unknown';
   const fields = [
     { label: 'From',        value: origin },
-    { label: 'Destination', value: trip.route?.destination ?? DESTINATION },
+    { label: 'Destination', value: trip.route?.destination ?? HOME_TERMINAL_NAME },
     { label: 'Van plate',   value: trip.van?.plateNumber ?? 'Unknown' },
     { label: 'Capacity',    value: trip.van?.capacity ?? '—' },
     { label: 'Status',      value: <StatusBadge status={trip.status} /> },
     {
       label: 'Departure',
-      value: trip.scheduledAt
-        ? new Date(trip.scheduledAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      value: trip.scheduledTime
+        ? new Date(trip.scheduledTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
         : '—',
     },
     ...(eta ? [{
@@ -207,7 +270,7 @@ function TripManifest({ trip, eta, delayMinutes }) {
       <div className="flex items-center justify-between mb-3 border-b border-slate-200 pb-2">
         <h2 className="text-sm font-bold text-slate-700 uppercase tracking-wider">Trip manifest</h2>
         <span className="text-xs font-semibold text-slate-500">
-          {origin} <span className="text-slate-300 mx-1">→</span> {trip.route?.destination ?? DESTINATION}
+          {origin} <span className="text-slate-300 mx-1">→</span> {trip.route?.destination ?? HOME_TERMINAL_SHORT}
         </span>
       </div>
       <dl className="grid grid-cols-2 gap-y-3 text-sm">
@@ -254,41 +317,83 @@ function BoardingPanel({ seatCounts, onDecrTotal, onIncrTotal, onDecrAvail, onIn
   );
 }
 
-// ── FleetMap — shows all currently-broadcasting vans; own van highlighted ──
+// ── FleetMap ───────────────────────────────────────────────────────────────
+// Combines the public /trips/live list (for plate/driver names) with the
+// same socket events PublicTracking.jsx listens to (initial_locations,
+// van_moved) so positions update live. Previously this component listened
+// for events the backend never emits — that was the actual reason vans
+// never showed up here.
 
-function FleetMap({ vans, ownVanId }) {
-  const list = Object.values(vans);
+function FleetMap({ fleetTrips, fleetLiveData, ownTripId }) {
+  const now = Date.now();
+
+  const markers = fleetTrips
+    .filter((trip) => MAP_VISIBLE_STATUSES.includes(trip.status))
+    .map((trip) => {
+      const live = fleetLiveData[trip.id];
+      const hasGps = typeof live?.lat === 'number' && typeof live?.lng === 'number';
+      const isStale = hasGps && live?.lastSeen && now - live.lastSeen > FLEET_GPS_STALE_THRESHOLD_MS;
+
+      let position = null;
+      if (hasGps && !isStale) {
+        position = [live.lat, live.lng];
+      } else if (trip.status === 'BOARDING') {
+        const originName = trip.route?.origin;
+        position = getCoordinatesForDestination(originName) ?? (isHomeTerminal(originName) ? VIRAC_HUB : null);
+      }
+
+      if (!position) return null;
+
+      return {
+        tripId: trip.id,
+        position,
+        status: trip.status,
+        plateNumber: trip.van?.plateNumber,
+        driverName: trip.driver?.name,
+        speedKmh: msToKmh(live?.speed),
+        isOwn: trip.id === ownTripId,
+      };
+    })
+    .filter(Boolean);
+
   return (
     <section className="rounded-xl overflow-hidden border border-gray-200 shadow-sm" aria-label="Live fleet map">
       <div className="bg-slate-800 text-white text-xs font-bold uppercase tracking-wide px-3 py-2 flex items-center justify-between">
         <span>🗺️ Live Fleet Map</span>
         <span className="text-slate-300 font-normal normal-case">
-          {list.length} van{list.length === 1 ? '' : 's'} active
+          {markers.length} van{markers.length === 1 ? '' : 's'} active
         </span>
       </div>
       <div style={{ height: '220px' }}>
-        <MapContainer center={MAP_CENTER} zoom={MAP_DEFAULT_ZOOM} style={{ height: '100%', width: '100%' }} scrollWheelZoom={false}>
+        <MapContainer center={VIRAC_HUB} zoom={11} style={{ height: '100%', width: '100%' }} scrollWheelZoom={false}>
           <TileLayer
             attribution='&copy; OpenStreetMap contributors'
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
-          {list.map((v) => (
-            <Marker key={v.vanId} position={[v.lat, v.lng]}>
+          <Marker position={VIRAC_HUB} icon={hubIcon}>
+            <Popup>
+              <div className="text-xs font-bold">{HOME_TERMINAL_NAME}</div>
+            </Popup>
+          </Marker>
+          {markers.map((m) => (
+            <Marker key={m.tripId} position={m.position} icon={getVanIconForStatus(m.status, m.isOwn)}>
               <Popup>
-                <div className="text-xs">
+                <div className="text-xs space-y-0.5">
                   <div className="font-bold">
-                    {v.plateNumber ?? v.vanId}{v.vanId === ownVanId ? ' (You)' : ''}
+                    {m.plateNumber ?? 'Unknown plate'}{m.isOwn ? ' (You)' : ''}
                   </div>
-                  {v.speedKmh != null && <div>{v.speedKmh} km/h</div>}
+                  {m.driverName && <div className="text-gray-500">{m.driverName}</div>}
+                  <div>{friendlyStatus(m.status).label}</div>
+                  {m.speedKmh != null && <div>{m.speedKmh} km/h</div>}
                 </div>
               </Popup>
             </Marker>
           ))}
         </MapContainer>
       </div>
-      {list.length === 0 && (
+      {markers.length === 0 && (
         <p className="text-xs text-gray-400 text-center py-2 bg-gray-50 border-t border-gray-100">
-          No vans currently broadcasting location.
+          No vans currently active.
         </p>
       )}
     </section>
@@ -459,7 +564,7 @@ function StatusControlPanel({ trip, delayMinutes, eta, statusUpdating, onAdvance
 
       {showEta && (
         <div className="text-center mb-4">
-          <p className="text-xs text-indigo-500 mb-0.5">Estimated arrival · Virac Terminal</p>
+          <p className="text-xs text-indigo-500 mb-0.5">Estimated arrival · {HOME_TERMINAL_SHORT}</p>
           <p className="text-4xl font-black text-indigo-800 tabular-nums leading-none">
             {eta ? eta.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—'}
           </p>
@@ -545,8 +650,8 @@ function TripSetupScreen({ onTripStarted, onRefresh }) {
 
     const payload = {
       origin:      selected.name,
-      destination: DESTINATION,
-      routeName:   `${selected.name} → ${DESTINATION}`,
+      destination: HOME_TERMINAL_NAME,
+      routeName:   `${selected.name} → ${HOME_TERMINAL_NAME}`,
     };
 
     try {
@@ -569,7 +674,7 @@ function TripSetupScreen({ onTripStarted, onRefresh }) {
         <h2 className="text-lg font-black text-gray-900 mt-3">Ready to roll?</h2>
         <p className="text-sm text-gray-500 mt-1">
           Pick your starting municipality. We'll open a trip to{' '}
-          <span className="font-semibold text-gray-700">{DESTINATION}</span>.
+          <span className="font-semibold text-gray-700">{HOME_TERMINAL_SHORT}</span>.
         </p>
       </div>
 
@@ -599,7 +704,7 @@ function TripSetupScreen({ onTripStarted, onRefresh }) {
             <p className="font-semibold text-slate-800">
               {selected.emoji} {selected.name}
               <span className="text-slate-400 font-normal mx-2">→</span>
-              Virac Central Terminal
+              {HOME_TERMINAL_SHORT}
             </p>
             <p className="text-xs text-slate-500 mt-0.5">Estimated travel time: ~{selected.minutes} min</p>
           </div>
@@ -651,7 +756,10 @@ export default function DriverDashboard() {
   const [departureTime, setDepartureTime] = useState(null);
   const [delayMinutes, setDelayMinutes]   = useState(0);
   const [statusUpdating, setStatusUpdating] = useState(false);
-  const [fleetVans, setFleetVans]         = useState({}); // { [vanId]: { vanId, plateNumber, lat, lng, speedKmh } }
+
+  // ── Fleet map state — mirrors PublicTracking.jsx's data model exactly ────
+  const [fleetTrips, setFleetTrips]       = useState([]);
+  const [fleetLiveData, setFleetLiveData] = useState({});
 
   const seatSyncedRef = useRef(false);
   const watchIdRef    = useRef(null);
@@ -691,6 +799,19 @@ export default function DriverDashboard() {
       console.error('[DriverDashboard] fetchMyTrip error:', err);
     } finally {
       if (!silent) setLoading(false);
+    }
+  }, []);
+
+  // Fetches the same public live-trips list PublicTracking.jsx uses, so the
+  // fleet map has plate numbers and driver names to show for every van, not
+  // just raw GPS dots.
+  const fetchFleetTrips = useCallback(async (signal) => {
+    try {
+      const response = await apiClient.get('/trips/live', { signal });
+      setFleetTrips(Array.isArray(response.data) ? response.data : []);
+    } catch (err) {
+      if (err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') return;
+      console.error('[DriverDashboard] fetchFleetTrips error:', err);
     }
   }, []);
 
@@ -773,6 +894,15 @@ export default function DriverDashboard() {
         if (kmh !== null) {
           setMaxSpeedKmh((prev) => Math.max(prev, kmh));
         }
+
+        // Reflect our own movement in the fleet map immediately, without
+        // waiting for the round-trip broadcast back from the server.
+        setFleetLiveData((prev) => ({
+          ...prev,
+          [tripIdRef.current]: {
+            lat, lng, speed: resolvedSpeed, accuracy, lastSeen: Date.now(),
+          },
+        }));
       },
       (err) => {
         console.error('[DriverDashboard] geolocation error:', err);
@@ -857,6 +987,7 @@ export default function DriverDashboard() {
     lastFixRef.current = null;
     const capacity = newTrip?.van?.capacity ?? 14;
     setSeatCounts({ total: capacity, available: capacity });
+    setFleetTrips((prev) => (prev.some((t) => t.id === newTrip.id) ? prev : [...prev, newTrip]));
   }, []);
 
   useEffect(() => {
@@ -865,56 +996,97 @@ export default function DriverDashboard() {
     return () => { controller.abort(); stopLocationSharing(); socket.disconnect(); };
   }, [fetchMyTrip, stopLocationSharing]);
 
-  // Join the map room, listen for trip status changes AND fleet location
-  // broadcasts — independent of whether this driver is currently sharing GPS.
+  // Fleet map data source: fetch the live trips list once, then refresh it
+  // periodically as a fallback in case a socket event is missed.
+  useEffect(() => {
+    const controller = new AbortController();
+    fetchFleetTrips(controller.signal);
+    const id = setInterval(() => {
+      const ctrl = new AbortController();
+      fetchFleetTrips(ctrl.signal);
+    }, FLEET_REFETCH_INTERVAL_MS);
+    return () => { controller.abort(); clearInterval(id); };
+  }, [fetchFleetTrips]);
+
+  // Socket wiring for the fleet map — uses the SAME event names the backend
+  // actually emits (confirmed against PublicTracking.jsx): 'initial_locations'
+  // (array snapshot keyed by tripId) and 'van_moved' (per-trip updates), plus
+  // 'trip_status_changed' / 'trip_dispatched' to keep the trip list current.
   useEffect(() => {
     socket.connect();
     socket.emit('subscribe_to_map');
 
-    const handleConnect = () => {
-      socket.emit('subscribe_to_map');
-    };
+    const handleConnect = () => socket.emit('subscribe_to_map');
     socket.on('connect', handleConnect);
 
-    const handleVanLocation = (payload) => {
-      if (!payload?.vanId || typeof payload.lat !== 'number' || typeof payload.lng !== 'number') return;
-      setFleetVans((prev) => ({
+    const onInitialLocations = (payload = []) => {
+      if (!Array.isArray(payload)) return;
+      try {
+        const seeded = payload.map(([tid, data]) => [
+          tid,
+          {
+            lat: data?.lat,
+            lng: data?.lng,
+            speed: typeof data?.speed === 'number' ? data.speed : null,
+            accuracy: typeof data?.accuracy === 'number' ? data.accuracy : null,
+            lastSeen: data?.timestamp ? new Date(data.timestamp).getTime() : Date.now(),
+          },
+        ]);
+        setFleetLiveData(Object.fromEntries(seeded));
+      } catch {
+        // ignore malformed payloads
+      }
+    };
+    socket.on('initial_locations', onInitialLocations);
+
+    const onVanMoved = (data) => {
+      if (!data?.tripId || typeof data.lat !== 'number' || typeof data.lng !== 'number') return;
+      setFleetLiveData((prev) => ({
         ...prev,
-        [payload.vanId]: {
-          vanId: payload.vanId,
-          plateNumber: payload.plateNumber ?? prev[payload.vanId]?.plateNumber,
-          lat: payload.lat,
-          lng: payload.lng,
-          speedKmh: msToKmh(payload.speed),
+        [data.tripId]: {
+          lat: data.lat,
+          lng: data.lng,
+          speed: typeof data.speed === 'number' ? data.speed : null,
+          accuracy: typeof data.accuracy === 'number' ? data.accuracy : null,
+          lastSeen: Date.now(),
         },
       }));
     };
-    socket.on(EVT_VAN_LOCATION, handleVanLocation);
+    socket.on('van_moved', onVanMoved);
 
-    const handleSnapshot = (list) => {
-      if (!Array.isArray(list)) return;
-      setFleetVans((prev) => {
-        const next = { ...prev };
-        list.forEach((v) => {
-          if (v?.vanId && typeof v.lat === 'number' && typeof v.lng === 'number') {
-            next[v.vanId] = {
-              vanId: v.vanId,
-              plateNumber: v.plateNumber,
-              lat: v.lat,
-              lng: v.lng,
-              speedKmh: msToKmh(v.speed),
-            };
-          }
-        });
-        return next;
-      });
+    const onFleetTripDispatched = ({ trip: newTrip } = {}) => {
+      if (!newTrip?.id) return;
+      setFleetTrips((prev) => (prev.some((t) => t.id === newTrip.id) ? prev : [...prev, newTrip]));
     };
-    socket.on(EVT_LIVE_SNAPSHOT, handleSnapshot);
+    socket.on('trip_dispatched', onFleetTripDispatched);
+
+    const onFleetTripStatusChanged = ({ tripId, trip: updated } = {}) => {
+      if (!tripId) return;
+      setFleetTrips((prev) => {
+        if (updated?.status === 'COMPLETED' || updated?.status === 'CANCELLED') {
+          return prev.filter((t) => t.id !== tripId);
+        }
+        const exists = prev.some((t) => t.id === tripId);
+        if (exists) return prev.map((t) => (t.id === tripId ? { ...t, ...updated } : t));
+        if (updated) return [...prev, updated];
+        return prev;
+      });
+      if (updated?.status === 'COMPLETED' || updated?.status === 'CANCELLED') {
+        setFleetLiveData((prev) => {
+          const next = { ...prev };
+          delete next[tripId];
+          return next;
+        });
+      }
+    };
+    socket.on('trip_status_changed', onFleetTripStatusChanged);
 
     return () => {
       socket.off('connect', handleConnect);
-      socket.off(EVT_VAN_LOCATION, handleVanLocation);
-      socket.off(EVT_LIVE_SNAPSHOT, handleSnapshot);
+      socket.off('initial_locations', onInitialLocations);
+      socket.off('van_moved', onVanMoved);
+      socket.off('trip_dispatched', onFleetTripDispatched);
+      socket.off('trip_status_changed', onFleetTripStatusChanged);
     };
   }, []);
 
@@ -956,6 +1128,7 @@ export default function DriverDashboard() {
     return () => socket.off('disconnect', handleDisconnect);
   }, [gpsState, clearWatch]);
 
+  // Listen for the dispatcher's QR scan completing OUR OWN trip in real time.
   useEffect(() => {
     const handleRemoteStatusChange = (payload) => {
       if (!payload?.tripId || payload.tripId !== tripIdRef.current) return;
@@ -964,15 +1137,13 @@ export default function DriverDashboard() {
 
       if (updatedTrip.status === 'COMPLETED') {
         stopLocationSharing();
-        // Remove this van from the fleet map — its trip is over.
-        const finishedVanId = updatedTrip.van?.id;
-        if (finishedVanId) {
-          setFleetVans((prev) => {
-            const next = { ...prev };
-            delete next[finishedVanId];
-            return next;
-          });
-        }
+        const finishedTripId = tripIdRef.current;
+        setFleetTrips((prev) => prev.filter((t) => t.id !== finishedTripId));
+        setFleetLiveData((prev) => {
+          const next = { ...prev };
+          delete next[finishedTripId];
+          return next;
+        });
         tripIdRef.current = null;
         setTrip(null);
         setDepartureTime(null);
@@ -1032,7 +1203,7 @@ export default function DriverDashboard() {
           </button>
         </header>
 
-        <FleetMap vans={fleetVans} ownVanId={trip?.van?.id} />
+        <FleetMap fleetTrips={fleetTrips} fleetLiveData={fleetLiveData} ownTripId={trip?.id} />
 
         {!trip ? (
           <TripSetupScreen onTripStarted={handleTripStarted} onRefresh={() => fetchMyTrip()} />
