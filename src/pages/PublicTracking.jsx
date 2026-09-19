@@ -11,9 +11,6 @@ const REFETCH_INTERVAL_MS = 30_000;
 const GPS_STALE_THRESHOLD_MS = 120_000;
 const OSRM_BASE_URL = 'https://router.project-osrm.org/route/v1/driving';
 
-// The official name of the home terminal. Used for exact-match comparisons
-// (route direction, fallback coordinates) — NOT a substring check, since
-// this name doesn't contain any single word safe to match loosely.
 const HOME_TERMINAL_NAME = 'Provincial Integrated Transport Terminal and Business Complex';
 const HOME_TERMINAL_SHORT = 'Terminal';
 
@@ -21,12 +18,9 @@ const BOARDING_STATUSES = ['BOARDING'];
 const DRIVING_STATUSES = ['DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'];
 const MAP_VISIBLE_STATUSES = [...BOARDING_STATUSES, ...DRIVING_STATUSES];
 
-// Speed display tuning — mirrors what consumer trackers like Life360 do:
-// smooth the raw reading so it doesn't flicker, and treat anything under a
-// small noise floor as "stopped" rather than a jittery 1-2 km/h.
-const SPEED_SMOOTHING_ALPHA = 0.4;   // weight given to each new reading
+const SPEED_SMOOTHING_ALPHA = 0.4;
 const STOPPED_THRESHOLD_KMH = 2;
-const LOW_ACCURACY_THRESHOLD_M = 75; // beyond this, flag the fix as imprecise
+const LOW_ACCURACY_THRESHOLD_M = 75;
 
 const STATUS_CONFIG = {
   BOARDING: { label: 'Boarding', cls: 'bg-green-100 text-green-800 border-green-200' },
@@ -36,16 +30,13 @@ const STATUS_CONFIG = {
   DELAYED: { label: 'Delayed', cls: 'bg-orange-100 text-orange-800 border-orange-200' },
 };
 
-// ── Per-status marker styling ───────────────────────────────────────────
-// Each trip status gets its own icon glyph + color, so a glance at the map
-// tells you whether a van is boarding, departing, en route, arriving, or
-// delayed — without needing to open the popup.
+// ── Per-status marker styling — same palette used on DriverDashboard's map ──
 const STATUS_MARKER_STYLE = {
-  BOARDING:  { glyph: '🧍', color: '#16a34a' }, // green  — loading passengers
-  DEPARTING: { glyph: '🚦', color: '#d97706' }, // amber  — about to pull out
-  DEPARTED:  { glyph: '🚐', color: '#2563eb' }, // blue   — en route
-  ARRIVING:  { glyph: '📍', color: '#059669' }, // emerald — approaching terminal
-  DELAYED:   { glyph: '⏱️', color: '#ea580c' }, // orange — delayed
+  BOARDING:  { glyph: '🧍', color: '#16a34a' },
+  DEPARTING: { glyph: '🚦', color: '#d97706' },
+  DEPARTED:  { glyph: '🚐', color: '#2563eb' },
+  ARRIVING:  { glyph: '📍', color: '#059669' },
+  DELAYED:   { glyph: '⏱️', color: '#ea580c' },
 };
 const DEFAULT_MARKER_STYLE = { glyph: '🚐', color: '#6b7280' };
 
@@ -64,17 +55,11 @@ function relativeTime(ts) {
   return 'over an hour ago';
 }
 
-// The home terminal's name is intentionally excluded from the generic
-// "strip trailing Terminal" rule below — it gets its own short label
-// (HOME_TERMINAL_SHORT) since the full name is too long for inline UI.
 function shortPlaceName(name) {
   if (isHomeTerminal(name)) return HOME_TERMINAL_SHORT;
   return (name ?? 'Unknown').replace(/\s*Terminal$/i, '');
 }
 
-// Exact match (case-insensitive, trimmed) against the official terminal
-// name — replaces the old substring check, which relied on the name
-// containing "virac" and silently breaks against any other naming.
 function isHomeTerminal(name) {
   return typeof name === 'string' && name.trim().toLowerCase() === HOME_TERMINAL_NAME.toLowerCase();
 }
@@ -97,12 +82,6 @@ function formatDuration(seconds) {
   return rem > 0 ? `${hours}h ${rem}m` : `${hours}h`;
 }
 
-/**
- * Renders a "Life360-style" speed label from a smoothed m/s value:
- *  - null            → "Speed unavailable" (we genuinely don't know)
- *  - < noise floor    → "Stopped"
- *  - otherwise        → "NN km/h"
- */
 function speedLabel(smoothedSpeedMps) {
   const kmh = msToKmh(smoothedSpeedMps);
   if (kmh === null) return 'Speed unavailable';
@@ -110,11 +89,7 @@ function speedLabel(smoothedSpeedMps) {
   return `${kmh} km/h`;
 }
 
-// Cached per status so Leaflet isn't asked to rebuild an identical divIcon
-// on every render — there are only 5 possible statuses, so this cache
-// never grows past 5 entries.
 const statusIconCache = new Map();
-
 function getVanIconForStatus(status) {
   if (statusIconCache.has(status)) return statusIconCache.get(status);
 
@@ -292,10 +267,6 @@ export default function PublicTracking() {
     const onConnect = () => setSocketStatus('connected');
     const onDisconnect = () => setSocketStatus('disconnected');
 
-    // Initial snapshot from the server's in-memory store. Each entry already
-    // carries { lat, lng, speed, accuracy, positionTrusted, timestamp, ... }
-    // from the backend — seed smoothedSpeed from the raw speed so the first
-    // paint isn't blank, and normalize timestamp into a plain ms number.
     const onInitialLocations = (payload = []) => {
       if (!Array.isArray(payload)) return;
 
@@ -328,11 +299,6 @@ export default function PublicTracking() {
         const prevEntry = prev[data.tripId] ?? {};
         const rawSpeed = typeof data.speed === 'number' ? data.speed : null;
 
-        // Exponential moving average so the km/h reading doesn't jitter
-        // frame-to-frame the way a raw instantaneous GPS speed does.
-        // If this fix has no speed (unknown), hold the last smoothed value
-        // rather than snapping to 0 — matches how consumer trackers avoid
-        // flashing "stopped" every time a single fix comes back speed-less.
         const smoothedSpeed =
           rawSpeed === null
             ? prevEntry.smoothedSpeed ?? null
@@ -369,19 +335,38 @@ export default function PublicTracking() {
       }));
     };
 
+    // Now also cleans up liveData/liveEtas for trips that just finished —
+    // previously these were left behind, which silently inflated the
+    // "ETA Live" sidebar counter with stale entries for trips no longer
+    // on the map at all.
     const onTripStatusChanged = ({ tripId, trip } = {}) => {
       if (!tripId) return;
 
-      setActiveTrips((prev) => {
-        if (trip?.status === 'COMPLETED' || trip?.status === 'CANCELLED') {
-          return prev.filter((t) => t.id !== tripId);
-        }
+      const isFinished = trip?.status === 'COMPLETED' || trip?.status === 'CANCELLED';
 
+      setActiveTrips((prev) => {
+        if (isFinished) return prev.filter((t) => t.id !== tripId);
         const exists = prev.some((t) => t.id === tripId);
         if (exists) return prev.map((t) => (t.id === tripId ? { ...t, ...trip } : t));
         if (trip) return [...prev, trip];
         return prev;
       });
+
+      if (isFinished) {
+        setLiveData((prev) => {
+          if (!(tripId in prev)) return prev;
+          const next = { ...prev };
+          delete next[tripId];
+          return next;
+        });
+        setLiveEtas((prev) => {
+          if (!(tripId in prev)) return prev;
+          const next = { ...prev };
+          delete next[tripId];
+          return next;
+        });
+        if (selectedTripId === tripId) setSelectedTripId(null);
+      }
     };
 
     const onTripDispatched = ({ trip } = {}) => {
@@ -420,7 +405,7 @@ export default function PublicTracking() {
       socket.off('eta_update', onEtaUpdate);
       socket.disconnect();
     };
-  }, [fetchActiveTrips, reloadToken]);
+  }, [fetchActiveTrips, reloadToken, selectedTripId]);
 
   useEffect(() => {
     const id = setInterval(() => {
@@ -451,22 +436,36 @@ export default function PublicTracking() {
     [activeTrips]
   );
 
+  // Resolves each trip's map position with a SINGLE shared rule, used both
+  // for the marker layer below and for bounds-fitting — previously the two
+  // used slightly different logic (bounds only fell back for BOARDING; the
+  // fallback also wasn't staleness-aware), which is exactly what caused
+  // vans to silently vanish once they left BOARDING without a GPS fix yet,
+  // or freeze in place forever once their GPS signal died.
+  const resolveTripPosition = useCallback((trip) => {
+    const data = liveData[trip.id];
+    const hasGps = typeof data?.lat === 'number' && typeof data?.lng === 'number';
+    const isStale = hasGps && data?.lastSeen && Date.now() - data.lastSeen > GPS_STALE_THRESHOLD_MS;
+
+    if (hasGps && !isStale) {
+      return { position: [data.lat, data.lng], isLiveFix: true, isStale: false };
+    }
+
+    // No trustworthy live fix — fall back to the route's origin coordinates
+    // (or the terminal, if departing from there) regardless of status, so
+    // the van stays visible on the map while GPS is still being acquired
+    // or has gone stale, matching what the sidebar already communicates.
+    const originName = trip.route?.origin;
+    const fallback = getCoordinatesForDestination(originName) ?? (isHomeTerminal(originName) ? VIRAC_HUB : null);
+
+    return { position: fallback, isLiveFix: false, isStale };
+  }, [liveData]);
+
   const activeVanPositions = useMemo(() => {
     return mapTrips
-      .map((trip) => {
-        const data = liveData[trip.id];
-        if (typeof data?.lat === 'number' && typeof data?.lng === 'number') {
-          return [data.lat, data.lng];
-        }
-        if (trip.status === 'BOARDING') {
-          const originName = trip.route?.origin;
-          return getCoordinatesForDestination(originName) ?? 
-                 (isHomeTerminal(originName) ? VIRAC_HUB : null);
-        }
-        return null;
-      })
+      .map((trip) => resolveTripPosition(trip).position)
       .filter(Boolean);
-  }, [mapTrips, liveData]);
+  }, [mapTrips, resolveTripPosition]);
 
   const selectedTrip = useMemo(
     () => activeTrips.find((t) => t.id === selectedTripId) ?? null,
@@ -695,24 +694,16 @@ export default function PublicTracking() {
 
             {mapTrips.map((trip) => {
               const data = liveData[trip.id];
-              const hasGps = typeof data?.lat === 'number' && typeof data?.lng === 'number';
+              const { position, isLiveFix, isStale } = resolveTripPosition(trip);
               const isSelected = selectedTripId === trip.id;
-
-              let position = null;
-              if (hasGps) {
-                position = [data.lat, data.lng];
-              } else if (trip.status === 'BOARDING') {
-                const originName = trip.route?.origin;
-                position = getCoordinatesForDestination(originName) ?? 
-                           (isHomeTerminal(originName) ? VIRAC_HUB : null);
-              }
 
               if (!position) return null;
 
-              // Only draw an accuracy circle for real GPS fixes, not the
-              // terminal-coordinate fallback used while boarding.
+              // Only draw an accuracy circle for a live, non-stale GPS fix —
+              // not the origin-coordinate fallback used while acquiring a
+              // signal or after one has gone quiet.
               const showAccuracyCircle =
-                hasGps && typeof data?.accuracy === 'number' && data.accuracy > 0;
+                isLiveFix && typeof data?.accuracy === 'number' && data.accuracy > 0;
 
               return (
                 <div key={trip.id}>
@@ -731,6 +722,7 @@ export default function PublicTracking() {
                   <Marker
                     position={position}
                     icon={getVanIconForStatus(trip.status)}
+                    opacity={isLiveFix ? 1 : 0.55}
                     eventHandlers={{
                       click: () => setSelectedTripId(trip.id),
                     }}
@@ -748,7 +740,7 @@ export default function PublicTracking() {
                             ? ' · En route'
                             : ` · ${STATUS_CONFIG[trip.status]?.label ?? trip.status}`}
                         </div>
-                        {hasGps && (
+                        {isLiveFix ? (
                           <div className="text-xs font-semibold text-gray-700">
                             {speedLabel(data?.smoothedSpeed)}
                             {typeof data?.accuracy === 'number' && (
@@ -756,6 +748,14 @@ export default function PublicTracking() {
                                 (±{Math.round(data.accuracy)}m)
                               </span>
                             )}
+                          </div>
+                        ) : isStale ? (
+                          <div className="text-xs font-semibold text-amber-600">
+                            ⚠️ GPS signal lost — showing last known route position
+                          </div>
+                        ) : (
+                          <div className="text-xs font-semibold text-yellow-600">
+                            ⏳ Establishing GPS link…
                           </div>
                         )}
                         <div className="flex items-center justify-between gap-2">
