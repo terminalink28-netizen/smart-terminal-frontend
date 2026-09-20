@@ -13,14 +13,15 @@ const GPS_OPTIONS = { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 };
 
 const GPS_LOCKED_STATUSES = ['SCHEDULED', 'COMPLETED', 'CANCELLED'];
 
-// Every status where the backend's handleQrScan actually accepts a scan
-// (see SCAN_TRANSITIONS in trip.controller.js). The QR must stay visible
-// throughout this whole window, not just at the final ARRIVING step —
-// dispatch can scan it at departure, mid-route, or on arrival.
+// Every status where the backend's handleQrScan actually accepts a scan.
 const QR_SCANNABLE_STATUSES = ['DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'];
 
 const HOME_TERMINAL_NAME = 'Provincial Integrated Transport Terminal and Business Complex';
 const HOME_TERMINAL_SHORT = 'Terminal';
+
+const PHONE_RE = /^[+\d][\d\s-]{6,14}$/;
+const MAX_CONTACT_NUMBERS = 5;
+const SEAT_PERSIST_DEBOUNCE_MS = 500;
 
 function isHomeTerminal(name) {
   return typeof name === 'string' && name.trim().toLowerCase() === HOME_TERMINAL_NAME.toLowerCase();
@@ -151,7 +152,6 @@ const hubIcon = L.divIcon({
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
-/** Reads the current user id from localStorage (set at login). */
 function getStoredUserId() {
   try {
     const raw = localStorage.getItem('user');
@@ -160,6 +160,35 @@ function getStoredUserId() {
     return parsed?.id ?? parsed?.userId ?? null;
   } catch {
     return null;
+  }
+}
+
+function getStoredContactNumbers() {
+  try {
+    const raw = localStorage.getItem('user');
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed?.contactNumbers) && parsed.contactNumbers.length) {
+      return parsed.contactNumbers;
+    }
+    if (typeof parsed?.contactNumber === 'string' && parsed.contactNumber) {
+      return [parsed.contactNumber];
+    }
+    return [];
+  } catch {
+    return [];
+  }
+}
+
+function persistContactNumbersLocally(numbers) {
+  try {
+    const raw = localStorage.getItem('user');
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    parsed.contactNumbers = numbers;
+    localStorage.setItem('user', JSON.stringify(parsed));
+  } catch {
+    // ignore storage errors
   }
 }
 
@@ -301,19 +330,25 @@ function TripManifest({ trip, eta, delayMinutes }) {
   );
 }
 
-// ── SeatManagerPanel ─────────────────────────────────────────────────────────
-// Previously only shown while status === 'BOARDING'. Now shown throughout
-// every active status (anything the driver can be in short of the locked
-// states) — passenger counts can genuinely change mid-route (a drop-off,
-// a pickup arranged by the dispatcher), and hiding the control the moment
-// boarding ends meant the driver had no way to correct the count afterward.
+// ── SeatManagerPanel ───────────────────────────────────────────────────────
+// Shown throughout every active status — the count persists to the backend,
+// so whatever the driver sets during boarding carries through departure,
+// the road, and arrival, and survives logout/login.
 
-function SeatManagerPanel({ seatCounts, onDecrTotal, onIncrTotal, onDecrAvail, onIncrAvail }) {
+function SeatManagerPanel({ seatCounts, saving, onDecrTotal, onIncrTotal, onDecrAvail, onIncrAvail }) {
   return (
     <section className="bg-green-50 p-5 rounded-xl border-2 border-green-200" aria-label="Seat availability controls">
-      <h2 className="text-sm font-bold text-green-900 text-center uppercase tracking-wider mb-4">
-        Seat availability
-      </h2>
+      <div className="flex items-center justify-between mb-4">
+        <h2 className="text-sm font-bold text-green-900 uppercase tracking-wider">
+          Seat availability
+        </h2>
+        {saving && (
+          <span className="text-[11px] font-semibold text-green-600 flex items-center gap-1">
+            <span className="w-2 h-2 border-2 border-green-600 border-t-transparent rounded-full animate-spin" />
+            Saving…
+          </span>
+        )}
+      </div>
       <div className="flex items-center justify-between bg-white px-4 py-3 rounded-lg border border-green-100 mb-5">
         <span className="text-sm font-semibold text-gray-600">Total capacity</span>
         <div className="flex items-center gap-3">
@@ -335,7 +370,115 @@ function SeatManagerPanel({ seatCounts, onDecrTotal, onIncrTotal, onDecrAvail, o
             className="w-14 h-14 rounded-full bg-green-200 text-green-800 hover:bg-green-300 font-black text-3xl flex items-center justify-center transition-colors shadow-sm active:scale-95">+</button>
         </div>
         <SeatProgressBar available={seatCounts.available} total={seatCounts.total} />
+        <p className="text-[11px] text-green-600 mt-3">
+          Counts are saved automatically and stay with this trip until it ends.
+        </p>
       </div>
+    </section>
+  );
+}
+
+// ── ContactNumbersPanel ────────────────────────────────────────────────────
+// Drivers can keep up to 5 numbers on file. The whole list is saved with
+// one PATCH, so removing + adding in one go is a single round-trip.
+
+function ContactNumbersPanel({
+  numbers,
+  newNumber,
+  onNewNumberChange,
+  onAdd,
+  onRemove,
+  saving,
+  error,
+  onClose,
+}) {
+  const atCap = numbers.length >= MAX_CONTACT_NUMBERS;
+  const canAdd = newNumber.trim().length > 0 && PHONE_RE.test(newNumber.trim()) && !atCap;
+
+  return (
+    <section className="bg-slate-50 p-4 rounded-xl border border-slate-200 mt-3">
+      <div className="flex items-center justify-between mb-3">
+        <h2 className="text-sm font-bold text-slate-700 uppercase tracking-wider">
+          📞 My contact numbers
+        </h2>
+        <div className="flex items-center gap-2">
+          {saving && (
+            <span className="text-[11px] font-semibold text-slate-500 flex items-center gap-1">
+              <span className="w-2 h-2 border-2 border-slate-500 border-t-transparent rounded-full animate-spin" />
+              Saving…
+            </span>
+          )}
+          <button
+            onClick={onClose}
+            className="text-xs font-bold text-slate-400 hover:text-slate-700"
+            aria-label="Close contact numbers editor"
+          >
+            ✕
+          </button>
+        </div>
+      </div>
+
+      {numbers.length === 0 ? (
+        <p className="text-xs text-slate-400 mb-3">
+          No contact numbers yet. Passengers will see these on the public tracking page.
+        </p>
+      ) : (
+        <ul className="space-y-1.5 mb-3">
+          {numbers.map((n) => (
+            <li
+              key={n}
+              className="flex items-center justify-between bg-white px-3 py-2 rounded-lg border border-slate-200"
+            >
+              <span className="text-sm font-semibold text-slate-800 tabular-nums">{n}</span>
+              <button
+                onClick={() => onRemove(n)}
+                className="text-xs font-bold text-red-500 hover:text-red-700"
+                aria-label={`Remove ${n}`}
+              >
+                Remove
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {!atCap && (
+        <div className="flex gap-2">
+          <input
+            type="tel"
+            inputMode="tel"
+            placeholder="09XXXXXXXXX"
+            value={newNumber}
+            onChange={(e) => onNewNumberChange(e.target.value)}
+            className="flex-1 min-w-0 px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+            maxLength={15}
+            aria-label="New contact number"
+          />
+          <button
+            onClick={onAdd}
+            disabled={!canAdd}
+            className={`px-4 py-2 rounded-lg font-bold text-sm transition-colors ${
+              canAdd
+                ? 'bg-blue-600 hover:bg-blue-700 text-white'
+                : 'bg-gray-200 text-gray-400 cursor-not-allowed'
+            }`}
+          >
+            Add
+          </button>
+        </div>
+      )}
+
+      {atCap && (
+        <p className="text-[11px] text-slate-400">
+          Maximum of {MAX_CONTACT_NUMBERS} numbers. Remove one to add another.
+        </p>
+      )}
+
+      {error && (
+        <p role="alert" className="mt-2 text-xs text-red-600 font-medium">
+          ⚠️ {error}
+        </p>
+      )}
     </section>
   );
 }
@@ -550,13 +693,8 @@ function ETACountdown({ eta }) {
   );
 }
 
-// ── TripQrPanel ──────────────────────────────────────────────────────────────
-// Was previously only rendered at ARRIVING for trip completion. The backend's
-// handleQrScan actually accepts a scan at DEPARTING, DEPARTED, ARRIVING, and
-// DELAYED (see SCAN_TRANSITIONS) — one scan of this same QR advances the trip
-// through whichever transition matches its current status. So this panel
-// now stays visible across that whole window with status-appropriate copy,
-// instead of only appearing once, right before the trip ends.
+// ── TripQrPanel ────────────────────────────────────────────────────────────
+// Visible across the whole QR-scannable window (DEPARTING → ARRIVING).
 
 const QR_PANEL_COPY = {
   DEPARTING: {
@@ -569,7 +707,7 @@ const QR_PANEL_COPY = {
   },
   DELAYED: {
     title: 'Delayed ⏱️',
-    subtitle: 'Once you\'re moving again, your dispatcher can scan this to confirm the next checkpoint.',
+    subtitle: "Once you're moving again, your dispatcher can scan this to confirm the next checkpoint.",
   },
   ARRIVING: {
     title: "You've arrived 🎉",
@@ -827,6 +965,7 @@ export default function DriverDashboard() {
   const [lastCoords, setLastCoords]       = useState(null);
   const [maxSpeedKmh, setMaxSpeedKmh]     = useState(0);
   const [seatCounts, setSeatCounts]       = useState({ total: 14, available: 14 });
+  const [seatSaving, setSeatSaving]       = useState(false);
   const [departureTime, setDepartureTime] = useState(null);
   const [delayMinutes, setDelayMinutes]   = useState(0);
   const [statusUpdating, setStatusUpdating] = useState(false);
@@ -836,11 +975,23 @@ export default function DriverDashboard() {
   const [fleetTrips, setFleetTrips]       = useState([]);
   const [fleetLiveData, setFleetLiveData] = useState({});
 
+  // ── Contact numbers ──
+  const [contactNumbers, setContactNumbers]         = useState(getStoredContactNumbers());
+  const [newContactNumber, setNewContactNumber]     = useState('');
+  const [contactsSaving, setContactsSaving]         = useState(false);
+  const [contactsError, setContactsError]           = useState('');
+  const [showContactEditor, setShowContactEditor]   = useState(false);
+
   const seatSyncedRef = useRef(false);
   const watchIdRef    = useRef(null);
   const tripIdRef     = useRef(null);
   const lastFixRef    = useRef(null);
   const userIdRef     = useRef(getStoredUserId());
+
+  // Tracks which trip's seatCounts have been hydrated from the server.
+  // Prevents the initial load from triggering a redundant PATCH.
+  const seatHydratedForTripRef = useRef(null);
+  const seatPersistTimerRef    = useRef(null);
 
   const routeDurationMinutes = useMemo(() => {
     if (!trip?.route?.name) return DEFAULT_ROUTE_DURATION;
@@ -854,6 +1005,7 @@ export default function DriverDashboard() {
     return new Date(departureTime.getTime() + (routeDurationMinutes + delayMinutes) * 60_000);
   }, [departureTime, routeDurationMinutes, delayMinutes]);
 
+  // ── Load driver's trip (seats come from the trip, not the van default) ──
   const fetchMyTrip = useCallback(async (signal, { silent = false } = {}) => {
     if (!silent) setLoading(true);
     if (!silent) setError('');
@@ -865,8 +1017,17 @@ export default function DriverDashboard() {
       setTrip(currentTrip);
       setDepartureTime(null);
       setDelayMinutes(0);
-      const capacity = currentTrip?.van?.capacity ?? 14;
-      setSeatCounts({ total: capacity, available: capacity });
+
+      // Seats persist on the trip row. Prefer those; fall back to van
+      // capacity only when the driver has never touched the controls.
+      const fallbackTotal = currentTrip?.van?.capacity ?? 14;
+      const totalSeats     = currentTrip?.totalSeats     ?? fallbackTotal;
+      const availableSeats = currentTrip?.availableSeats ?? totalSeats;
+      setSeatCounts({ total: totalSeats, available: availableSeats });
+
+      // Mark this trip as hydrated so the persistence effect skips the
+      // very first render where seatCounts changes as a result of the fetch.
+      seatHydratedForTripRef.current = currentTrip?.id ?? null;
     } catch (err) {
       if (err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') return;
       if (!silent) {
@@ -909,6 +1070,69 @@ export default function DriverDashboard() {
     }
   }, []);
 
+  // ── Contact numbers ──
+  const fetchContactNumbers = useCallback(async (signal) => {
+    try {
+      const response = await apiClient.get('/drivers/me/contact-numbers', { signal });
+      const numbers = Array.isArray(response.data?.contactNumbers)
+        ? response.data.contactNumbers
+        : [];
+      setContactNumbers(numbers);
+      persistContactNumbersLocally(numbers);
+    } catch (err) {
+      if (err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') return;
+      // Endpoint might not exist yet — fall back to whatever's in localStorage.
+      console.warn('[DriverDashboard] fetchContactNumbers failed (using local cache):', err?.message);
+    }
+  }, []);
+
+  const saveContactNumbers = useCallback(async (nextNumbers) => {
+    setContactsSaving(true);
+    setContactsError('');
+    try {
+      await apiClient.patch('/drivers/me/contact-numbers', { contactNumbers: nextNumbers });
+      persistContactNumbersLocally(nextNumbers);
+    } catch (err) {
+      const msg = err?.response?.data?.error ?? 'Failed to save. Try again.';
+      setContactsError(msg);
+      // Revert to the last-known-good list so UI doesn't lie to the driver.
+      setContactNumbers(contactNumbers);
+      console.error('[DriverDashboard] saveContactNumbers failed:', err);
+    } finally {
+      setContactsSaving(false);
+    }
+  }, [contactNumbers]);
+
+  const handleAddContact = useCallback(() => {
+    const trimmed = newContactNumber.trim();
+    if (!trimmed) return;
+    if (!PHONE_RE.test(trimmed)) {
+      setContactsError('Enter a valid phone number (digits only, 7–15 chars).');
+      return;
+    }
+    if (contactNumbers.includes(trimmed)) {
+      setContactsError('That number is already on your list.');
+      return;
+    }
+    if (contactNumbers.length >= MAX_CONTACT_NUMBERS) {
+      setContactsError(`Maximum of ${MAX_CONTACT_NUMBERS} numbers.`);
+      return;
+    }
+    const next = [...contactNumbers, trimmed];
+    setContactNumbers(next);
+    setNewContactNumber('');
+    setContactsError('');
+    saveContactNumbers(next);
+  }, [newContactNumber, contactNumbers, saveContactNumbers]);
+
+  const handleRemoveContact = useCallback((number) => {
+    const next = contactNumbers.filter((n) => n !== number);
+    setContactNumbers(next);
+    setContactsError('');
+    saveContactNumbers(next);
+  }, [contactNumbers, saveContactNumbers]);
+
+  // ── GPS ──
   const clearWatch = useCallback(() => {
     if (watchIdRef.current !== null) {
       navigator.geolocation.clearWatch(watchIdRef.current);
@@ -1059,7 +1283,7 @@ export default function DriverDashboard() {
       localStorage.removeItem('token');
       localStorage.removeItem('user');
     } catch {
-      // ignore storage access errors (e.g. private browsing restrictions)
+      // ignore storage access errors
     }
 
     window.location.replace('/login');
@@ -1076,16 +1300,27 @@ export default function DriverDashboard() {
     setLastCoords(null);
     setMaxSpeedKmh(0);
     lastFixRef.current = null;
-    const capacity = newTrip?.van?.capacity ?? 14;
-    setSeatCounts({ total: capacity, available: capacity });
+
+    // Prefer the trip's persisted seat counts (in case the driver is
+    // re-attaching to a trip that was created earlier) — fall back to
+    // the van capacity only if the trip doesn't carry them yet.
+    const fallbackTotal = newTrip?.van?.capacity ?? 14;
+    const totalSeats     = newTrip?.totalSeats     ?? fallbackTotal;
+    const availableSeats = newTrip?.availableSeats ?? totalSeats;
+    setSeatCounts({ total: totalSeats, available: availableSeats });
+
+    seatHydratedForTripRef.current = newTrip.id;
+
     setFleetTrips((prev) => (prev.some((t) => t.id === newTrip.id) ? prev : [...prev, newTrip]));
   }, []);
 
+  // ── Effects ──
   useEffect(() => {
     const controller = new AbortController();
     fetchMyTrip(controller.signal);
+    fetchContactNumbers(controller.signal);
     return () => { controller.abort(); stopLocationSharing(); socket.disconnect(); };
-  }, [fetchMyTrip, stopLocationSharing]);
+  }, [fetchMyTrip, fetchContactNumbers, stopLocationSharing]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -1097,6 +1332,46 @@ export default function DriverDashboard() {
     return () => { controller.abort(); clearInterval(id); };
   }, [fetchFleetTrips]);
 
+  // ── Seat persistence ────────────────────────────────────────────────────
+  // Every seatCounts change (after the initial hydration for a given trip)
+  // is PATCHed to the backend, debounced so rapid +/- taps collapse into
+  // one request. The trip row then carries the seat count through every
+  // status change and across logout/login.
+  useEffect(() => {
+    const tripId = trip?.id;
+    if (!tripId) {
+      seatHydratedForTripRef.current = null;
+      return;
+    }
+    // First pass for this trip = the initial hydration fetch. Skip it.
+    if (seatHydratedForTripRef.current !== tripId) {
+      seatHydratedForTripRef.current = tripId;
+      return;
+    }
+    if (GPS_LOCKED_STATUSES.includes(trip?.status)) return;
+
+    if (seatPersistTimerRef.current) clearTimeout(seatPersistTimerRef.current);
+    seatPersistTimerRef.current = setTimeout(async () => {
+      setSeatSaving(true);
+      try {
+        await apiClient.patch(`/trips/${tripId}/seats`, {
+          availableSeats: seatCounts.available,
+          totalSeats:     seatCounts.total,
+        });
+      } catch (err) {
+        // Non-fatal — the UI keeps the value locally; next successful tap retries.
+        console.warn('[DriverDashboard] seat persist failed:', err?.message);
+      } finally {
+        setSeatSaving(false);
+      }
+    }, SEAT_PERSIST_DEBOUNCE_MS);
+
+    return () => {
+      if (seatPersistTimerRef.current) clearTimeout(seatPersistTimerRef.current);
+    };
+  }, [trip?.id, trip?.status, seatCounts.available, seatCounts.total]);
+
+  // ── Socket wiring ──
   useEffect(() => {
     const emitRegistration = () => {
       socket.emit('subscribe_to_map');
@@ -1211,25 +1486,6 @@ export default function DriverDashboard() {
     startLocationSharing();
   }, [pendingAutoStart, trip?.id, gpsState, startLocationSharing]);
 
-  // Seat updates now broadcast throughout every active status, not just
-  // BOARDING — previously this effect stopped emitting the instant the
-  // trip left BOARDING, so any seat change a driver made afterward (e.g.
-  // a passenger drop-off mid-route) never reached the dispatcher or public
-  // map. The SeatManagerPanel below is visible for the same set of statuses,
-  // so the control and the broadcast stay in sync.
-  useEffect(() => {
-    const tripId     = trip?.id;
-    const tripStatus = trip?.status;
-    if (!tripId || GPS_LOCKED_STATUSES.includes(tripStatus)) return;
-    socket.connect();
-    socket.emit('seat_update', {
-      tripId,
-      availableSeats: seatCounts.available,
-      totalSeats:     seatCounts.total,
-    });
-    seatSyncedRef.current = true;
-  }, [trip?.id, trip?.status, seatCounts.available, seatCounts.total]);
-
   useEffect(() => {
     if (!trip?.id || !eta) return;
     socket.emit('eta_update', {
@@ -1316,9 +1572,6 @@ export default function DriverDashboard() {
     gpsState !== GPS_STATE.LIVE &&
     gpsState !== GPS_STATE.ACQUIRING;
 
-  // Seat controls stay visible for every active status short of the fully
-  // locked ones (SCHEDULED never applies to a self-started driver trip;
-  // COMPLETED/CANCELLED have no seats left to manage).
   const showSeatManager = trip && !GPS_LOCKED_STATUSES.includes(trip.status);
 
   return (
@@ -1339,6 +1592,30 @@ export default function DriverDashboard() {
           </button>
         </header>
 
+        {/* Contact numbers — collapsed by default, expandable */}
+        <div className="border-b border-gray-100 pb-3">
+          <button
+            onClick={() => setShowContactEditor((s) => !s)}
+            className="flex items-center justify-between w-full text-xs font-bold text-slate-600 hover:text-slate-800 py-1"
+            aria-expanded={showContactEditor}
+          >
+            <span>📞 My contact numbers ({contactNumbers.length})</span>
+            <span aria-hidden="true">{showContactEditor ? '▲' : '▼'}</span>
+          </button>
+          {showContactEditor && (
+            <ContactNumbersPanel
+              numbers={contactNumbers}
+              newNumber={newContactNumber}
+              onNewNumberChange={setNewContactNumber}
+              onAdd={handleAddContact}
+              onRemove={handleRemoveContact}
+              saving={contactsSaving}
+              error={contactsError}
+              onClose={() => setShowContactEditor(false)}
+            />
+          )}
+        </div>
+
         <FleetMap fleetTrips={fleetTrips} fleetLiveData={fleetLiveData} ownTripId={trip?.id} />
 
         {!trip ? (
@@ -1351,6 +1628,7 @@ export default function DriverDashboard() {
             {showSeatManager && (
               <SeatManagerPanel
                 seatCounts={seatCounts}
+                saving={seatSaving}
                 onDecrTotal={decreaseTotalSeats}
                 onIncrTotal={increaseTotalSeats}
                 onDecrAvail={decreaseAvailableSeats}
