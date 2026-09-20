@@ -130,6 +130,19 @@ function normaliseFix(input) {
   };
 }
 
+/**
+ * Resolves a trip's seat count with a single shared rule used everywhere
+ * seats are displayed: prefer the live socket-reported count, fall back to
+ * the van's registered capacity so a number always renders — even before
+ * the first `seat_update_broadcast` arrives — rather than showing nothing.
+ */
+function resolveSeatInfo(trip, liveEntry) {
+  const total = liveEntry?.totalSeats ?? trip.van?.capacity ?? null;
+  const available = liveEntry?.availableSeats ?? trip.van?.capacity ?? null;
+  const isLive = liveEntry?.availableSeats !== undefined;
+  return { available, total, isLive };
+}
+
 // ─── Icons ───────────────────────────────────────────────────────────────────
 
 const statusIconCache = new Map();
@@ -226,6 +239,36 @@ function EmptyState({ icon, text }) {
   );
 }
 
+/**
+ * Compact seat pill reused in every card + the selected van panel, so seat
+ * availability is visible at every stage of a trip, not just while boarding.
+ * `isLive` renders a small pulsing dot to signal the count is a real-time
+ * socket value rather than the van's default capacity fallback.
+ */
+function SeatPill({ available, total, isLive, size = 'sm' }) {
+  if (available === null) return null;
+  const isFull = available === 0;
+  const sizeCls = size === 'lg' ? 'text-sm px-3 py-1.5' : 'text-xs px-2 py-1';
+
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 rounded-full font-bold whitespace-nowrap ${sizeCls} ${
+        isFull
+          ? 'bg-gray-100 text-gray-500 border border-gray-200'
+          : 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+      }`}
+    >
+      {isLive && !isFull && (
+        <span className="relative flex h-1.5 w-1.5">
+          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+          <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-emerald-500" />
+        </span>
+      )}
+      🪑 {isFull ? 'Full' : `${available}${total != null ? `/${total}` : ''} seats`}
+    </span>
+  );
+}
+
 async function fetchOsrmRoute(startCoords, endCoords, signal) {
   const [startLat, startLng] = startCoords;
   const [endLat, endLng] = endCoords;
@@ -280,7 +323,10 @@ export default function PublicTracking() {
           if (!fix) continue;
           const existing = next[trip.id];
           if (!existing || (fix.lastSeen ?? 0) > (existing.lastSeen ?? 0)) {
-            next[trip.id] = fix;
+            // Preserve any seat data already known for this trip — a fresh
+            // GPS-only fix from the HTTP snapshot shouldn't wipe out a seat
+            // count we already received over the socket.
+            next[trip.id] = { ...fix, availableSeats: existing?.availableSeats, totalSeats: existing?.totalSeats };
           }
         }
         return next;
@@ -319,7 +365,7 @@ export default function PublicTracking() {
           if (!fix) continue;
           const existing = next[tripId];
           if (!existing || (fix.lastSeen ?? 0) > (existing.lastSeen ?? 0)) {
-            next[tripId] = fix;
+            next[tripId] = { ...fix, availableSeats: existing?.availableSeats, totalSeats: existing?.totalSeats };
           }
         }
         return next;
@@ -336,6 +382,11 @@ export default function PublicTracking() {
       }));
     };
 
+    // Seat updates apply throughout the trip's life, not just BOARDING — the
+    // driver's app can emit this any time capacity changes, and this handler
+    // never restricts by status, so the count stays current everywhere it's
+    // shown (Boarding cards, On the Road cards, Selected Van panel) without
+    // needing a page refresh.
     const onSeatUpdate = (data) => {
       if (!data?.tripId || typeof data.availableSeats !== 'number') return;
       setLiveData((prev) => ({
@@ -500,6 +551,7 @@ export default function PublicTracking() {
   const selectedStatusCfg = selectedTrip
     ? STATUS_CONFIG[selectedTrip.status] ?? STATUS_CONFIG.DEPARTED
     : null;
+  const selectedSeatInfo = selectedTrip ? resolveSeatInfo(selectedTrip, selectedTripLive) : null;
 
   const selectedTripPosition = useMemo(() => {
     if (!selectedTrip) return null;
@@ -687,6 +739,7 @@ export default function PublicTracking() {
               const data = liveData[trip.id];
               const { position, isTrusted } = resolveTripPosition(trip);
               const isSelected = selectedTripId === trip.id;
+              const seatInfo = resolveSeatInfo(trip, data);
 
               if (!position) return null;
 
@@ -720,6 +773,9 @@ export default function PublicTracking() {
                             : trip.status === 'DEPARTED'
                             ? ' · En route'
                             : ` · ${STATUS_CONFIG[trip.status]?.label ?? trip.status}`}
+                        </div>
+                        <div>
+                          <SeatPill available={seatInfo.available} total={seatInfo.total} isLive={seatInfo.isLive} />
                         </div>
                         <div className="text-xs font-semibold text-gray-700">
                           {speedLabel(data?.smoothedSpeed)}
@@ -798,8 +854,8 @@ export default function PublicTracking() {
                 <div className="space-y-3">
                   {boardingTrips.map((trip) => {
                     const data = liveData[trip.id];
-                    const seatsLeft = data?.availableSeats ?? trip.van?.capacity ?? 0;
-                    const isFull = seatsLeft === 0;
+                    const seatInfo = resolveSeatInfo(trip, data);
+                    const isFull = seatInfo.available === 0;
                     const isSelected = selectedTripId === trip.id;
                     const gps = resolveTripPosition(trip);
 
@@ -830,38 +886,45 @@ export default function PublicTracking() {
                             </div>
                           </div>
 
-                          <div className={`shrink-0 text-center px-3 py-2 rounded-lg min-w-[56px] ${
-                            isFull
-                              ? 'bg-gray-200 text-gray-500'
-                              : seatsLeft === 0
-                              ? 'bg-gray-100 text-gray-400'
-                              : 'bg-white shadow-sm border border-emerald-100 text-emerald-700'
-                          }`}>
-                            <div className="text-xl font-black leading-none">{seatsLeft}</div>
+                          <div
+                            className={`shrink-0 text-center px-3 py-2 rounded-lg min-w-[56px] ${
+                              isFull
+                                ? 'bg-gray-200 text-gray-500'
+                                : 'bg-white shadow-sm border border-emerald-100 text-emerald-700'
+                            }`}
+                          >
+                            <div className="text-xl font-black leading-none">
+                              {seatInfo.available ?? '—'}
+                            </div>
                             <div className="text-[9px] font-bold uppercase mt-0.5">
                               {isFull ? 'Full' : 'Left'}
                             </div>
                           </div>
                         </div>
 
-                        <div className="mt-2 text-xs font-semibold">
-                          {gps.position ? (
-                            <span className="text-emerald-700 flex items-center gap-1.5">
-                              <span className="relative flex h-1.5 w-1.5">
-                                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
-                                <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-emerald-500" />
-                              </span>
-                              Sharing live location
-                              {typeof gps.accuracy === 'number' && (
-                                <span className="text-emerald-500 font-normal">
-                                  ±{Math.round(gps.accuracy)}m
+                        <div className="mt-2 flex items-center justify-between gap-2">
+                          <span className="text-xs font-semibold">
+                            {gps.position ? (
+                              <span className="text-emerald-700 flex items-center gap-1.5">
+                                <span className="relative flex h-1.5 w-1.5">
+                                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
+                                  <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-emerald-500" />
                                 </span>
-                              )}
-                            </span>
-                          ) : (
-                            <span className="text-gray-400 font-medium">
-                              Waiting for driver's GPS…
-                            </span>
+                                Sharing live location
+                                {typeof gps.accuracy === 'number' && (
+                                  <span className="text-emerald-500 font-normal">
+                                    ±{Math.round(gps.accuracy)}m
+                                  </span>
+                                )}
+                              </span>
+                            ) : (
+                              <span className="text-gray-400 font-medium">
+                                Waiting for driver's GPS…
+                              </span>
+                            )}
+                          </span>
+                          {seatInfo.isLive && (
+                            <span className="text-[10px] text-emerald-500 font-semibold shrink-0">seats live</span>
                           )}
                         </div>
                       </button>
@@ -888,6 +951,7 @@ export default function PublicTracking() {
                   {drivingTrips.map((trip) => {
                     const data = liveData[trip.id];
                     const gps = resolveTripPosition(trip);
+                    const seatInfo = resolveSeatInfo(trip, data);
                     const isSelected = selectedTripId === trip.id;
                     const isLowAccuracy =
                       gps.hasFix &&
@@ -918,6 +982,13 @@ export default function PublicTracking() {
                           <span className={`shrink-0 text-xs font-bold px-2 py-1 rounded border ${STATUS_CONFIG[trip.status]?.cls ?? STATUS_CONFIG.DEPARTED.cls}`}>
                             {STATUS_CONFIG[trip.status]?.label ?? trip.status}
                           </span>
+                        </div>
+
+                        {/* Seats stay visible at this stage too — passengers */}
+                        {/* deciding whether to wait for the next van need to  */}
+                        {/* know remaining capacity even after it has departed. */}
+                        <div className="mb-2">
+                          <SeatPill available={seatInfo.available} total={seatInfo.total} isLive={seatInfo.isLive} />
                         </div>
 
                         {gps.position ? (
@@ -992,8 +1063,16 @@ export default function PublicTracking() {
                     </button>
                   </div>
 
-                  <div className={`inline-flex text-xs font-bold px-2 py-1 rounded border ${selectedStatusCfg.cls}`}>
-                    {selectedStatusCfg.label}
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className={`inline-flex text-xs font-bold px-2 py-1 rounded border ${selectedStatusCfg.cls}`}>
+                      {selectedStatusCfg.label}
+                    </span>
+                    <SeatPill
+                      available={selectedSeatInfo.available}
+                      total={selectedSeatInfo.total}
+                      isLive={selectedSeatInfo.isLive}
+                      size="lg"
+                    />
                   </div>
 
                   <div className="text-sm text-gray-600 space-y-1">
@@ -1032,12 +1111,6 @@ export default function PublicTracking() {
                       <p className="text-xs text-amber-700 bg-amber-50 border border-amber-100 rounded-lg px-3 py-2">
                         No live GPS fix right now — the van's position isn't being plotted until the
                         driver's phone reports an accurate location.
-                      </p>
-                    )}
-                    {selectedTripLive?.availableSeats !== undefined && (
-                      <p>
-                        <span className="font-semibold text-gray-900">Seats:</span>{' '}
-                        {selectedTripLive.availableSeats}/{selectedTripLive.totalSeats ?? selectedTrip.van?.capacity ?? '?'} available
                       </p>
                     )}
                   </div>
