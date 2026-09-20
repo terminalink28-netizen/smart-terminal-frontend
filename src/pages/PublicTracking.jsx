@@ -269,6 +269,16 @@ function SeatPill({ available, total, isLive, size = 'sm' }) {
   );
 }
 
+/** Small reusable contact-number line — used in cards, popup, and the panel. */
+function DriverContact({ number, className = '' }) {
+  if (!number) return null;
+  return (
+    <span className={`inline-flex items-center gap-1 text-xs font-semibold text-gray-500 ${className}`}>
+      📞 {number}
+    </span>
+  );
+}
+
 async function fetchOsrmRoute(startCoords, endCoords, signal) {
   const [startLat, startLng] = startCoords;
   const [endLat, endLng] = endCoords;
@@ -349,7 +359,6 @@ export default function PublicTracking() {
 
     const onConnect = () => {
       setSocketStatus('connected');
-      // Re-subscribe on every (re)connect so we always get a fresh snapshot.
       socket.emit('subscribe_to_map');
     };
     const onDisconnect = () => setSocketStatus('disconnected');
@@ -382,11 +391,9 @@ export default function PublicTracking() {
       }));
     };
 
-    // Seat updates apply throughout the trip's life, not just BOARDING — the
-    // driver's app can emit this any time capacity changes, and this handler
-    // never restricts by status, so the count stays current everywhere it's
-    // shown (Boarding cards, On the Road cards, Selected Van panel) without
-    // needing a page refresh.
+    // Seat updates apply throughout the trip's life, not just BOARDING — this
+    // handler never restricts by status, so the count stays current
+    // everywhere it's shown without needing a page refresh.
     const onSeatUpdate = (data) => {
       if (!data?.tripId || typeof data.availableSeats !== 'number') return;
       setLiveData((prev) => ({
@@ -509,12 +516,6 @@ export default function PublicTracking() {
     [activeTrips]
   );
 
-  /**
-   * A trip's plottable position — the driver's phone fix, or null.
-   * A fix is plottable only when lat/lng arrived AND it's fresh AND
-   * accuracy is null or ≤ UNUSABLE_ACCURACY_M AND the backend didn't
-   * flag it untrusted.
-   */
   const resolveTripPosition = useCallback((trip) => {
     const data = liveData[trip.id];
     if (!data) return { position: null, hasFix: false, isStale: false, isTrusted: false, accuracy: null };
@@ -766,9 +767,7 @@ export default function PublicTracking() {
                         <div className="font-bold text-gray-900 text-sm leading-snug">
                           {trip.driver?.name || 'Assigned Driver'}
                         </div>
-                        {trip.driver?.contactNumber && (
-                          <div className="text-xs text-gray-500">📞 {trip.driver.contactNumber}</div>
-                        )}
+                        <DriverContact number={trip.driver?.contactNumber} />
                         <div className="text-xs text-gray-500 font-semibold uppercase tracking-wide truncate">
                           <span className="text-emerald-700">{trip.van?.plateNumber ?? '—'}</span>
                           {trip.status === 'BOARDING'
@@ -887,6 +886,7 @@ export default function PublicTracking() {
                                 {trip.van?.plateNumber ?? 'Unknown plate'}
                               </span>
                             </div>
+                            <DriverContact number={trip.driver?.contactNumber} className="mt-1" />
                           </div>
 
                           <div
@@ -980,6 +980,7 @@ export default function PublicTracking() {
                             <div className="text-xs text-gray-400 font-bold uppercase tracking-widest mt-0.5 truncate">
                               <span className="text-blue-700">{trip.van?.plateNumber ?? '—'}</span>
                             </div>
+                            <DriverContact number={trip.driver?.contactNumber} className="mt-1" />
                           </div>
 
                           <span className={`shrink-0 text-xs font-bold px-2 py-1 rounded border ${STATUS_CONFIG[trip.status]?.cls ?? STATUS_CONFIG.DEPARTED.cls}`}>
