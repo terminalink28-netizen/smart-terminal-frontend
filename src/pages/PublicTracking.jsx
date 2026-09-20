@@ -131,16 +131,56 @@ function normaliseFix(input) {
 }
 
 /**
- * Resolves a trip's seat count with a single shared rule used everywhere
- * seats are displayed: prefer the live socket-reported count, fall back to
- * the van's registered capacity so a number always renders — even before
- * the first `seat_update_broadcast` arrives — rather than showing nothing.
+ * Resolves a trip's seat count.
+ *
+ * Priority:
+ *   1. Live socket value (`seat_update_broadcast`) — reflects the very latest
+ *      change the instant the driver taps +/−.
+ *   2. Persisted trip row (`trip.availableSeats` / `trip.totalSeats`) — the
+ *      authoritative count that carries across every phase and survives a
+ *      page refresh, logout, or 30 s poll cycle before the next socket push
+ *      arrives.
+ *   3. Van's registered capacity — final fallback so we always render a
+ *      number instead of blank.
+ *
+ * The previous version only checked (1) and (3), which is why seat counts
+ * appeared to "reset" on cold load: the HTTP response carries the persisted
+ * count on the trip, not inside `liveLocation`.
  */
 function resolveSeatInfo(trip, liveEntry) {
-  const total = liveEntry?.totalSeats ?? trip.van?.capacity ?? null;
-  const available = liveEntry?.availableSeats ?? trip.van?.capacity ?? null;
-  const isLive = liveEntry?.availableSeats !== undefined;
+  const liveAvailable = liveEntry?.availableSeats;
+  const liveTotal     = liveEntry?.totalSeats;
+  const tripAvailable = typeof trip?.availableSeats === 'number' ? trip.availableSeats : null;
+  const tripTotal     = typeof trip?.totalSeats     === 'number' ? trip.totalSeats     : null;
+  const vanCapacity   = trip?.van?.capacity ?? null;
+
+  const available = liveAvailable ?? tripAvailable ?? vanCapacity;
+  const total     = liveTotal     ?? tripTotal     ?? vanCapacity ?? available;
+
+  // Only flag as "live" when we have an actual socket value — a count read
+  // off the trip row is authoritative but not pushed in real time.
+  const isLive = typeof liveAvailable === 'number';
+
   return { available, total, isLive };
+}
+
+/**
+ * Returns the driver's contact numbers as an array, regardless of which
+ * shape the backend sends.
+ *
+ * New accounts write `contactNumbers: string[]`; older accounts only have
+ * the singular `contactNumber`. This collapses both into one array so every
+ * call site (popup, cards, panel) renders all numbers consistently.
+ */
+function getDriverContacts(driver) {
+  if (!driver) return [];
+  if (Array.isArray(driver.contactNumbers) && driver.contactNumbers.length > 0) {
+    return driver.contactNumbers.filter(Boolean);
+  }
+  if (typeof driver.contactNumber === 'string' && driver.contactNumber) {
+    return [driver.contactNumber];
+  }
+  return [];
 }
 
 // ─── Icons ───────────────────────────────────────────────────────────────────
@@ -243,10 +283,10 @@ function EmptyState({ icon, text }) {
  * Compact seat pill reused in every card + the selected van panel, so seat
  * availability is visible at every stage of a trip, not just while boarding.
  * `isLive` renders a small pulsing dot to signal the count is a real-time
- * socket value rather than the van's default capacity fallback.
+ * socket value rather than a persisted/snapshot value.
  */
 function SeatPill({ available, total, isLive, size = 'sm' }) {
-  if (available === null) return null;
+  if (available === null || available === undefined) return null;
   const isFull = available === 0;
   const sizeCls = size === 'lg' ? 'text-sm px-3 py-1.5' : 'text-xs px-2 py-1';
 
@@ -269,12 +309,31 @@ function SeatPill({ available, total, isLive, size = 'sm' }) {
   );
 }
 
-/** Small reusable contact-number line — used in cards, popup, and the panel. */
-function DriverContact({ number, className = '' }) {
-  if (!number) return null;
+/**
+ * Renders every contact number the driver has on file. Accepts the driver
+ * object and pulls from either the new array field or the legacy singular
+ * field, so this works before and after the schema rollout.
+ *
+ *   variant="stacked" — one per line, used in the map popup and Selected Van panel
+ *   variant="inline"  — comma-separated on one line, used in the compact cards
+ */
+function DriverContacts({ driver, variant = 'inline', className = '' }) {
+  const numbers = getDriverContacts(driver);
+  if (numbers.length === 0) return null;
+
+  if (variant === 'stacked') {
+    return (
+      <div className={`space-y-0.5 ${className}`}>
+        {numbers.map((n) => (
+          <div key={n} className="text-xs text-gray-500">📞 {n}</div>
+        ))}
+      </div>
+    );
+  }
+
   return (
-    <span className={`inline-flex items-center gap-1 text-xs font-semibold text-gray-500 ${className}`}>
-      📞 {number}
+    <span className={`text-xs font-semibold text-gray-500 ${className}`}>
+      📞 {numbers.join(' · ')}
     </span>
   );
 }
@@ -335,7 +394,8 @@ export default function PublicTracking() {
           if (!existing || (fix.lastSeen ?? 0) > (existing.lastSeen ?? 0)) {
             // Preserve any seat data already known for this trip — a fresh
             // GPS-only fix from the HTTP snapshot shouldn't wipe out a seat
-            // count we already received over the socket.
+            // count we already received over the socket. (Seat values on the
+            // trip row itself are read by resolveSeatInfo, not stored here.)
             next[trip.id] = { ...fix, availableSeats: existing?.availableSeats, totalSeats: existing?.totalSeats };
           }
         }
@@ -393,7 +453,8 @@ export default function PublicTracking() {
 
     // Seat updates apply throughout the trip's life, not just BOARDING — this
     // handler never restricts by status, so the count stays current
-    // everywhere it's shown without needing a page refresh.
+    // everywhere it's shown without needing a page refresh. The backend
+    // emits this whenever the driver persists a change via PATCH /seats.
     const onSeatUpdate = (data) => {
       if (!data?.tripId || typeof data.availableSeats !== 'number') return;
       setLiveData((prev) => ({
@@ -767,7 +828,7 @@ export default function PublicTracking() {
                         <div className="font-bold text-gray-900 text-sm leading-snug">
                           {trip.driver?.name || 'Assigned Driver'}
                         </div>
-                        <DriverContact number={trip.driver?.contactNumber} />
+                        <DriverContacts driver={trip.driver} variant="stacked" />
                         <div className="text-xs text-gray-500 font-semibold uppercase tracking-wide truncate">
                           <span className="text-emerald-700">{trip.van?.plateNumber ?? '—'}</span>
                           {trip.status === 'BOARDING'
@@ -886,7 +947,7 @@ export default function PublicTracking() {
                                 {trip.van?.plateNumber ?? 'Unknown plate'}
                               </span>
                             </div>
-                            <DriverContact number={trip.driver?.contactNumber} className="mt-1" />
+                            <DriverContacts driver={trip.driver} className="block mt-1" />
                           </div>
 
                           <div
@@ -980,7 +1041,7 @@ export default function PublicTracking() {
                             <div className="text-xs text-gray-400 font-bold uppercase tracking-widest mt-0.5 truncate">
                               <span className="text-blue-700">{trip.van?.plateNumber ?? '—'}</span>
                             </div>
-                            <DriverContact number={trip.driver?.contactNumber} className="mt-1" />
+                            <DriverContacts driver={trip.driver} className="block mt-1" />
                           </div>
 
                           <span className={`shrink-0 text-xs font-bold px-2 py-1 rounded border ${STATUS_CONFIG[trip.status]?.cls ?? STATUS_CONFIG.DEPARTED.cls}`}>
@@ -1092,11 +1153,13 @@ export default function PublicTracking() {
                         ? 'Returning to Terminal'
                         : 'Heading out'}
                     </p>
-                    {selectedTrip.driver?.contactNumber && (
-                      <p>
-                        <span className="font-semibold text-gray-900">Driver contact:</span>{' '}
-                        {selectedTrip.driver.contactNumber}
-                      </p>
+                    {getDriverContacts(selectedTrip.driver).length > 0 && (
+                      <div>
+                        <span className="font-semibold text-gray-900">Driver contact:</span>
+                        <div className="mt-0.5">
+                          <DriverContacts driver={selectedTrip.driver} variant="stacked" />
+                        </div>
+                      </div>
                     )}
                     {selectedTripPosition ? (
                       <>
