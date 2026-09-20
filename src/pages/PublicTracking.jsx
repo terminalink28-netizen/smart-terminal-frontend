@@ -766,6 +766,9 @@ export default function PublicTracking() {
                         <div className="font-bold text-gray-900 text-sm leading-snug">
                           {trip.driver?.name || 'Assigned Driver'}
                         </div>
+                        {trip.driver?.contactNumber && (
+                          <div className="text-xs text-gray-500">📞 {trip.driver.contactNumber}</div>
+                        )}
                         <div className="text-xs text-gray-500 font-semibold uppercase tracking-wide truncate">
                           <span className="text-emerald-700">{trip.van?.plateNumber ?? '—'}</span>
                           {trip.status === 'BOARDING'
@@ -1088,6 +1091,12 @@ export default function PublicTracking() {
                         ? 'Returning to Terminal'
                         : 'Heading out'}
                     </p>
+                    {selectedTrip.driver?.contactNumber && (
+                      <p>
+                        <span className="font-semibold text-gray-900">Driver contact:</span>{' '}
+                        {selectedTrip.driver.contactNumber}
+                      </p>
+                    )}
                     {selectedTripPosition ? (
                       <>
                         <p>
