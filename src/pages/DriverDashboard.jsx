@@ -13,8 +13,12 @@ const GPS_OPTIONS = { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 };
 
 const GPS_LOCKED_STATUSES = ['SCHEDULED', 'COMPLETED', 'CANCELLED'];
 
-// The official terminal name — matches PublicTracking.jsx exactly so the
-// two screens never drift apart on naming again.
+// Every status where the backend's handleQrScan actually accepts a scan
+// (see SCAN_TRANSITIONS in trip.controller.js). The QR must stay visible
+// throughout this whole window, not just at the final ARRIVING step —
+// dispatch can scan it at departure, mid-route, or on arrival.
+const QR_SCANNABLE_STATUSES = ['DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'];
+
 const HOME_TERMINAL_NAME = 'Provincial Integrated Transport Terminal and Business Complex';
 const HOME_TERMINAL_SHORT = 'Terminal';
 
@@ -297,11 +301,18 @@ function TripManifest({ trip, eta, delayMinutes }) {
   );
 }
 
-function BoardingPanel({ seatCounts, onDecrTotal, onIncrTotal, onDecrAvail, onIncrAvail }) {
+// ── SeatManagerPanel ─────────────────────────────────────────────────────────
+// Previously only shown while status === 'BOARDING'. Now shown throughout
+// every active status (anything the driver can be in short of the locked
+// states) — passenger counts can genuinely change mid-route (a drop-off,
+// a pickup arranged by the dispatcher), and hiding the control the moment
+// boarding ends meant the driver had no way to correct the count afterward.
+
+function SeatManagerPanel({ seatCounts, onDecrTotal, onIncrTotal, onDecrAvail, onIncrAvail }) {
   return (
-    <section className="bg-green-50 p-5 rounded-xl border-2 border-green-200" aria-label="Passenger boarding controls">
+    <section className="bg-green-50 p-5 rounded-xl border-2 border-green-200" aria-label="Seat availability controls">
       <h2 className="text-sm font-bold text-green-900 text-center uppercase tracking-wider mb-4">
-        Passenger boarding
+        Seat availability
       </h2>
       <div className="flex items-center justify-between bg-white px-4 py-3 rounded-lg border border-green-100 mb-5">
         <span className="text-sm font-semibold text-gray-600">Total capacity</span>
@@ -399,15 +410,6 @@ function FleetMap({ fleetTrips, fleetLiveData, ownTripId }) {
   );
 }
 
-/**
- * LiveTrackingCard — now auto-aware.
- *
- * When the backend pushes `start_tracking` (which happens automatically the
- * moment the trip enters BOARDING), the parent calls startLocationSharing()
- * directly. This card just reflects whatever state we're in. The manual
- * "Share live location" button remains as an explicit fallback in case the
- * auto-start didn't fire (e.g. socket was offline at the moment of boarding).
- */
 function LiveTrackingCard({
   trip,
   gpsState,
@@ -548,7 +550,36 @@ function ETACountdown({ eta }) {
   );
 }
 
-function CompletionQrPanel({ van, onRefresh }) {
+// ── TripQrPanel ──────────────────────────────────────────────────────────────
+// Was previously only rendered at ARRIVING for trip completion. The backend's
+// handleQrScan actually accepts a scan at DEPARTING, DEPARTED, ARRIVING, and
+// DELAYED (see SCAN_TRANSITIONS) — one scan of this same QR advances the trip
+// through whichever transition matches its current status. So this panel
+// now stays visible across that whole window with status-appropriate copy,
+// instead of only appearing once, right before the trip ends.
+
+const QR_PANEL_COPY = {
+  DEPARTING: {
+    title: 'Ready to roll 🚦',
+    subtitle: "Show this to your dispatcher at the terminal — they'll scan it to confirm your departure.",
+  },
+  DEPARTED: {
+    title: 'On the road 🚐',
+    subtitle: 'This same code works at any checkpoint — your dispatcher can scan it to confirm your arrival when you reach the terminal.',
+  },
+  DELAYED: {
+    title: 'Delayed ⏱️',
+    subtitle: 'Once you\'re moving again, your dispatcher can scan this to confirm the next checkpoint.',
+  },
+  ARRIVING: {
+    title: "You've arrived 🎉",
+    subtitle: "Show this to your dispatcher — they'll scan it to confirm the trip is complete.",
+  },
+};
+
+function TripQrPanel({ trip, onRefresh }) {
+  const van = trip?.van;
+
   if (!van?.qrToken) {
     return (
       <section className="bg-amber-50 border border-amber-200 rounded-xl p-5 text-center">
@@ -558,12 +589,15 @@ function CompletionQrPanel({ van, onRefresh }) {
     );
   }
 
+  const copy = QR_PANEL_COPY[trip.status] ?? {
+    title: 'Trip QR code',
+    subtitle: 'Show this to your dispatcher at the next checkpoint.',
+  };
+
   return (
-    <section className="bg-white border-2 border-indigo-200 rounded-2xl p-6 text-center" aria-label="Trip completion QR code">
-      <p className="text-sm font-bold text-indigo-900 mb-1">You've arrived 🎉</p>
-      <p className="text-xs text-indigo-500 mb-4">
-        Show this code to your dispatcher — they'll scan it to confirm the trip is complete.
-      </p>
+    <section className="bg-white border-2 border-indigo-200 rounded-2xl p-6 text-center" aria-label="Trip checkpoint QR code">
+      <p className="text-sm font-bold text-indigo-900 mb-1">{copy.title}</p>
+      <p className="text-xs text-indigo-500 mb-4">{copy.subtitle}</p>
       <div className="flex justify-center mb-4">
         <div className="p-4 bg-white rounded-xl border-2 border-indigo-100 shadow-sm">
           <QRCodeSVG value={van.qrToken} size={180} />
@@ -581,7 +615,7 @@ function StatusControlPanel({ trip, delayMinutes, eta, statusUpdating, onAdvance
   if (!trip) return null;
 
   const step = STATUS_FLOW.find((s) => s.key === trip.status);
-  const isArriving = trip.status === 'ARRIVING';
+  const showQr = QR_SCANNABLE_STATUSES.includes(trip.status);
   const showEta = ETA_ACTIVE_STATUSES.includes(trip.status) && ['DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'].includes(trip.status);
 
   return (
@@ -627,7 +661,11 @@ function StatusControlPanel({ trip, delayMinutes, eta, statusUpdating, onAdvance
         </div>
       )}
 
-      {isArriving && <CompletionQrPanel van={trip.van} onRefresh={onRefresh} />}
+      {showQr && (
+        <div className={step ? 'mt-4' : undefined}>
+          <TripQrPanel trip={trip} onRefresh={onRefresh} />
+        </div>
+      )}
 
       {ETA_ACTIVE_STATUSES.includes(trip.status) && trip.status !== 'BOARDING' && (
         <>
@@ -793,11 +831,8 @@ export default function DriverDashboard() {
   const [delayMinutes, setDelayMinutes]   = useState(0);
   const [statusUpdating, setStatusUpdating] = useState(false);
 
-  // Set when the backend tells us to auto-start tracking (fires when the
-  // trip enters BOARDING). Cleared once we've actually started the watch.
   const [pendingAutoStart, setPendingAutoStart] = useState(null);
 
-  // ── Fleet map state — mirrors PublicTracking.jsx's data model exactly ────
   const [fleetTrips, setFleetTrips]       = useState([]);
   const [fleetLiveData, setFleetLiveData] = useState({});
 
@@ -843,10 +878,6 @@ export default function DriverDashboard() {
     }
   }, []);
 
-  // Fetches the same public live-trips list PublicTracking.jsx uses, so the
-  // fleet map has plate numbers and driver names to show for every van, and
-  // seeds fleetLiveData from `liveLocation` so markers appear on first paint
-  // without waiting for a socket event.
   const fetchFleetTrips = useCallback(async (signal) => {
     try {
       const response = await apiClient.get('/trips/live', { signal });
@@ -939,8 +970,6 @@ export default function DriverDashboard() {
 
         lastFixRef.current = { lat, lng, timestamp };
 
-        // The event name the backend socket layer listens for. Payload shape
-        // matches what PublicTracking.jsx renders on the public map.
         socket.emit('driver_location', {
           tripId: tripIdRef.current,
           lat,
@@ -959,8 +988,6 @@ export default function DriverDashboard() {
           setMaxSpeedKmh((prev) => Math.max(prev, kmh));
         }
 
-        // Reflect our own movement in the fleet map immediately, without
-        // waiting for the round-trip broadcast back from the server.
         setFleetLiveData((prev) => ({
           ...prev,
           [tripIdRef.current]: {
@@ -1060,8 +1087,6 @@ export default function DriverDashboard() {
     return () => { controller.abort(); stopLocationSharing(); socket.disconnect(); };
   }, [fetchMyTrip, stopLocationSharing]);
 
-  // Fleet map data source: fetch the live trips list once, then refresh it
-  // periodically as a fallback in case a socket event is missed.
   useEffect(() => {
     const controller = new AbortController();
     fetchFleetTrips(controller.signal);
@@ -1072,11 +1097,6 @@ export default function DriverDashboard() {
     return () => { controller.abort(); clearInterval(id); };
   }, [fetchFleetTrips]);
 
-  // ── Socket wiring ────────────────────────────────────────────────────────
-  // On connect we:
-  //   1. subscribe to the public map (so the fleet map receives van_moved),
-  //   2. register as a driver so the backend can target us with
-  //      start_tracking / stop_tracking (auto GPS control).
   useEffect(() => {
     const emitRegistration = () => {
       socket.emit('subscribe_to_map');
@@ -1154,11 +1174,6 @@ export default function DriverDashboard() {
     };
     socket.on('trip_status_changed', onFleetTripStatusChanged);
 
-    // ── Auto GPS control ──────────────────────────────────────────────────
-    // The backend fires `start_tracking` the instant our trip enters
-    // BOARDING (self-start, dispatcher create, or status change). We queue
-    // a pending auto-start, and an effect below flips the actual watch on
-    // once our trip is loaded and matches.
     const onStartTracking = ({ tripId } = {}) => {
       if (!tripId) return;
       console.log('[DriverDashboard] start_tracking received for trip', tripId);
@@ -1167,7 +1182,6 @@ export default function DriverDashboard() {
     socket.on('start_tracking', onStartTracking);
 
     const onStopTracking = ({ tripId } = {}) => {
-      // If the payload doesn't specify a trip, stop whatever we're running.
       if (tripId && tripIdRef.current && tripId !== tripIdRef.current) return;
       console.log('[DriverDashboard] stop_tracking received');
       setPendingAutoStart(null);
@@ -1186,9 +1200,6 @@ export default function DriverDashboard() {
     };
   }, [stopLocationSharing]);
 
-  // Once our trip is loaded and its id matches the pending auto-start, turn
-  // on GPS. This handles the race where start_tracking arrives before
-  // fetchMyTrip has finished.
   useEffect(() => {
     if (!pendingAutoStart) return;
     if (trip?.id !== pendingAutoStart) return;
@@ -1200,10 +1211,16 @@ export default function DriverDashboard() {
     startLocationSharing();
   }, [pendingAutoStart, trip?.id, gpsState, startLocationSharing]);
 
+  // Seat updates now broadcast throughout every active status, not just
+  // BOARDING — previously this effect stopped emitting the instant the
+  // trip left BOARDING, so any seat change a driver made afterward (e.g.
+  // a passenger drop-off mid-route) never reached the dispatcher or public
+  // map. The SeatManagerPanel below is visible for the same set of statuses,
+  // so the control and the broadcast stay in sync.
   useEffect(() => {
     const tripId     = trip?.id;
     const tripStatus = trip?.status;
-    if (!tripId || tripStatus !== 'BOARDING') return;
+    if (!tripId || GPS_LOCKED_STATUSES.includes(tripStatus)) return;
     socket.connect();
     socket.emit('seat_update', {
       tripId,
@@ -1238,7 +1255,6 @@ export default function DriverDashboard() {
     return () => socket.off('disconnect', handleDisconnect);
   }, [gpsState, clearWatch]);
 
-  // Listen for the dispatcher's QR scan completing OUR OWN trip in real time.
   useEffect(() => {
     const handleRemoteStatusChange = (payload) => {
       if (!payload?.tripId || payload.tripId !== tripIdRef.current) return;
@@ -1295,12 +1311,15 @@ export default function DriverDashboard() {
     );
   }
 
-  // Auto-start is "armed" when we have a BOARDING trip and haven't started
-  // sharing yet — that's when the backend will push start_tracking.
   const autoArmed =
     trip?.status === 'BOARDING' &&
     gpsState !== GPS_STATE.LIVE &&
     gpsState !== GPS_STATE.ACQUIRING;
+
+  // Seat controls stay visible for every active status short of the fully
+  // locked ones (SCHEDULED never applies to a self-started driver trip;
+  // COMPLETED/CANCELLED have no seats left to manage).
+  const showSeatManager = trip && !GPS_LOCKED_STATUSES.includes(trip.status);
 
   return (
     <div className="min-h-screen bg-gray-100 p-4 font-sans flex flex-col">
@@ -1329,8 +1348,8 @@ export default function DriverDashboard() {
 
             <TripManifest trip={trip} eta={eta} delayMinutes={delayMinutes} />
 
-            {trip.status === 'BOARDING' && (
-              <BoardingPanel
+            {showSeatManager && (
+              <SeatManagerPanel
                 seatCounts={seatCounts}
                 onDecrTotal={decreaseTotalSeats}
                 onIncrTotal={increaseTotalSeats}
