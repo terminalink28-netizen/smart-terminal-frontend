@@ -8,10 +8,10 @@ import QRScannerModal from '../components/QRScannerModal';
 import CreateTripModal from '../components/CreateTripModal';
 import { VIRAC_HUB, getCoordinatesForDestination } from '../components/townCoordinates';
 
+// ─── leaflet default icon fix (kept for any component still using the default) ─
+
 import icon from 'leaflet/dist/images/marker-icon.png';
 import iconShadow from 'leaflet/dist/images/marker-shadow.png';
-
-// ─── leaflet default icon fix ─────────────────────────────────────────────────
 
 const DefaultIcon = L.icon({
   iconUrl:    icon,
@@ -27,6 +27,17 @@ const MAP_ZOOM           = 10;
 const SUCCESS_BANNER_TTL = 5000; // ms
 const REFETCH_INTERVAL_MS = 30_000;
 
+// The official terminal name — matches PublicTracking.jsx and
+// DriverDashboard.jsx exactly. Previously this file used a substring check
+// (`isViracHub`) that only worked because the old name happened to contain
+// "virac" — it silently stopped matching anything once the terminal name
+// changed, breaking the BOARDING-position fallback below.
+const HOME_TERMINAL_NAME = 'Provincial Integrated Transport Terminal and Business Complex';
+
+function isHomeTerminal(name) {
+  return typeof name === 'string' && name.trim().toLowerCase() === HOME_TERMINAL_NAME.toLowerCase();
+}
+
 const STATUS_STYLES = {
   BOARDING:   'bg-green-100 text-green-800 border border-green-200',
   DEPARTING:  'bg-amber-100 text-amber-800 border border-amber-200',
@@ -36,6 +47,49 @@ const STATUS_STYLES = {
   COMPLETED:  'bg-gray-100  text-gray-600  border border-gray-200',
 };
 
+// ── Per-status marker styling — identical palette to PublicTracking.jsx and
+// DriverDashboard.jsx's fleet map. Previously every van on this map used one
+// fixed blue icon regardless of status — the same inconsistency fixed on
+// the other two maps earlier now fixed here too, so a dispatcher glancing
+// at the map gets the same visual language as the public tracking page.
+const STATUS_MARKER_STYLE = {
+  BOARDING:  { glyph: '🧍', color: '#16a34a' },
+  DEPARTING: { glyph: '🚦', color: '#d97706' },
+  DEPARTED:  { glyph: '🚐', color: '#2563eb' },
+  ARRIVING:  { glyph: '📍', color: '#059669' },
+  DELAYED:   { glyph: '⏱️', color: '#ea580c' },
+};
+const DEFAULT_MARKER_STYLE = { glyph: '🚐', color: '#6b7280' };
+
+const statusIconCache = new Map();
+function getVanIconForStatus(status) {
+  if (statusIconCache.has(status)) return statusIconCache.get(status);
+  const { glyph, color } = STATUS_MARKER_STYLE[status] ?? DEFAULT_MARKER_STYLE;
+  const icon = L.divIcon({
+    className: '',
+    html: `
+      <div style="
+        font-size:18px;
+        background:white;
+        border-radius:50%;
+        padding:4px;
+        border:3px solid ${color};
+        width:36px;
+        height:36px;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        box-shadow:0 4px 12px ${color}59;
+      ">${glyph}</div>
+    `,
+    iconSize: [36, 36],
+    iconAnchor: [18, 18],
+    popupAnchor: [0, -22],
+  });
+  statusIconCache.set(status, icon);
+  return icon;
+}
+
 function mpsToKph(mps) {
   return Math.round((mps ?? 0) * 3.6);
 }
@@ -43,10 +97,6 @@ function mpsToKph(mps) {
 function formatSpeed(mps) {
   const kph = mpsToKph(mps);
   return kph > 0 ? `${kph} km/h` : 'Stopped';
-}
-
-function isViracHub(name) {
-  return typeof name === 'string' && name.toLowerCase().includes('virac');
 }
 
 // ─── sub-components ───────────────────────────────────────────────────────────
@@ -286,8 +336,6 @@ export default function DispatcherDashboard() {
   const [selectedTripId, setSelectedTripId] = useState(null);
   const [reloadToken, setReloadToken]     = useState(0);
 
-  // Vans currently at the terminal (IDLE or BOARDING) — separate from
-  // activeTrips, since IDLE vans have no trip at all.
   const [terminalVans, setTerminalVans]   = useState([]);
   const [terminalLoading, setTerminalLoading] = useState(true);
   const [terminalError, setTerminalError] = useState('');
@@ -333,7 +381,6 @@ export default function DispatcherDashboard() {
     }
   }, []);
 
-  // Set up 30-second polling fallback (Same as PublicTracker)
   useEffect(() => {
     const id = setInterval(() => {
       const ctrl = new AbortController();
@@ -373,10 +420,6 @@ export default function DispatcherDashboard() {
       );
     };
 
-    // FIX: Safely remove trips when they are completed or cancelled.
-    // Also refresh the terminal list here — a status change (BOARDING ->
-    // DEPARTING, or -> COMPLETED which frees the van back to IDLE) always
-    // means the terminal's set of "vans physically here" just changed.
     const handleTripStatusChanged = ({ tripId, status, trip }) => {
       if (!tripId) return;
       setActiveTrips((prev) => {
@@ -391,9 +434,6 @@ export default function DispatcherDashboard() {
       fetchTerminalVans();
     };
 
-    // FIX: Instantly add new trips started by drivers. A driver self-starting
-    // a trip means a van just went IDLE -> BOARDING — still at the terminal,
-    // so the terminal list needs a refresh too, not just activeTrips.
     const handleTripDispatched = ({ trip }) => {
       if (!trip?.id) return;
       setActiveTrips((prev) => (prev.some((t) => t.id === trip.id) ? prev : [trip, ...prev]));
@@ -408,7 +448,7 @@ export default function DispatcherDashboard() {
     socket.on('seat_update',           handleSeatUpdate);           // Legacy support
     socket.on('seat_update_broadcast', handleSeatUpdate);           // New broadcast
     socket.on('trip_status_changed',   handleTripStatusChanged);
-    socket.on('trip_dispatched',       handleTripDispatched);       // Listens for brand new trips
+    socket.on('trip_dispatched',       handleTripDispatched);
 
     return () => {
       controller.abort();
@@ -431,9 +471,6 @@ export default function DispatcherDashboard() {
     successTimerRef.current = setTimeout(() => setSuccessMessage(''), SUCCESS_BANNER_TTL);
   }, []);
 
-  // A successful QR scan can move a trip all the way to COMPLETED (freeing
-  // the van to IDLE) — refresh both lists so the terminal panel picks up
-  // the van immediately instead of waiting for the next 30s poll.
   const handleScanSuccess = useCallback((result) => {
     showSuccess(typeof result === 'string' ? result : 'QR scan successful.');
     fetchActiveTrips();
@@ -464,7 +501,6 @@ export default function DispatcherDashboard() {
   const handleTripSelect = useCallback((tripId) => {
     setSelectedTripId((prev) => (prev === tripId ? null : tripId));
     
-    // Smooth camera pan if location exists
     const loc = liveLocations[tripId];
     if (loc && mapRef.current) {
       mapRef.current.setView([loc.lat, loc.lng], 14, { animate: true });
@@ -477,10 +513,6 @@ export default function DispatcherDashboard() {
     } catch (err) {
       console.error('[DispatcherDashboard] Logout error:', err);
     } finally {
-      // Both keys must go — ProtectedRoute and Login's redirect-if-logged-in
-      // effect both key off 'user', but the Bearer token in localStorage is
-      // a separate credential that also needs clearing (see the driver
-      // dashboard fix for the full explanation of this bug).
       localStorage.removeItem('token');
       localStorage.removeItem('user');
       navigate('/login', { replace: true });
@@ -502,29 +534,6 @@ export default function DispatcherDashboard() {
       .reduce((acc, t) => acc + mpsToKph(liveLocations[t.id]?.speed), 0) / liveCount
   );
 
-  // ─── custom icons ─────────────────────────────────────────────────────────────
-
-const vanIcon = L.divIcon({
-  className: '',
-  html: `
-    <div style="
-      font-size:18px;
-      background:white;
-      border-radius:50%;
-      padding:4px;
-      border:3px solid #3b82f6; /* Blue border to match dispatcher theme */
-      width:36px;
-      height:36px;
-      display:flex;
-      align-items:center;
-      justify-content:center;
-      box-shadow:0 4px 12px rgba(59,130,246,0.35);
-    ">🚐</div>
-  `,
-  iconSize: [36, 36],
-  iconAnchor: [18, 18],
-  popupAnchor: [0, -22],
-});
   // ── Render States ──────────────────────────────────────────────────────────
 
   if (loading) {
@@ -678,14 +687,13 @@ const vanIcon = L.divIcon({
               const hasGps = typeof loc?.lat === 'number' && typeof loc?.lng === 'number';
               const isSelected = selectedTripId === trip.id;
 
-              // FIX: Pin Boarding vans to their terminal just like Public Tracking
               let position = null;
               if (hasGps) {
                 position = [loc.lat, loc.lng];
               } else if (trip.status === 'BOARDING') {
                 const originName = trip.route?.origin ?? trip.route?.name?.split('→')[0]?.trim();
                 position = getCoordinatesForDestination(originName) ?? 
-                           (isViracHub(originName) ? VIRAC_HUB : null);
+                           (isHomeTerminal(originName) ? VIRAC_HUB : null);
               }
 
               if (!position) return null;
@@ -694,7 +702,7 @@ const vanIcon = L.divIcon({
                 <Marker
                   key={trip.id}
                   position={position}
-                  icon={vanIcon} // <-- Add the custom icon here
+                  icon={getVanIconForStatus(trip.status)}
                   eventHandlers={{ click: () => handleTripSelect(trip.id) }}
                 >
                   <Popup className="dispatcher-popup">
