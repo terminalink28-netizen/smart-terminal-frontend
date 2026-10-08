@@ -713,14 +713,14 @@ export default function DispatcherDashboard() {
             {activeTrips.length} {activeTrips.length === 1 ? 'Trip' : 'Trips'}
           </span>
 
-          <button
-            onClick={handleLogout}
-            aria-label="Log out"
-            className="bg-slate-700/50 hover:bg-slate-700 active:bg-slate-800 text-white text-sm font-bold h-10 px-3 rounded-lg transition-colors border border-slate-600 flex items-center gap-1.5"
-          >
-            <span aria-hidden="true">🚪</span>
-            <span className="hidden sm:inline">Logout</span>
-          </button>
+          <button 
+  onClick={handleLogout} 
+  aria-label="Log out" 
+  className="bg-red-500/10 hover:bg-red-500/20 active:bg-red-500/30 text-red-500 hover:text-red-400 text-sm font-bold h-10 px-4 rounded-lg transition-colors border border-red-500/30 hover:border-red-500/50 flex items-center"
+>
+  Logout
+</button>
+
         </div>
 
         {/* Primary actions — big, full-width thumb targets on phones */}
