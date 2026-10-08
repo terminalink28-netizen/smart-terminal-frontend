@@ -5,16 +5,25 @@ import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import apiClient from '../api/axios';
 import { socket } from '../api/socket';
-import { VIRAC_HUB, getCoordinatesForDestination } from '../components/townCoordinates';
+import { VIRAC_HUB } from '../components/townCoordinates';
 
 // ─── constants ────────────────────────────────────────────────────────────────
+//
+// A trip is a ROUND TRIP made of two legs, tracked by `trip.direction`:
+//
+//   OUTBOUND  municipality → terminal
+//     BOARDING → DEPARTING → DEPARTED → ARRIVING
+//     At ARRIVING the driver shows a QR code. The dispatcher's scan checks
+//     the van into its cooperative's terminal line: first in line goes
+//     straight to BOARDING (RETURN leg), otherwise QUEUED.
+//
+//   RETURN    terminal → municipality
+//     (QUEUED →) BOARDING → DEPARTING → DEPARTED → ARRIVING
+//     No scan at the municipality — the driver taps "Finish Trip".
 
 const GPS_OPTIONS = { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 };
 
 const GPS_LOCKED_STATUSES = ['SCHEDULED', 'COMPLETED', 'CANCELLED'];
-
-// Every status where the backend's handleQrScan actually accepts a scan.
-const QR_SCANNABLE_STATUSES = ['DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'];
 
 const HOME_TERMINAL_NAME = 'Provincial Integrated Transport Terminal and Business Complex';
 const HOME_TERMINAL_SHORT = 'Terminal';
@@ -33,6 +42,7 @@ const STATUS_COPY = {
   DEPARTING:  { label: 'Preparing to Depart', icon: '🚦' },
   DEPARTED:   { label: 'On the Road',         icon: '🚐' },
   ARRIVING:   { label: 'Arriving Soon',       icon: '📍' },
+  QUEUED:     { label: 'Queued at Terminal',  icon: '🅿️' },
   DELAYED:    { label: 'Delayed',             icon: '⏱️' },
   COMPLETED:  { label: 'Trip Completed',      icon: '✅' },
   CANCELLED:  { label: 'Cancelled',           icon: '✕' },
@@ -43,17 +53,12 @@ const STATUS_STYLES = {
   DEPARTING:  'bg-amber-100  text-amber-800  border border-amber-200',
   DEPARTED:   'bg-blue-100   text-blue-800   border border-blue-200',
   ARRIVING:   'bg-indigo-100 text-indigo-800 border border-indigo-200',
+  QUEUED:     'bg-amber-100  text-amber-800  border border-amber-300',
   DELAYED:    'bg-orange-100 text-orange-800 border border-orange-200',
   COMPLETED:  'bg-gray-100   text-gray-600   border border-gray-200',
   CANCELLED:  'bg-red-100    text-red-700    border border-red-200',
   SCHEDULED:  'bg-yellow-100 text-yellow-800 border border-yellow-200',
 };
-
-const STATUS_FLOW = [
-  { key: 'BOARDING',  next: 'DEPARTING', actionLabel: '🚦 Ready to Depart',      actionHint: 'Tap once all passengers are seated.' },
-  { key: 'DEPARTING', next: 'DEPARTED',  actionLabel: '🚐 Confirm Departure',    actionHint: "Tap the moment you actually pull out." },
-  { key: 'DEPARTED',  next: 'ARRIVING',  actionLabel: '📍 Approaching Terminal', actionHint: "Tap when you're close to the terminal." },
-];
 
 const MUNICIPALITIES = [
   { name: 'Bato',       minutes: 30,  emoji: '🏘️' },
@@ -70,9 +75,9 @@ const MUNICIPALITIES = [
 const DEFAULT_ROUTE_DURATION = 60;
 const DELAY_OPTIONS = [5, 10, 15, 30];
 
-const ETA_ACTIVE_STATUSES = ['BOARDING', 'DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'];
-const STEPPER_KEYS = ['BOARDING', 'DEPARTING', 'DEPARTED', 'ARRIVING', 'COMPLETED'];
-const MAP_VISIBLE_STATUSES = ['BOARDING', 'DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'];
+const ETA_STATUSES = ['DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'];
+const DELAY_REPORT_STATUSES = ['DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'];
+const MAP_VISIBLE_STATUSES = ['BOARDING', 'QUEUED', 'DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'];
 
 const GPS_STATE = { IDLE: 'IDLE', ACQUIRING: 'ACQUIRING', LIVE: 'LIVE', ERROR: 'ERROR' };
 
@@ -86,6 +91,7 @@ const FLEET_GPS_STALE_THRESHOLD_MS = 120_000;
 // ── Per-status marker styling — identical palette to PublicTracking.jsx ────
 const STATUS_MARKER_STYLE = {
   BOARDING:  { glyph: '🧍', color: '#16a34a' },
+  QUEUED:    { glyph: '🅿️', color: '#d97706' },
   DEPARTING: { glyph: '🚦', color: '#d97706' },
   DEPARTED:  { glyph: '🚐', color: '#2563eb' },
   ARRIVING:  { glyph: '📍', color: '#059669' },
@@ -222,6 +228,73 @@ function friendlyStatus(status) {
   return STATUS_COPY[status] ?? { label: status ?? 'Unknown', icon: '•' };
 }
 
+function getDirection(trip) {
+  return trip?.direction === 'RETURN' ? 'RETURN' : 'OUTBOUND';
+}
+
+function shortPlace(name) {
+  if (isHomeTerminal(name)) return HOME_TERMINAL_SHORT;
+  return (name ?? 'Unknown').replace(/\s*Terminal$/i, '');
+}
+
+function originName(trip) {
+  return trip?.route?.origin ?? trip?.route?.name?.split('→')[0]?.trim() ?? 'Unknown';
+}
+
+// Where the van is heading on its CURRENT leg.
+function legDestinationLabel(trip) {
+  return getDirection(trip) === 'RETURN' ? shortPlace(originName(trip)) : HOME_TERMINAL_SHORT;
+}
+
+// Where the van started its CURRENT leg.
+function legOriginLabel(trip) {
+  return getDirection(trip) === 'RETURN' ? HOME_TERMINAL_SHORT : shortPlace(originName(trip));
+}
+
+// The single driver-facing button for the current status (null when the
+// driver has nothing to tap — e.g. waiting for the dispatcher's scan).
+function getAdvanceStep(trip) {
+  if (!trip) return null;
+  const dest = legDestinationLabel(trip);
+  switch (trip.status) {
+    case 'BOARDING':
+      return { next: 'DEPARTING', actionLabel: '🚦 Ready to Depart', actionHint: 'Tap once all passengers are seated.' };
+    case 'DEPARTING':
+      return { next: 'DEPARTED', actionLabel: '🚐 Confirm Departure', actionHint: 'Tap the moment you actually pull out.' };
+    case 'DEPARTED':
+      return { next: 'ARRIVING', actionLabel: `📍 Approaching ${dest}`, actionHint: `Tap when you're close to ${dest}.` };
+    default:
+      return null;
+  }
+}
+
+function getStepperSteps(trip) {
+  return [
+    { key: 'BOARDING',  icon: '🧍' },
+    { key: 'DEPARTING', icon: '🚦' },
+    { key: 'DEPARTED',  icon: '🚐' },
+    { key: 'ARRIVING',  icon: '📍' },
+    getDirection(trip) === 'RETURN'
+      ? { key: 'COMPLETED', icon: '✅' }
+      : { key: 'CHECKIN',   icon: '🅿️' },
+  ];
+}
+
+// Keeps the van's QR token when a socket broadcast (which doesn't carry it)
+// replaces the trip object.
+function mergeTrip(prev, updated) {
+  if (!prev || prev.id !== updated.id) return updated;
+  return {
+    ...prev,
+    ...updated,
+    van: {
+      ...(prev.van ?? {}),
+      ...(updated.van ?? {}),
+      qrToken: updated.van?.qrToken ?? prev.van?.qrToken,
+    },
+  };
+}
+
 // ─── sub-components ───────────────────────────────────────────────────────────
 
 function StatusBadge({ status }) {
@@ -234,18 +307,18 @@ function StatusBadge({ status }) {
   );
 }
 
-function TripProgressStepper({ status }) {
-  const idx = STEPPER_KEYS.indexOf(status);
+function TripProgressStepper({ trip }) {
+  const steps = getStepperSteps(trip);
+  const idx = steps.findIndex((s) => s.key === trip.status);
   if (idx === -1) return null;
 
   return (
     <div className="flex items-center" aria-label="Trip progress">
-      {STEPPER_KEYS.map((key, i) => {
+      {steps.map((step, i) => {
         const isDone    = i < idx;
         const isCurrent = i === idx;
-        const { icon } = friendlyStatus(key);
         return (
-          <div key={key} className="flex items-center flex-1 last:flex-none">
+          <div key={step.key} className="flex items-center flex-1 last:flex-none">
             <div className="flex flex-col items-center gap-1">
               <div
                 className={`w-8 h-8 rounded-full flex items-center justify-center text-sm border-2 transition-colors ${
@@ -257,10 +330,10 @@ function TripProgressStepper({ status }) {
                 }`}
                 aria-current={isCurrent ? 'step' : undefined}
               >
-                {isDone ? '✓' : icon}
+                {isDone ? '✓' : step.icon}
               </div>
             </div>
-            {i < STEPPER_KEYS.length - 1 && (
+            {i < steps.length - 1 && (
               <div className={`flex-1 h-1 mx-1 rounded-full ${isDone ? 'bg-green-500' : 'bg-gray-200'}`} />
             )}
           </div>
@@ -284,15 +357,21 @@ function SeatProgressBar({ available, total }) {
 }
 
 function TripManifest({ trip, eta, delayMinutes }) {
-  const origin = trip.route?.origin ?? trip.route?.name?.split('→')[0]?.trim() ?? 'Unknown';
+  const direction = getDirection(trip);
+  const from = legOriginLabel(trip);
+  const to   = legDestinationLabel(trip);
+  const coop = trip.van?.cooperative?.name;
+
   const fields = [
-    { label: 'From',        value: origin },
-    { label: 'Destination', value: trip.route?.destination ?? HOME_TERMINAL_NAME },
+    { label: 'Leg',         value: direction === 'RETURN' ? '↩ Return trip' : '↗ Outbound trip' },
+    { label: 'From',        value: from },
+    { label: 'Destination', value: to },
     { label: 'Van plate',   value: trip.van?.plateNumber ?? 'Unknown' },
+    ...(coop ? [{ label: 'Cooperative', value: coop }] : []),
     { label: 'Capacity',    value: trip.van?.capacity ?? '—' },
     { label: 'Status',      value: <StatusBadge status={trip.status} /> },
     {
-      label: 'Departure',
+      label: 'Trip started',
       value: trip.scheduledTime
         ? new Date(trip.scheduledTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
         : '—',
@@ -315,7 +394,7 @@ function TripManifest({ trip, eta, delayMinutes }) {
       <div className="flex items-center justify-between mb-3 border-b border-slate-200 pb-2">
         <h2 className="text-sm font-bold text-slate-700 uppercase tracking-wider">Trip manifest</h2>
         <span className="text-xs font-semibold text-slate-500">
-          {origin} <span className="text-slate-300 mx-1">→</span> {trip.route?.destination ?? HOME_TERMINAL_SHORT}
+          {from} <span className="text-slate-300 mx-1">→</span> {to}
         </span>
       </div>
       <dl className="grid grid-cols-2 gap-y-3 text-sm">
@@ -331,9 +410,6 @@ function TripManifest({ trip, eta, delayMinutes }) {
 }
 
 // ── SeatManagerPanel ───────────────────────────────────────────────────────
-// Shown throughout every active status — the count persists to the backend,
-// so whatever the driver sets during boarding carries through departure,
-// the road, and arrival, and survives logout/login.
 
 function SeatManagerPanel({ seatCounts, saving, onDecrTotal, onIncrTotal, onDecrAvail, onIncrAvail }) {
   return (
@@ -371,7 +447,7 @@ function SeatManagerPanel({ seatCounts, saving, onDecrTotal, onIncrTotal, onDecr
         </div>
         <SeatProgressBar available={seatCounts.available} total={seatCounts.total} />
         <p className="text-[11px] text-green-600 mt-3">
-          Counts are saved automatically and stay with this trip until it ends.
+          Counts are saved automatically and reset to full when the return trip begins.
         </p>
       </div>
     </section>
@@ -379,8 +455,6 @@ function SeatManagerPanel({ seatCounts, saving, onDecrTotal, onIncrTotal, onDecr
 }
 
 // ── ContactNumbersPanel ────────────────────────────────────────────────────
-// Drivers can keep up to 5 numbers on file. The whole list is saved with
-// one PATCH, so removing + adding in one go is a single round-trip.
 
 function ContactNumbersPanel({
   numbers,
@@ -694,26 +768,8 @@ function ETACountdown({ eta }) {
 }
 
 // ── TripQrPanel ────────────────────────────────────────────────────────────
-// Visible across the whole QR-scannable window (DEPARTING → ARRIVING).
-
-const QR_PANEL_COPY = {
-  DEPARTING: {
-    title: 'Ready to roll 🚦',
-    subtitle: "Show this to your dispatcher at the terminal — they'll scan it to confirm your departure.",
-  },
-  DEPARTED: {
-    title: 'On the road 🚐',
-    subtitle: 'This same code works at any checkpoint — your dispatcher can scan it to confirm your arrival when you reach the terminal.',
-  },
-  DELAYED: {
-    title: 'Delayed ⏱️',
-    subtitle: "Once you're moving again, your dispatcher can scan this to confirm the next checkpoint.",
-  },
-  ARRIVING: {
-    title: "You've arrived 🎉",
-    subtitle: "Show this to your dispatcher — they'll scan it to confirm the trip is complete.",
-  },
-};
+// Shown ONLY on the outbound leg's ARRIVING status — it's the van's ticket
+// to the dispatcher's terminal check-in scan.
 
 function TripQrPanel({ trip, onRefresh }) {
   const van = trip?.van;
@@ -722,20 +778,21 @@ function TripQrPanel({ trip, onRefresh }) {
     return (
       <section className="bg-amber-50 border border-amber-200 rounded-xl p-5 text-center">
         <p className="text-sm font-semibold text-amber-800">QR code unavailable</p>
-        <p className="text-xs text-amber-600 mt-1">Ask your dispatcher to complete this trip manually.</p>
+        <p className="text-xs text-amber-600 mt-1">Tap refresh below, or ask your dispatcher to check you in manually.</p>
+        <button onClick={onRefresh} className="mt-3 text-xs text-amber-700 hover:text-amber-900 underline underline-offset-2">
+          Refresh
+        </button>
       </section>
     );
   }
 
-  const copy = QR_PANEL_COPY[trip.status] ?? {
-    title: 'Trip QR code',
-    subtitle: 'Show this to your dispatcher at the next checkpoint.',
-  };
-
   return (
-    <section className="bg-white border-2 border-indigo-200 rounded-2xl p-6 text-center" aria-label="Trip checkpoint QR code">
-      <p className="text-sm font-bold text-indigo-900 mb-1">{copy.title}</p>
-      <p className="text-xs text-indigo-500 mb-4">{copy.subtitle}</p>
+    <section className="bg-white border-2 border-indigo-200 rounded-2xl p-6 text-center" aria-label="Terminal check-in QR code">
+      <p className="text-sm font-bold text-indigo-900 mb-1">You've reached the terminal 🎉</p>
+      <p className="text-xs text-indigo-500 mb-4">
+        Show this to your dispatcher. Scanning it checks you into your cooperative's
+        boarding line — first in line starts boarding right away, otherwise you'll be queued.
+      </p>
       <div className="flex justify-center mb-4">
         <div className="p-4 bg-white rounded-xl border-2 border-indigo-100 shadow-sm">
           <QRCodeSVG value={van.qrToken} size={180} />
@@ -749,20 +806,49 @@ function TripQrPanel({ trip, onRefresh }) {
   );
 }
 
-function StatusControlPanel({ trip, delayMinutes, eta, statusUpdating, onAdvance, onAddDelay, onRefresh }) {
+function StatusControlPanel({
+  trip,
+  delayMinutes,
+  eta,
+  statusUpdating,
+  statusError,
+  onAdvance,
+  onAddDelay,
+  onRefresh,
+}) {
   if (!trip) return null;
 
-  const step = STATUS_FLOW.find((s) => s.key === trip.status);
-  const showQr = QR_SCANNABLE_STATUSES.includes(trip.status);
-  const showEta = ETA_ACTIVE_STATUSES.includes(trip.status) && ['DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'].includes(trip.status);
+  const direction = getDirection(trip);
+  const dest = legDestinationLabel(trip);
+  const step = getAdvanceStep(trip);
+
+  const awaitingScan = direction === 'OUTBOUND' && trip.status === 'ARRIVING';
+  const canFinish    = direction === 'RETURN' && trip.status === 'ARRIVING';
+  const isQueued     = trip.status === 'QUEUED';
+  const showEta      = ETA_STATUSES.includes(trip.status);
 
   return (
     <section className="bg-indigo-50 p-4 rounded-xl border-2 border-indigo-200" aria-label="Trip status control">
-      <h2 className="text-sm font-bold text-indigo-900 uppercase tracking-wider mb-4 text-center">Trip status</h2>
+      <h2 className="text-sm font-bold text-indigo-900 uppercase tracking-wider mb-4 text-center">
+        Trip status · {direction === 'RETURN' ? 'Return leg' : 'Outbound leg'}
+      </h2>
 
-      <div className="mb-5 px-1">
-        <TripProgressStepper status={trip.status} />
-      </div>
+      {!isQueued && (
+        <div className="mb-5 px-1">
+          <TripProgressStepper trip={trip} />
+        </div>
+      )}
+
+      {isQueued && (
+        <div className="bg-amber-50 border-2 border-amber-200 rounded-xl p-5 text-center mb-2">
+          <p className="text-3xl mb-1" aria-hidden="true">🅿️</p>
+          <p className="text-sm font-bold text-amber-900">You're checked in and queued</p>
+          <p className="text-xs text-amber-700 mt-1">
+            Another van from your cooperative is boarding right now. You'll move to
+            boarding automatically as soon as it departs — nothing to tap.
+          </p>
+        </div>
+      )}
 
       {trip.status === 'DELAYED' && (
         <div className="bg-orange-50 border border-orange-200 rounded-lg p-3 text-center text-sm text-orange-800 font-semibold mb-4">
@@ -772,7 +858,7 @@ function StatusControlPanel({ trip, delayMinutes, eta, statusUpdating, onAdvance
 
       {showEta && (
         <div className="text-center mb-4">
-          <p className="text-xs text-indigo-500 mb-0.5">Estimated arrival · {HOME_TERMINAL_SHORT}</p>
+          <p className="text-xs text-indigo-500 mb-0.5">Estimated arrival · {dest}</p>
           <p className="text-4xl font-black text-indigo-800 tabular-nums leading-none">
             {eta ? eta.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—'}
           </p>
@@ -799,13 +885,40 @@ function StatusControlPanel({ trip, delayMinutes, eta, statusUpdating, onAdvance
         </div>
       )}
 
-      {showQr && (
-        <div className={step ? 'mt-4' : undefined}>
+      {awaitingScan && (
+        <div className="mt-2">
           <TripQrPanel trip={trip} onRefresh={onRefresh} />
         </div>
       )}
 
-      {ETA_ACTIVE_STATUSES.includes(trip.status) && trip.status !== 'BOARDING' && (
+      {canFinish && (
+        <div className="mt-2 bg-emerald-50 border-2 border-emerald-200 rounded-xl p-5 text-center">
+          <p className="text-3xl mb-1" aria-hidden="true">🏁</p>
+          <p className="text-sm font-bold text-emerald-900">Arriving at {dest}</p>
+          <p className="text-xs text-emerald-700 mt-1 mb-4">
+            No scan needed here. Once your passengers are off, finish the trip.
+          </p>
+          <button onClick={() => onAdvance('COMPLETED')} disabled={statusUpdating}
+            className="w-full bg-emerald-600 hover:bg-emerald-700 active:bg-emerald-800 text-white font-bold py-4 px-4 rounded-xl shadow-sm transition-colors border-b-4 border-emerald-800 active:border-b-0 active:translate-y-0.5 disabled:opacity-60 disabled:cursor-not-allowed"
+            aria-label="Finish trip">
+            {statusUpdating ? (
+              <span className="flex items-center justify-center gap-2">
+                <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                Finishing…
+              </span>
+            ) : '✅ Finish Trip'}
+          </button>
+        </div>
+      )}
+
+      {statusError && (
+        <div role="alert" className="mt-3 flex items-start gap-2 text-sm text-red-700 bg-red-50 border border-red-200 p-3 rounded-xl">
+          <span className="text-base leading-none mt-0.5" aria-hidden="true">⚠️</span>
+          <span className="font-medium">{statusError}</span>
+        </div>
+      )}
+
+      {DELAY_REPORT_STATUSES.includes(trip.status) && (
         <>
           <hr className="border-indigo-200 my-3" />
           <div>
@@ -886,7 +999,8 @@ function TripSetupScreen({ onTripStarted, onRefresh }) {
         <h2 className="text-lg font-black text-gray-900 mt-3">Ready to roll?</h2>
         <p className="text-sm text-gray-500 mt-1">
           Pick your starting municipality. We'll open a trip to{' '}
-          <span className="font-semibold text-gray-700">{HOME_TERMINAL_SHORT}</span>.
+          <span className="font-semibold text-gray-700">{HOME_TERMINAL_SHORT}</span>
+          {' '}and bring you back after.
         </p>
       </div>
 
@@ -969,6 +1083,7 @@ export default function DriverDashboard() {
   const [departureTime, setDepartureTime] = useState(null);
   const [delayMinutes, setDelayMinutes]   = useState(0);
   const [statusUpdating, setStatusUpdating] = useState(false);
+  const [statusError, setStatusError]     = useState('');
 
   const [pendingAutoStart, setPendingAutoStart] = useState(null);
 
@@ -982,9 +1097,9 @@ export default function DriverDashboard() {
   const [contactsError, setContactsError]           = useState('');
   const [showContactEditor, setShowContactEditor]   = useState(false);
 
-  const seatSyncedRef = useRef(false);
   const watchIdRef    = useRef(null);
   const tripIdRef     = useRef(null);
+  const tripRef       = useRef(null);
   const lastFixRef    = useRef(null);
   const userIdRef     = useRef(getStoredUserId());
 
@@ -993,12 +1108,15 @@ export default function DriverDashboard() {
   const seatHydratedForTripRef = useRef(null);
   const seatPersistTimerRef    = useRef(null);
 
+  useEffect(() => { tripRef.current = trip; }, [trip]);
+
   const routeDurationMinutes = useMemo(() => {
-    if (!trip?.route?.name) return DEFAULT_ROUTE_DURATION;
-    const lower = trip.route.name.toLowerCase();
+    const name = trip?.route?.name ?? trip?.route?.origin;
+    if (!name) return DEFAULT_ROUTE_DURATION;
+    const lower = name.toLowerCase();
     const match = MUNICIPALITIES.find((m) => lower.includes(m.name.toLowerCase()));
     return match?.minutes ?? DEFAULT_ROUTE_DURATION;
-  }, [trip?.route?.name]);
+  }, [trip?.route?.name, trip?.route?.origin]);
 
   const eta = useMemo(() => {
     if (!departureTime) return null;
@@ -1012,21 +1130,16 @@ export default function DriverDashboard() {
     try {
       const response    = await apiClient.get('/trips/my-trips', { signal });
       const currentTrip = response.data?.[0] ?? null;
-      tripIdRef.current     = currentTrip?.id ?? null;
-      seatSyncedRef.current = false;
-      setTrip(currentTrip);
+      tripIdRef.current = currentTrip?.id ?? null;
+      setTrip((prev) => (currentTrip ? mergeTrip(prev, currentTrip) : null));
       setDepartureTime(null);
       setDelayMinutes(0);
 
-      // Seats persist on the trip row. Prefer those; fall back to van
-      // capacity only when the driver has never touched the controls.
-      const fallbackTotal = currentTrip?.van?.capacity ?? 14;
+      const fallbackTotal  = currentTrip?.van?.capacity ?? 14;
       const totalSeats     = currentTrip?.totalSeats     ?? fallbackTotal;
       const availableSeats = currentTrip?.availableSeats ?? totalSeats;
       setSeatCounts({ total: totalSeats, available: availableSeats });
 
-      // Mark this trip as hydrated so the persistence effect skips the
-      // very first render where seatCounts changes as a result of the fetch.
       seatHydratedForTripRef.current = currentTrip?.id ?? null;
     } catch (err) {
       if (err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') return;
@@ -1081,7 +1194,6 @@ export default function DriverDashboard() {
       persistContactNumbersLocally(numbers);
     } catch (err) {
       if (err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') return;
-      // Endpoint might not exist yet — fall back to whatever's in localStorage.
       console.warn('[DriverDashboard] fetchContactNumbers failed (using local cache):', err?.message);
     }
   }, []);
@@ -1095,7 +1207,6 @@ export default function DriverDashboard() {
     } catch (err) {
       const msg = err?.response?.data?.error ?? 'Failed to save. Try again.';
       setContactsError(msg);
-      // Revert to the last-known-good list so UI doesn't lie to the driver.
       setContactNumbers(contactNumbers);
       console.error('[DriverDashboard] saveContactNumbers failed:', err);
     } finally {
@@ -1229,30 +1340,76 @@ export default function DriverDashboard() {
     );
   }, [clearWatch]);
 
+  // ── Applies a fresh trip payload from either the driver's own PATCH
+  //    response or a socket broadcast (dispatcher scan, queue promotion).
+  //    • COMPLETED/CANCELLED  → clean up and go back to the setup screen
+  //    • direction flipped    → a new leg began: reset ETA + seats
+  //    • otherwise            → merge, keeping the van's QR token
+  const applyTripUpdate = useCallback((updated) => {
+    if (!updated?.id) return;
+
+    if (updated.status === 'COMPLETED' || updated.status === 'CANCELLED') {
+      stopLocationSharing();
+      const finishedTripId = updated.id;
+      setFleetTrips((prev) => prev.filter((t) => t.id !== finishedTripId));
+      setFleetLiveData((prev) => {
+        const next = { ...prev };
+        delete next[finishedTripId];
+        return next;
+      });
+      tripIdRef.current = null;
+      setTrip(null);
+      setDepartureTime(null);
+      setDelayMinutes(0);
+      setMaxSpeedKmh(0);
+      setStatusError('');
+      fetchMyTrip(undefined, { silent: true });
+      return;
+    }
+
+    const prevTrip = tripRef.current;
+    const directionChanged =
+      prevTrip && prevTrip.id === updated.id && updated.direction && prevTrip.direction !== updated.direction;
+
+    if (directionChanged) {
+      setDepartureTime(null);
+      setDelayMinutes(0);
+      // Passengers got off at the terminal — the van starts the return leg empty.
+      setSeatCounts((prev) => ({ ...prev, available: prev.total }));
+    }
+
+    setTrip((prev) => mergeTrip(prev, updated));
+  }, [stopLocationSharing, fetchMyTrip]);
+
   const handleAdvanceStatus = useCallback(async (newStatus) => {
     if (!tripIdRef.current || !newStatus || statusUpdating) return;
     setStatusUpdating(true);
+    setStatusError('');
     try {
       const response = await apiClient.patch(`/trips/${tripIdRef.current}/status`, { newStatus });
       const updatedTrip = response.data?.trip ?? response.data;
-      if (updatedTrip?.id) {
-        setTrip(updatedTrip);
-      } else {
-        setTrip((prev) => prev ? { ...prev, status: newStatus } : prev);
-      }
 
-      if (newStatus === 'DEPARTING' && !departureTime) {
+      if (newStatus === 'DEPARTING') {
         setDepartureTime(new Date());
         setDelayMinutes(0);
       }
+
+      if (updatedTrip?.id) {
+        applyTripUpdate(updatedTrip);
+      } else {
+        setTrip((prev) => (prev ? { ...prev, status: newStatus } : prev));
+      }
     } catch (err) {
       console.error('[DriverDashboard] status update error:', err);
-      const msg = err?.response?.data?.error ?? err?.response?.data?.message ?? 'Could not update trip status. Try again.';
-      setGpsError(msg);
+      const msg =
+        err?.response?.data?.error ??
+        err?.response?.data?.message ??
+        'Could not update trip status. Try again.';
+      setStatusError(msg);
     } finally {
       setStatusUpdating(false);
     }
-  }, [statusUpdating, departureTime]);
+  }, [statusUpdating, applyTripUpdate]);
 
   const handleAddDelay = useCallback((minutes) => {
     setDelayMinutes((prev) => prev + minutes);
@@ -1290,21 +1447,18 @@ export default function DriverDashboard() {
   }, [stopLocationSharing]);
 
   const handleTripStarted = useCallback((newTrip) => {
-    tripIdRef.current     = newTrip.id;
-    seatSyncedRef.current = false;
+    tripIdRef.current = newTrip.id;
     setTrip(newTrip);
     setDepartureTime(null);
     setDelayMinutes(0);
     setGpsState(GPS_STATE.IDLE);
     setGpsError('');
+    setStatusError('');
     setLastCoords(null);
     setMaxSpeedKmh(0);
     lastFixRef.current = null;
 
-    // Prefer the trip's persisted seat counts (in case the driver is
-    // re-attaching to a trip that was created earlier) — fall back to
-    // the van capacity only if the trip doesn't carry them yet.
-    const fallbackTotal = newTrip?.van?.capacity ?? 14;
+    const fallbackTotal  = newTrip?.van?.capacity ?? 14;
     const totalSeats     = newTrip?.totalSeats     ?? fallbackTotal;
     const availableSeats = newTrip?.availableSeats ?? totalSeats;
     setSeatCounts({ total: totalSeats, available: availableSeats });
@@ -1332,18 +1486,13 @@ export default function DriverDashboard() {
     return () => { controller.abort(); clearInterval(id); };
   }, [fetchFleetTrips]);
 
-  // ── Seat persistence ────────────────────────────────────────────────────
-  // Every seatCounts change (after the initial hydration for a given trip)
-  // is PATCHed to the backend, debounced so rapid +/- taps collapse into
-  // one request. The trip row then carries the seat count through every
-  // status change and across logout/login.
+  // ── Seat persistence (debounced PATCH on every change after hydration) ──
   useEffect(() => {
     const tripId = trip?.id;
     if (!tripId) {
       seatHydratedForTripRef.current = null;
       return;
     }
-    // First pass for this trip = the initial hydration fetch. Skip it.
     if (seatHydratedForTripRef.current !== tripId) {
       seatHydratedForTripRef.current = tripId;
       return;
@@ -1359,7 +1508,6 @@ export default function DriverDashboard() {
           totalSeats:     seatCounts.total,
         });
       } catch (err) {
-        // Non-fatal — the UI keeps the value locally; next successful tap retries.
         console.warn('[DriverDashboard] seat persist failed:', err?.message);
       } finally {
         setSeatSaving(false);
@@ -1451,14 +1599,12 @@ export default function DriverDashboard() {
 
     const onStartTracking = ({ tripId } = {}) => {
       if (!tripId) return;
-      console.log('[DriverDashboard] start_tracking received for trip', tripId);
       setPendingAutoStart(tripId);
     };
     socket.on('start_tracking', onStartTracking);
 
     const onStopTracking = ({ tripId } = {}) => {
       if (tripId && tripIdRef.current && tripId !== tripIdRef.current) return;
-      console.log('[DriverDashboard] stop_tracking received');
       setPendingAutoStart(null);
       stopLocationSharing();
     };
@@ -1511,36 +1657,18 @@ export default function DriverDashboard() {
     return () => socket.off('disconnect', handleDisconnect);
   }, [gpsState, clearWatch]);
 
+  // Status changes pushed from the server for MY trip: the dispatcher's
+  // terminal scan (ARRIVING → BOARDING/QUEUED, direction flips to RETURN),
+  // queue promotion (QUEUED → BOARDING), etc.
   useEffect(() => {
     const handleRemoteStatusChange = (payload) => {
       if (!payload?.tripId || payload.tripId !== tripIdRef.current) return;
-      const updatedTrip = payload.trip;
-      if (!updatedTrip) return;
-
-      if (updatedTrip.status === 'COMPLETED') {
-        stopLocationSharing();
-        const finishedTripId = tripIdRef.current;
-        setFleetTrips((prev) => prev.filter((t) => t.id !== finishedTripId));
-        setFleetLiveData((prev) => {
-          const next = { ...prev };
-          delete next[finishedTripId];
-          return next;
-        });
-        tripIdRef.current = null;
-        setTrip(null);
-        setDepartureTime(null);
-        setDelayMinutes(0);
-        setMaxSpeedKmh(0);
-
-        fetchMyTrip(undefined, { silent: true });
-        return;
-      }
-
-      setTrip(updatedTrip);
+      if (!payload.trip) return;
+      applyTripUpdate(payload.trip);
     };
     socket.on('trip_status_changed', handleRemoteStatusChange);
     return () => socket.off('trip_status_changed', handleRemoteStatusChange);
-  }, [stopLocationSharing, fetchMyTrip]);
+  }, [applyTripUpdate]);
 
   if (loading) {
     return (
@@ -1641,9 +1769,10 @@ export default function DriverDashboard() {
               delayMinutes={delayMinutes}
               eta={eta}
               statusUpdating={statusUpdating}
+              statusError={statusError}
               onAdvance={handleAdvanceStatus}
               onAddDelay={handleAddDelay}
-              onRefresh={() => fetchMyTrip()}
+              onRefresh={() => fetchMyTrip(undefined, { silent: true })}
             />
 
             {gpsError && gpsState !== GPS_STATE.IDLE && gpsState !== GPS_STATE.ERROR && (
