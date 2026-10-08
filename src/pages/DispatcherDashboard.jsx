@@ -27,11 +27,6 @@ const MAP_ZOOM           = 10;
 const SUCCESS_BANNER_TTL = 5000; // ms
 const REFETCH_INTERVAL_MS = 30_000;
 
-// The official terminal name — matches PublicTracking.jsx and
-// DriverDashboard.jsx exactly. Previously this file used a substring check
-// (`isViracHub`) that only worked because the old name happened to contain
-// "virac" — it silently stopped matching anything once the terminal name
-// changed, breaking the BOARDING-position fallback below.
 const HOME_TERMINAL_NAME = 'Provincial Integrated Transport Terminal and Business Complex';
 
 function isHomeTerminal(name) {
@@ -43,20 +38,19 @@ const STATUS_STYLES = {
   DEPARTING:  'bg-amber-100 text-amber-800 border border-amber-200',
   DEPARTED:   'bg-blue-100  text-blue-800  border border-blue-200',
   ARRIVING:   'bg-emerald-100 text-emerald-800 border border-emerald-200',
+  QUEUED:     'bg-amber-100 text-amber-800 border border-amber-300',
   DELAYED:    'bg-orange-100 text-orange-800 border border-orange-200',
   COMPLETED:  'bg-gray-100  text-gray-600  border border-gray-200',
 };
 
 // ── Per-status marker styling — identical palette to PublicTracking.jsx and
-// DriverDashboard.jsx's fleet map. Previously every van on this map used one
-// fixed blue icon regardless of status — the same inconsistency fixed on
-// the other two maps earlier now fixed here too, so a dispatcher glancing
-// at the map gets the same visual language as the public tracking page.
+// DriverDashboard.jsx's fleet map.
 const STATUS_MARKER_STYLE = {
   BOARDING:  { glyph: '🧍', color: '#16a34a' },
   DEPARTING: { glyph: '🚦', color: '#d97706' },
   DEPARTED:  { glyph: '🚐', color: '#2563eb' },
   ARRIVING:  { glyph: '📍', color: '#059669' },
+  QUEUED:    { glyph: '🅿️', color: '#d97706' },
   DELAYED:   { glyph: '⏱️', color: '#ea580c' },
 };
 const DEFAULT_MARKER_STYLE = { glyph: '🚐', color: '#6b7280' };
@@ -97,6 +91,23 @@ function mpsToKph(mps) {
 function formatSpeed(mps) {
   const kph = mpsToKph(mps);
   return kph > 0 ? `${kph} km/h` : 'Stopped';
+}
+
+// A van's known physical location when it has no live GPS fix yet: still
+// near the origin municipality while boarding the outbound leg, or at the
+// terminal itself while boarding/queued for the return leg.
+function fallbackPositionForTrip(trip) {
+  if (trip.direction === 'RETURN') return VIRAC_HUB;
+  const originName = trip.route?.origin ?? trip.route?.name?.split('→')[0]?.trim();
+  return getCoordinatesForDestination(originName) ?? (isHomeTerminal(originName) ? VIRAC_HUB : null);
+}
+
+function directionLabel(trip) {
+  return trip.direction === 'RETURN' ? '↩ Return leg' : '↗ Outbound';
+}
+
+function cooperativeName(trip) {
+  return trip.van?.cooperative?.name ?? 'Unassigned';
 }
 
 // ─── sub-components ───────────────────────────────────────────────────────────
@@ -142,16 +153,27 @@ function TripCard({ trip, liveData, isSelected, onClick }) {
         <StatusBadge status={trip.status} />
       </div>
 
-      <div className="flex items-center gap-2 mb-2">
+      <div className="flex items-center gap-2 mb-1 flex-wrap">
         <span className="text-xs font-black text-emerald-700 uppercase tracking-widest">
           {trip.van?.plateNumber ?? 'Unknown plate'}
         </span>
         <span className="text-xs text-slate-400 font-medium truncate">
           • {trip.route?.name ?? 'Unnamed route'}
         </span>
+        <span
+          className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
+            trip.direction === 'RETURN' ? 'bg-purple-100 text-purple-700' : 'bg-sky-100 text-sky-700'
+          }`}
+        >
+          {directionLabel(trip)}
+        </span>
       </div>
 
-      <div className="flex items-center justify-between mt-3 bg-slate-50 px-2 py-1.5 rounded-lg border border-slate-100">
+      <div className="text-[11px] font-semibold text-slate-400 mb-2">
+        🏢 {cooperativeName(trip)}
+      </div>
+
+      <div className="flex items-center justify-between mt-1 bg-slate-50 px-2 py-1.5 rounded-lg border border-slate-100">
         <div className="flex items-center gap-1.5">
           <span
             className={`w-2 h-2 rounded-full flex-shrink-0 ${
@@ -160,7 +182,7 @@ function TripCard({ trip, liveData, isSelected, onClick }) {
             aria-hidden="true"
           />
           <span className="text-xs font-semibold text-slate-600">
-            {hasGps ? formatSpeed(liveData.speed) : isBoarding ? 'At Terminal' : 'Awaiting GPS…'}
+            {hasGps ? formatSpeed(liveData.speed) : isBoarding ? 'At Terminal/Origin' : 'Awaiting GPS…'}
           </span>
         </div>
 
@@ -176,21 +198,25 @@ function TripCard({ trip, liveData, isSelected, onClick }) {
 }
 
 // ─── TerminalVanCard ──────────────────────────────────────────────────────────
-// Shows a van that is physically AT the terminal right now — either idle and
-// ready to be loaded, or already boarding passengers. Disappears from this
-// list the moment its trip moves to DEPARTING (see getTerminalVans backend).
+// Shows a van's state at the terminal: arrived and awaiting the dispatcher's
+// scan, currently boarding for the return leg, queued waiting its turn
+// (behind other vans from the SAME cooperative only), or idle.
 
-function TerminalVanCard({ entry }) {
-  const isBoarding = entry.terminalStatus === 'BOARDING';
+function TerminalVanCard({ entry, terminalStatus }) {
+  const isAwaitingScan = terminalStatus === 'AWAITING_SCAN';
+  const isBoarding     = terminalStatus === 'BOARDING';
+  const isQueued       = terminalStatus === 'QUEUED';
+
+  const palette = isBoarding
+    ? { card: 'border-green-200 bg-green-50', badge: 'bg-green-100 text-green-800 border-green-200', label: 'Boarding' }
+    : isQueued
+    ? { card: 'border-amber-200 bg-amber-50', badge: 'bg-amber-100 text-amber-800 border-amber-200', label: `Queued · #${entry.queuePosition}` }
+    : isAwaitingScan
+    ? { card: 'border-indigo-200 bg-indigo-50', badge: 'bg-indigo-100 text-indigo-800 border-indigo-200', label: 'Scan to check in' }
+    : { card: 'border-slate-200 bg-white', badge: 'bg-slate-100 text-slate-600 border-slate-200', label: 'Idle' };
 
   return (
-    <div
-      className={`p-3 rounded-xl border ${
-        isBoarding
-          ? 'border-green-200 bg-green-50'
-          : 'border-slate-200 bg-white'
-      }`}
-    >
+    <div className={`p-3 rounded-xl border ${palette.card}`}>
       <div className="flex justify-between items-start gap-2">
         <div className="min-w-0">
           <div className="font-black text-slate-800 text-sm truncate">
@@ -200,28 +226,61 @@ function TerminalVanCard({ entry }) {
             {entry.plateNumber}
           </div>
         </div>
-        <span
-          className={`shrink-0 text-xs font-bold px-2 py-0.5 rounded border ${
-            isBoarding
-              ? 'bg-green-100 text-green-800 border-green-200'
-              : 'bg-slate-100 text-slate-600 border-slate-200'
-          }`}
-        >
-          {isBoarding ? 'Boarding' : 'Idle'}
+        <span className={`shrink-0 text-xs font-bold px-2 py-0.5 rounded border ${palette.badge}`}>
+          {palette.label}
         </span>
       </div>
 
-      {isBoarding && entry.trip?.routeName && (
-        <div className="text-xs text-slate-500 mt-2 pt-2 border-t border-green-100">
+      {(isBoarding || isQueued) && entry.trip?.routeName && (
+        <div className={`text-xs mt-2 pt-2 border-t ${isBoarding ? 'border-green-100 text-slate-500' : 'border-amber-100 text-amber-700'}`}>
           Route: <span className="font-semibold text-slate-700">{entry.trip.routeName}</span>
+          {isQueued && <div className="mt-0.5">Waiting for this cooperative's boarding slot to free up.</div>}
         </div>
       )}
 
-      {!isBoarding && (
+      {isAwaitingScan && (
+        <div className="text-xs text-indigo-600 mt-2 pt-2 border-t border-indigo-100">
+          Arrived at the terminal — scan this van's QR to check it in.
+        </div>
+      )}
+
+      {!isBoarding && !isQueued && !isAwaitingScan && (
         <div className="text-xs text-slate-400 mt-2 pt-2 border-t border-slate-100">
           Ready — waiting for driver to start a trip.
         </div>
       )}
+    </div>
+  );
+}
+
+// Groups every van at the terminal under its cooperative — each
+// cooperative's "Boarding" / "Queued" lists are independent of every
+// other cooperative's.
+function CooperativeTerminalGroup({ group }) {
+  const total = group.awaitingScan.length + group.boarding.length + group.queued.length + group.idle.length;
+
+  return (
+    <div className="rounded-2xl border border-slate-200 bg-white overflow-hidden shadow-sm">
+      <div className="bg-slate-800 text-white text-xs font-black uppercase tracking-wide px-3 py-2 flex items-center justify-between">
+        <span className="truncate">🏢 {group.cooperativeName}</span>
+        <span className="text-slate-300 font-normal normal-case shrink-0 ml-2">
+          {total} van{total === 1 ? '' : 's'}
+        </span>
+      </div>
+      <div className="p-2 flex flex-col gap-2">
+        {group.boarding.map((entry) => (
+          <TerminalVanCard key={entry.vanId} entry={entry} terminalStatus="BOARDING" />
+        ))}
+        {group.queued.map((entry) => (
+          <TerminalVanCard key={entry.vanId} entry={entry} terminalStatus="QUEUED" />
+        ))}
+        {group.awaitingScan.map((entry) => (
+          <TerminalVanCard key={entry.vanId} entry={entry} terminalStatus="AWAITING_SCAN" />
+        ))}
+        {group.idle.map((entry) => (
+          <TerminalVanCard key={entry.vanId} entry={entry} terminalStatus="IDLE" />
+        ))}
+      </div>
     </div>
   );
 }
@@ -336,7 +395,7 @@ export default function DispatcherDashboard() {
   const [selectedTripId, setSelectedTripId] = useState(null);
   const [reloadToken, setReloadToken]     = useState(0);
 
-  const [terminalVans, setTerminalVans]   = useState([]);
+  const [terminalGroups, setTerminalGroups] = useState([]);
   const [terminalLoading, setTerminalLoading] = useState(true);
   const [terminalError, setTerminalError] = useState('');
 
@@ -345,7 +404,7 @@ export default function DispatcherDashboard() {
   const [successMessage, setSuccessMessage] = useState('');
   const [departureScan, setDepartureScan] = useState(null);
   const [isDepartureSubmitting, setIsDepartureSubmitting] = useState(false);
-  
+
   const navigate = useNavigate();
   const successTimerRef = useRef(null);
   const mapRef          = useRef(null);
@@ -370,7 +429,7 @@ export default function DispatcherDashboard() {
   const fetchTerminalVans = useCallback(async (signal) => {
     try {
       const response = await apiClient.get('/trips/terminal', { signal });
-      setTerminalVans(Array.isArray(response.data) ? response.data : []);
+      setTerminalGroups(Array.isArray(response.data) ? response.data : []);
       setTerminalError('');
     } catch (err) {
       if (err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') return;
@@ -442,7 +501,7 @@ export default function DispatcherDashboard() {
 
     socket.connect();
     socket.emit('subscribe_to_map');
-    
+
     socket.on('initial_locations',     handleInitialLocations);
     socket.on('van_moved',             handleVanMoved);
     socket.on('seat_update',           handleSeatUpdate);           // Legacy support
@@ -500,7 +559,7 @@ export default function DispatcherDashboard() {
 
   const handleTripSelect = useCallback((tripId) => {
     setSelectedTripId((prev) => (prev === tripId ? null : tripId));
-    
+
     const loc = liveLocations[tripId];
     if (loc && mapRef.current) {
       mapRef.current.setView([loc.lat, loc.lng], 14, { animate: true });
@@ -527,11 +586,16 @@ export default function DispatcherDashboard() {
     const total = t.seatInfo?.totalSeats ?? t.van?.capacity ?? 0;
     return acc + Math.max(0, total - avail);
   }, 0);
-  
+
   const avgSpeedKph = liveCount === 0 ? 0 : Math.round(
     activeTrips
       .filter((t) => liveLocations[t.id])
       .reduce((acc, t) => acc + mpsToKph(liveLocations[t.id]?.speed), 0) / liveCount
+  );
+
+  const terminalVanCount = terminalGroups.reduce(
+    (acc, g) => acc + g.awaitingScan.length + g.boarding.length + g.queued.length + g.idle.length,
+    0,
   );
 
   // ── Render States ──────────────────────────────────────────────────────────
@@ -551,7 +615,7 @@ export default function DispatcherDashboard() {
 
   return (
     <div className="h-screen flex flex-col bg-gray-100 overflow-hidden font-sans">
-      
+
       {/* ── Header ─────────────────────────────────────────────────────────── */}
       <header className="bg-gradient-to-r from-blue-900 to-blue-800 text-white px-5 py-3 shadow-md flex items-center gap-3 flex-wrap z-10">
         <h1 className="text-lg font-black flex items-center gap-2 flex-1 min-w-0 tracking-tight">
@@ -607,11 +671,11 @@ export default function DispatcherDashboard() {
 
           <div className="flex-1 overflow-y-auto p-4 bg-slate-50 space-y-6">
 
-            {/* ── At the Terminal ─────────────────────────────────────────── */}
+            {/* ── At the Terminal (grouped by cooperative) ───────────────── */}
             <div>
               <h2 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-3 flex justify-between items-center">
                 🅿️ At the Terminal
-                <span className="text-purple-500 font-bold">{terminalVans.length}</span>
+                <span className="text-purple-500 font-bold">{terminalVanCount}</span>
               </h2>
 
               {terminalError && (
@@ -624,15 +688,15 @@ export default function DispatcherDashboard() {
                 <div className="text-center py-8 border-2 border-dashed border-slate-200 rounded-2xl bg-white">
                   <p className="text-xs font-semibold text-slate-400">Loading terminal status…</p>
                 </div>
-              ) : terminalVans.length === 0 ? (
+              ) : terminalGroups.length === 0 ? (
                 <div className="text-center py-8 border-2 border-dashed border-slate-200 rounded-2xl bg-white">
                   <span className="text-2xl mb-1 block">🚐</span>
                   <p className="text-xs font-bold text-slate-500">No vans at the terminal right now.</p>
                 </div>
               ) : (
-                <div className="flex flex-col gap-2">
-                  {terminalVans.map((entry) => (
-                    <TerminalVanCard key={entry.vanId} entry={entry} />
+                <div className="flex flex-col gap-4">
+                  {terminalGroups.map((group) => (
+                    <CooperativeTerminalGroup key={group.cooperativeId ?? 'unassigned'} group={group} />
                   ))}
                 </div>
               )}
@@ -690,10 +754,8 @@ export default function DispatcherDashboard() {
               let position = null;
               if (hasGps) {
                 position = [loc.lat, loc.lng];
-              } else if (trip.status === 'BOARDING') {
-                const originName = trip.route?.origin ?? trip.route?.name?.split('→')[0]?.trim();
-                position = getCoordinatesForDestination(originName) ?? 
-                           (isHomeTerminal(originName) ? VIRAC_HUB : null);
+              } else if (trip.status === 'BOARDING' || trip.status === 'QUEUED') {
+                position = fallbackPositionForTrip(trip);
               }
 
               if (!position) return null;
@@ -710,10 +772,16 @@ export default function DispatcherDashboard() {
                       <p className="font-black text-sm text-slate-900 mb-0.5">
                         {trip.driver?.name ?? 'Assigned Driver'}
                       </p>
-                      <p className="text-xs font-bold text-emerald-700 uppercase tracking-widest mb-2">
+                      <p className="text-xs font-bold text-emerald-700 uppercase tracking-widest mb-1">
                         {trip.van?.plateNumber ?? 'Unknown plate'}
                       </p>
-                      
+                      <p className="text-[11px] font-semibold text-slate-500">
+                        {directionLabel(trip)}
+                      </p>
+                      <p className="text-[11px] font-semibold text-slate-400 mb-2">
+                        🏢 {cooperativeName(trip)}
+                      </p>
+
                       <div className="flex items-center justify-between mt-2 pt-2 border-t border-slate-100">
                         <StatusBadge status={trip.status} />
                         {hasGps && (
@@ -745,7 +813,7 @@ export default function DispatcherDashboard() {
         onClose={() => setIsScannerOpen(false)}
         onSuccess={handleScanSuccess}
       />
-      
+
       <DepartureModal
         scan={departureScan}
         onConfirm={handleDepartureConfirm}
