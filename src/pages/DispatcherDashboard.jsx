@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { MapContainer, TileLayer, Marker, Popup } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Popup, useMap } from 'react-leaflet';
 import { useNavigate } from 'react-router-dom';
 import L from 'leaflet';
 import apiClient from '../api/axios';
@@ -29,8 +29,17 @@ const REFETCH_INTERVAL_MS = 30_000;
 
 const HOME_TERMINAL_NAME = 'Provincial Integrated Transport Terminal and Business Complex';
 
+// Full-height container that behaves on mobile browsers (dynamic viewport
+// height ignores the collapsing address bar). Falls back to h-screen where
+// 100dvh isn't supported.
+const FULL_HEIGHT_STYLE = { height: '100dvh' };
+
 function isHomeTerminal(name) {
   return typeof name === 'string' && name.trim().toLowerCase() === HOME_TERMINAL_NAME.toLowerCase();
+}
+
+function isDesktopViewport() {
+  return typeof window !== 'undefined' && window.matchMedia('(min-width: 1024px)').matches;
 }
 
 const STATUS_STYLES = {
@@ -43,8 +52,6 @@ const STATUS_STYLES = {
   COMPLETED:  'bg-gray-100  text-gray-600  border border-gray-200',
 };
 
-// ── Per-status marker styling — identical palette to PublicTracking.jsx and
-// DriverDashboard.jsx's fleet map.
 const STATUS_MARKER_STYLE = {
   BOARDING:  { glyph: '🧍', color: '#16a34a' },
   DEPARTING: { glyph: '🚦', color: '#d97706' },
@@ -110,6 +117,21 @@ function cooperativeName(trip) {
   return trip.van?.cooperative?.name ?? 'Unassigned';
 }
 
+// ─── map helper ───────────────────────────────────────────────────────────────
+// The map is hidden (display:none) on mobile while another tab is active.
+// Leaflet measures its container on mount, so when the tab is revealed we
+// must tell it to re-measure or tiles render grey/partial.
+
+function MapInvalidator({ active }) {
+  const map = useMap();
+  useEffect(() => {
+    if (!active) return undefined;
+    const t = setTimeout(() => map.invalidateSize(), 60);
+    return () => clearTimeout(t);
+  }, [active, map]);
+  return null;
+}
+
 // ─── sub-components ───────────────────────────────────────────────────────────
 
 function StatusBadge({ status }) {
@@ -123,9 +145,9 @@ function StatusBadge({ status }) {
 
 function MetricCard({ label, value, highlight }) {
   return (
-    <div className="bg-slate-50 rounded-xl p-3 text-center border border-slate-100">
-      <p className="text-xs text-slate-500 mb-1">{label}</p>
-      <p className={`text-2xl font-black tabular-nums ${highlight ? 'text-green-600' : 'text-slate-800'}`}>
+    <div className="bg-slate-50 rounded-xl p-2 lg:p-3 text-center border border-slate-100 min-w-0">
+      <p className="text-[10px] lg:text-xs text-slate-500 mb-0.5 lg:mb-1 truncate">{label}</p>
+      <p className={`text-base lg:text-2xl font-black tabular-nums truncate ${highlight ? 'text-green-600' : 'text-slate-800'}`}>
         {value}
       </p>
     </div>
@@ -139,15 +161,15 @@ function TripCard({ trip, liveData, isSelected, onClick }) {
   return (
     <button
       onClick={onClick}
-      className={`w-full text-left p-4 rounded-xl border transition-all ${
+      className={`w-full text-left p-4 rounded-xl border transition-all active:scale-[0.99] ${
         isSelected
           ? 'border-blue-400 bg-blue-50 shadow-sm ring-2 ring-blue-100'
           : 'border-slate-200 bg-white hover:border-slate-300 hover:shadow-sm'
       }`}
       aria-pressed={isSelected}
     >
-      <div className="flex justify-between items-start mb-2">
-        <span className="font-bold text-slate-800 text-sm truncate pr-2">
+      <div className="flex justify-between items-start gap-2 mb-2">
+        <span className="font-bold text-slate-800 text-sm truncate">
           {trip.driver?.name ?? 'Assigned Driver'}
         </span>
         <StatusBadge status={trip.status} />
@@ -157,7 +179,7 @@ function TripCard({ trip, liveData, isSelected, onClick }) {
         <span className="text-xs font-black text-emerald-700 uppercase tracking-widest">
           {trip.van?.plateNumber ?? 'Unknown plate'}
         </span>
-        <span className="text-xs text-slate-400 font-medium truncate">
+        <span className="text-xs text-slate-400 font-medium truncate max-w-full">
           • {trip.route?.name ?? 'Unnamed route'}
         </span>
         <span
@@ -173,21 +195,21 @@ function TripCard({ trip, liveData, isSelected, onClick }) {
         🏢 {cooperativeName(trip)}
       </div>
 
-      <div className="flex items-center justify-between mt-1 bg-slate-50 px-2 py-1.5 rounded-lg border border-slate-100">
-        <div className="flex items-center gap-1.5">
+      <div className="flex items-center justify-between gap-2 mt-1 bg-slate-50 px-2 py-1.5 rounded-lg border border-slate-100">
+        <div className="flex items-center gap-1.5 min-w-0">
           <span
             className={`w-2 h-2 rounded-full flex-shrink-0 ${
               hasGps ? 'bg-blue-500 animate-ping' : isBoarding ? 'bg-green-500' : 'bg-amber-400'
             }`}
             aria-hidden="true"
           />
-          <span className="text-xs font-semibold text-slate-600">
+          <span className="text-xs font-semibold text-slate-600 truncate">
             {hasGps ? formatSpeed(liveData.speed) : isBoarding ? 'At Terminal/Origin' : 'Awaiting GPS…'}
           </span>
         </div>
 
         {(trip.seatInfo?.totalSeats > 0 || trip.van?.capacity > 0) && (
-          <span className="text-xs font-bold text-slate-600">
+          <span className="text-xs font-bold text-slate-600 shrink-0">
             {trip.seatInfo?.availableSeats ?? trip.van?.capacity}/
             {trip.seatInfo?.totalSeats ?? trip.van?.capacity} seats
           </span>
@@ -198,9 +220,9 @@ function TripCard({ trip, liveData, isSelected, onClick }) {
 }
 
 // ─── TerminalVanCard ──────────────────────────────────────────────────────────
-// Shows a van's state at the terminal: arrived and awaiting the dispatcher's
-// scan, currently boarding for the return leg, queued waiting its turn
-// (behind other vans from the SAME cooperative only), or idle.
+// A van's state at the terminal: arrived and awaiting the dispatcher's scan,
+// boarding for the return leg, queued behind vans of the SAME cooperative,
+// or idle.
 
 function TerminalVanCard({ entry, terminalStatus }) {
   const isAwaitingScan = terminalStatus === 'AWAITING_SCAN';
@@ -253,15 +275,14 @@ function TerminalVanCard({ entry, terminalStatus }) {
   );
 }
 
-// Groups every van at the terminal under its cooperative — each
-// cooperative's "Boarding" / "Queued" lists are independent of every
-// other cooperative's.
+// Every van at the terminal grouped under its cooperative — each
+// cooperative's Boarding / Queued lists are independent of the others.
 function CooperativeTerminalGroup({ group }) {
   const total = group.awaitingScan.length + group.boarding.length + group.queued.length + group.idle.length;
 
   return (
     <div className="rounded-2xl border border-slate-200 bg-white overflow-hidden shadow-sm">
-      <div className="bg-slate-800 text-white text-xs font-black uppercase tracking-wide px-3 py-2 flex items-center justify-between">
+      <div className="bg-slate-800 text-white text-xs font-black uppercase tracking-wide px-3 py-2.5 flex items-center justify-between">
         <span className="truncate">🏢 {group.cooperativeName}</span>
         <span className="text-slate-300 font-normal normal-case shrink-0 ml-2">
           {total} van{total === 1 ? '' : 's'}
@@ -287,7 +308,7 @@ function CooperativeTerminalGroup({ group }) {
 
 function ErrorState({ message, onRetry }) {
   return (
-    <div className="h-screen flex items-center justify-center p-4 bg-gray-100">
+    <div className="h-screen flex items-center justify-center p-4 bg-gray-100" style={FULL_HEIGHT_STYLE}>
       <div className="max-w-md w-full bg-white rounded-2xl shadow-md p-6 text-center">
         <h1 className="text-xl font-bold text-gray-800 mb-1">Dispatcher dashboard</h1>
         <p className="text-sm text-gray-400 mb-4">Something went wrong</p>
@@ -305,6 +326,7 @@ function ErrorState({ message, onRetry }) {
   );
 }
 
+// Bottom sheet on phones, centered dialog from `sm` up.
 function DepartureModal({ scan, onConfirm, onDismiss, isSubmitting }) {
   const [departureTime, setDepartureTime] = useState('');
   const [error, setError]                 = useState('');
@@ -329,25 +351,25 @@ function DepartureModal({ scan, onConfirm, onDismiss, isSubmitting }) {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
-      <div className="bg-white rounded-2xl shadow-xl w-full max-w-sm overflow-hidden">
+    <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/40 backdrop-blur-sm sm:p-4">
+      <div className="bg-white rounded-t-2xl sm:rounded-2xl shadow-xl w-full sm:max-w-sm overflow-hidden pb-[env(safe-area-inset-bottom)]">
         <div className="bg-blue-900 text-white px-5 py-4">
           <h2 className="font-bold text-base">🕐 Set expected departure</h2>
           <p className="text-xs text-blue-300 mt-0.5">Passenger arrived — when does this van depart?</p>
         </div>
         <div className="px-5 pt-4 pb-2">
           <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 text-sm space-y-1.5">
-            <div className="flex justify-between">
+            <div className="flex justify-between gap-3">
               <span className="text-slate-500">Passenger</span>
-              <span className="font-semibold text-slate-800">{scan.passengerName ?? '—'}</span>
+              <span className="font-semibold text-slate-800 truncate">{scan.passengerName ?? '—'}</span>
             </div>
-            <div className="flex justify-between">
+            <div className="flex justify-between gap-3">
               <span className="text-slate-500">Van</span>
-              <span className="font-semibold text-slate-800">{scan.plateNumber ?? '—'}</span>
+              <span className="font-semibold text-slate-800 truncate">{scan.plateNumber ?? '—'}</span>
             </div>
-            <div className="flex justify-between">
+            <div className="flex justify-between gap-3">
               <span className="text-slate-500">Route</span>
-              <span className="font-semibold text-slate-800">{scan.routeName ?? '—'}</span>
+              <span className="font-semibold text-slate-800 truncate">{scan.routeName ?? '—'}</span>
             </div>
           </div>
         </div>
@@ -359,7 +381,7 @@ function DepartureModal({ scan, onConfirm, onDismiss, isSubmitting }) {
             type="time"
             value={departureTime}
             onChange={(e) => { setDepartureTime(e.target.value); setError(''); }}
-            className="w-full px-3 py-2.5 text-base font-semibold border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500"
+            className="w-full px-3 py-3 text-base font-semibold border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500"
             autoFocus
           />
           {error && <p className="text-xs text-red-600 mt-1.5 font-medium">{error}</p>}
@@ -368,20 +390,63 @@ function DepartureModal({ scan, onConfirm, onDismiss, isSubmitting }) {
           <button
             onClick={onDismiss}
             disabled={isSubmitting}
-            className="flex-1 py-2.5 text-sm font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors disabled:opacity-50"
+            className="flex-1 py-3 text-sm font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors disabled:opacity-50"
           >
             Skip
           </button>
           <button
             onClick={handleSubmit}
             disabled={isSubmitting}
-            className="flex-2 flex-grow-[2] py-2.5 text-sm font-bold text-white bg-blue-600 hover:bg-blue-700 rounded-xl transition-colors disabled:opacity-60 flex items-center justify-center gap-2"
+            className="flex-grow-[2] py-3 text-sm font-bold text-white bg-blue-600 hover:bg-blue-700 rounded-xl transition-colors disabled:opacity-60 flex items-center justify-center gap-2"
           >
             {isSubmitting ? 'Saving…' : '✅ Confirm departure'}
           </button>
         </div>
       </div>
     </div>
+  );
+}
+
+// Bottom tab bar — phones/tablets only. Desktop shows sidebar + map together.
+function MobileTabBar({ activeTab, onChange, terminalCount, fleetCount }) {
+  const tabs = [
+    { key: 'terminal', icon: '🅿️', label: 'Terminal', count: terminalCount },
+    { key: 'fleet',    icon: '🚐', label: 'Fleet',    count: fleetCount },
+    { key: 'map',      icon: '🗺️', label: 'Map',      count: null },
+  ];
+
+  return (
+    <nav
+      className="lg:hidden shrink-0 bg-white border-t border-slate-200 grid grid-cols-3 pb-[env(safe-area-inset-bottom)] z-20"
+      aria-label="Dispatcher views"
+    >
+      {tabs.map((tab) => {
+        const isActive = activeTab === tab.key;
+        return (
+          <button
+            key={tab.key}
+            onClick={() => onChange(tab.key)}
+            aria-current={isActive ? 'page' : undefined}
+            className={`relative flex flex-col items-center justify-center gap-0.5 min-h-[56px] py-1.5 text-[11px] font-bold transition-colors active:bg-slate-100 ${
+              isActive ? 'text-blue-700' : 'text-slate-500'
+            }`}
+          >
+            {isActive && <span className="absolute top-0 inset-x-6 h-0.5 bg-blue-600 rounded-b" aria-hidden="true" />}
+            <span className="text-xl leading-none" aria-hidden="true">{tab.icon}</span>
+            <span className="flex items-center gap-1">
+              {tab.label}
+              {tab.count != null && tab.count > 0 && (
+                <span className={`min-w-[18px] px-1 rounded-full text-[10px] leading-[18px] text-center ${
+                  isActive ? 'bg-blue-600 text-white' : 'bg-slate-200 text-slate-700'
+                }`}>
+                  {tab.count}
+                </span>
+              )}
+            </span>
+          </button>
+        );
+      })}
+    </nav>
   );
 }
 
@@ -404,6 +469,10 @@ export default function DispatcherDashboard() {
   const [successMessage, setSuccessMessage] = useState('');
   const [departureScan, setDepartureScan] = useState(null);
   const [isDepartureSubmitting, setIsDepartureSubmitting] = useState(false);
+
+  // Mobile-only: which full-screen view is showing. On lg+ everything is
+  // visible at once, so this has no effect there.
+  const [activeTab, setActiveTab] = useState('terminal');
 
   const navigate = useNavigate();
   const successTimerRef = useRef(null);
@@ -557,12 +626,25 @@ export default function DispatcherDashboard() {
     fetchTerminalVans();
   }, [fetchActiveTrips, fetchTerminalVans, showSuccess]);
 
-  const handleTripSelect = useCallback((tripId) => {
-    setSelectedTripId((prev) => (prev === tripId ? null : tripId));
+  // `focusMap` is used by list cards: on phones, tapping a van jumps to the
+  // Map tab and centers on it. On desktop the map is already visible, so a
+  // second tap simply deselects, as before.
+  const handleTripSelect = useCallback((tripId, { focusMap = false } = {}) => {
+    const onPhone = !isDesktopViewport();
+
+    if (focusMap && onPhone) {
+      setSelectedTripId(tripId);
+      setActiveTab('map');
+    } else {
+      setSelectedTripId((prev) => (prev === tripId ? null : tripId));
+    }
 
     const loc = liveLocations[tripId];
-    if (loc && mapRef.current) {
-      mapRef.current.setView([loc.lat, loc.lng], 14, { animate: true });
+    if (loc) {
+      // Delay so the map has been revealed + resized before re-centering.
+      setTimeout(() => {
+        mapRef.current?.setView([loc.lat, loc.lng], 14, { animate: true });
+      }, focusMap && onPhone ? 140 : 0);
     }
   }, [liveLocations]);
 
@@ -598,11 +680,14 @@ export default function DispatcherDashboard() {
     0,
   );
 
+  // Vans that need the dispatcher's attention right now (arrived, unscanned).
+  const awaitingScanCount = terminalGroups.reduce((acc, g) => acc + g.awaitingScan.length, 0);
+
   // ── Render States ──────────────────────────────────────────────────────────
 
   if (loading) {
     return (
-      <div className="h-screen flex flex-col items-center justify-center gap-3 bg-slate-50">
+      <div className="h-screen flex flex-col items-center justify-center gap-3 bg-slate-50" style={FULL_HEIGHT_STYLE}>
         <div className="w-12 h-12 border-4 border-blue-600 border-t-transparent rounded-full animate-spin" />
         <p className="text-sm text-slate-500 font-bold tracking-wide uppercase">Connecting to Terminal…</p>
       </div>
@@ -614,65 +699,80 @@ export default function DispatcherDashboard() {
   }
 
   return (
-    <div className="h-screen flex flex-col bg-gray-100 overflow-hidden font-sans">
+    <div className="h-screen flex flex-col bg-gray-100 overflow-hidden font-sans" style={FULL_HEIGHT_STYLE}>
 
       {/* ── Header ─────────────────────────────────────────────────────────── */}
-      <header className="bg-gradient-to-r from-blue-900 to-blue-800 text-white px-5 py-3 shadow-md flex items-center gap-3 flex-wrap z-10">
-        <h1 className="text-lg font-black flex items-center gap-2 flex-1 min-w-0 tracking-tight">
-          <span aria-hidden="true">📡</span>
-          <span className="truncate">Dispatcher's View</span>
-        </h1>
+      <header className="bg-gradient-to-r from-blue-900 to-blue-800 text-white px-3 sm:px-5 py-2.5 shadow-md z-10 shrink-0 pt-[max(0.625rem,env(safe-area-inset-top))]">
+        <div className="flex items-center gap-2 sm:gap-3">
+          <h1 className="text-base sm:text-lg font-black flex items-center gap-2 flex-1 min-w-0 tracking-tight">
+            <span aria-hidden="true">📡</span>
+            <span className="truncate">Dispatcher's View</span>
+          </h1>
 
-        <div className="flex items-center gap-2 flex-wrap">
-          <button
-            onClick={() => setIsCreateOpen(true)}
-            className="bg-blue-500 hover:bg-blue-400 active:bg-blue-600 text-white text-sm font-bold px-4 py-2 rounded-lg transition-colors shadow-sm"
-          >
-            ➕ Dispatch
-          </button>
-
-          <button
-            onClick={() => setIsScannerOpen(true)}
-            className="bg-emerald-500 hover:bg-emerald-400 active:bg-emerald-600 text-white text-sm font-bold px-4 py-2 rounded-lg transition-colors shadow-sm"
-          >
-            📸 Scan QR
-          </button>
+          <span className="text-[11px] sm:text-xs font-bold bg-blue-950/50 border border-blue-700/50 px-2.5 py-1 rounded-full shadow-inner whitespace-nowrap">
+            {activeTrips.length} {activeTrips.length === 1 ? 'Trip' : 'Trips'}
+          </span>
 
           <button
             onClick={handleLogout}
-            className="bg-slate-700/50 hover:bg-slate-700 active:bg-slate-800 text-white text-sm font-bold px-4 py-2 rounded-lg transition-colors border border-slate-600 ml-2"
+            aria-label="Log out"
+            className="bg-slate-700/50 hover:bg-slate-700 active:bg-slate-800 text-white text-sm font-bold h-10 px-3 rounded-lg transition-colors border border-slate-600 flex items-center gap-1.5"
           >
-            🚪 Logout
+            <span aria-hidden="true">🚪</span>
+            <span className="hidden sm:inline">Logout</span>
+          </button>
+        </div>
+
+        {/* Primary actions — big, full-width thumb targets on phones */}
+        <div className="grid grid-cols-2 gap-2 mt-2.5 sm:flex sm:justify-end">
+          <button
+            onClick={() => setIsScannerOpen(true)}
+            className="relative bg-emerald-500 hover:bg-emerald-400 active:bg-emerald-600 text-white text-sm font-bold min-h-[44px] px-4 rounded-xl transition-colors shadow-sm flex items-center justify-center gap-2"
+          >
+            📸 Scan QR
+            {awaitingScanCount > 0 && (
+              <span className="min-w-[20px] h-5 px-1.5 rounded-full bg-white text-emerald-700 text-[11px] font-black flex items-center justify-center">
+                {awaitingScanCount}
+              </span>
+            )}
           </button>
 
-          <span className="text-xs font-bold bg-blue-950/50 border border-blue-700/50 px-3 py-1.5 rounded-full ml-2 shadow-inner">
-            {activeTrips.length} {activeTrips.length === 1 ? 'Trip' : 'Trips'} Active
-          </span>
+          <button
+            onClick={() => setIsCreateOpen(true)}
+            className="bg-blue-500 hover:bg-blue-400 active:bg-blue-600 text-white text-sm font-bold min-h-[44px] px-4 rounded-xl transition-colors shadow-sm flex items-center justify-center gap-2"
+          >
+            ➕ Dispatch
+          </button>
         </div>
       </header>
 
       {successMessage && (
-        <div className="bg-emerald-100 border-b border-emerald-300 text-emerald-800 px-4 py-2.5 text-sm text-center font-bold z-10 shadow-sm animate-in slide-in-from-top-2">
+        <div
+          role="status"
+          className="bg-emerald-100 border-b border-emerald-300 text-emerald-800 px-4 py-2.5 text-sm text-center font-bold z-10 shadow-sm shrink-0"
+        >
           ✅ {successMessage}
         </div>
       )}
 
       {/* ── Body ───────────────────────────────────────────────────────────── */}
-      <div className="flex flex-1 overflow-hidden relative z-0">
+      <div className="flex flex-1 min-h-0 overflow-hidden relative z-0">
 
-        {/* ── Sidebar ──────────────────────────────────────────────────────── */}
-        <aside className="w-80 xl:w-96 bg-white border-r border-slate-200 flex flex-col overflow-hidden shadow-2xl z-10">
-          <div className="p-4 border-b border-slate-100 grid grid-cols-2 gap-3 bg-slate-50/50">
-            <MetricCard label="Active Trips" value={activeTrips.length} />
-            <MetricCard label="GPS Live"     value={liveCount}          highlight />
-            <MetricCard label="Passengers"   value={totalPax} />
-            <MetricCard label="Fleet Avg"    value={`${avgSpeedKph} km/h`} />
+        {/* ── Sidebar (phones: full-screen Terminal / Fleet tabs) ──────────── */}
+        <aside
+          className={`${activeTab === 'map' ? 'hidden' : 'flex'} lg:flex w-full lg:w-80 xl:w-96 bg-white lg:border-r border-slate-200 flex-col overflow-hidden lg:shadow-2xl z-10`}
+        >
+          <div className="p-3 lg:p-4 border-b border-slate-100 grid grid-cols-4 lg:grid-cols-2 gap-2 lg:gap-3 bg-slate-50/50 shrink-0">
+            <MetricCard label="Active"     value={activeTrips.length} />
+            <MetricCard label="GPS Live"   value={liveCount}          highlight />
+            <MetricCard label="Passengers" value={totalPax} />
+            <MetricCard label="Avg Speed"  value={`${avgSpeedKph}`} />
           </div>
 
-          <div className="flex-1 overflow-y-auto p-4 bg-slate-50 space-y-6">
+          <div className="flex-1 overflow-y-auto overscroll-contain p-3 lg:p-4 bg-slate-50 space-y-6">
 
             {/* ── At the Terminal (grouped by cooperative) ───────────────── */}
-            <div>
+            <div className={activeTab === 'terminal' ? 'block' : 'hidden lg:block'}>
               <h2 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-3 flex justify-between items-center">
                 🅿️ At the Terminal
                 <span className="text-purple-500 font-bold">{terminalVanCount}</span>
@@ -703,7 +803,7 @@ export default function DispatcherDashboard() {
             </div>
 
             {/* ── Live Fleet Status ────────────────────────────────────────── */}
-            <div>
+            <div className={activeTab === 'fleet' ? 'block' : 'hidden lg:block'}>
               <h2 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-3 flex justify-between">
                 Live Fleet Status
                 <span className="text-blue-500 font-bold">{activeTrips.length}</span>
@@ -723,7 +823,7 @@ export default function DispatcherDashboard() {
                       trip={trip}
                       liveData={liveLocations[trip.id]}
                       isSelected={selectedTripId === trip.id}
-                      onClick={() => handleTripSelect(trip.id)}
+                      onClick={() => handleTripSelect(trip.id, { focusMap: true })}
                     />
                   ))}
                 </div>
@@ -732,8 +832,8 @@ export default function DispatcherDashboard() {
           </div>
         </aside>
 
-        {/* ── Map ──────────────────────────────────────────────────────────── */}
-        <main className="flex-1 relative z-0 bg-slate-200">
+        {/* ── Map (phones: its own tab) ────────────────────────────────────── */}
+        <main className={`${activeTab === 'map' ? 'block' : 'hidden'} lg:block flex-1 relative z-0 bg-slate-200`}>
           <MapContainer
             center={MAP_CENTER}
             zoom={MAP_ZOOM}
@@ -741,6 +841,8 @@ export default function DispatcherDashboard() {
             ref={mapRef}
             zoomControl={false}
           >
+            <MapInvalidator active={activeTab === 'map'} />
+
             <TileLayer
               attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
               url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
@@ -749,7 +851,6 @@ export default function DispatcherDashboard() {
             {activeTrips.map((trip) => {
               const loc = liveLocations[trip.id];
               const hasGps = typeof loc?.lat === 'number' && typeof loc?.lng === 'number';
-              const isSelected = selectedTripId === trip.id;
 
               let position = null;
               if (hasGps) {
@@ -768,7 +869,7 @@ export default function DispatcherDashboard() {
                   eventHandlers={{ click: () => handleTripSelect(trip.id) }}
                 >
                   <Popup className="dispatcher-popup">
-                    <div className="min-w-[180px] p-1">
+                    <div className="min-w-[160px] p-1">
                       <p className="font-black text-sm text-slate-900 mb-0.5">
                         {trip.driver?.name ?? 'Assigned Driver'}
                       </p>
@@ -782,7 +883,7 @@ export default function DispatcherDashboard() {
                         🏢 {cooperativeName(trip)}
                       </p>
 
-                      <div className="flex items-center justify-between mt-2 pt-2 border-t border-slate-100">
+                      <div className="flex items-center justify-between gap-2 mt-2 pt-2 border-t border-slate-100">
                         <StatusBadge status={trip.status} />
                         {hasGps && (
                           <span className="text-blue-600 font-bold text-xs bg-blue-50 px-2 py-1 rounded">
@@ -799,13 +900,21 @@ export default function DispatcherDashboard() {
 
           {/* No GPS overlay */}
           {activeTrips.length > 0 && liveCount === 0 && (
-            <div className="absolute bottom-6 left-1/2 -translate-x-1/2 bg-white/90 backdrop-blur-sm border-2 border-amber-200 text-amber-800 text-xs font-bold px-5 py-2.5 rounded-full shadow-lg pointer-events-none z-[1000] flex items-center gap-2">
+            <div className="absolute bottom-4 lg:bottom-6 left-1/2 -translate-x-1/2 w-[calc(100%-2rem)] max-w-sm bg-white/90 backdrop-blur-sm border-2 border-amber-200 text-amber-800 text-xs font-bold px-4 py-2.5 rounded-full shadow-lg pointer-events-none z-[1000] flex items-center justify-center gap-2 text-center">
               <span className="animate-spin text-base leading-none">⏳</span>
               Waiting for drivers to establish GPS links…
             </div>
           )}
         </main>
       </div>
+
+      {/* ── Mobile bottom tabs ─────────────────────────────────────────────── */}
+      <MobileTabBar
+        activeTab={activeTab}
+        onChange={setActiveTab}
+        terminalCount={terminalVanCount}
+        fleetCount={activeTrips.length}
+      />
 
       {/* ── Modals ─────────────────────────────────────────────────────────── */}
       <QRScannerModal
