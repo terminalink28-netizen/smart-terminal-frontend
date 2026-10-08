@@ -14,9 +14,17 @@ const OSRM_BASE_URL = 'https://router.project-osrm.org/route/v1/driving';
 const HOME_TERMINAL_NAME = 'Provincial Integrated Transport Terminal and Business Complex';
 const HOME_TERMINAL_SHORT = 'Terminal';
 
+// A trip is a round trip of two legs, tracked by `direction`:
+//   OUTBOUND — municipality → terminal
+//   RETURN   — terminal → municipality (entered only after the dispatcher's
+//              terminal check-in scan)
+// BOARDING/DEPARTING/DEPARTED/ARRIVING/DELAYED apply to BOTH legs; QUEUED
+// only applies to the RETURN leg (checked in, waiting for this van's
+// cooperative's boarding slot at the terminal to free up).
 const BOARDING_STATUSES = ['BOARDING'];
+const QUEUED_STATUSES = ['QUEUED'];
 const DRIVING_STATUSES = ['DEPARTING', 'DEPARTED', 'ARRIVING', 'DELAYED'];
-const MAP_VISIBLE_STATUSES = [...BOARDING_STATUSES, ...DRIVING_STATUSES];
+const MAP_VISIBLE_STATUSES = [...BOARDING_STATUSES, ...QUEUED_STATUSES, ...DRIVING_STATUSES];
 
 const STOPPED_THRESHOLD_KMH = 2;
 const LOW_ACCURACY_THRESHOLD_M = 75;
@@ -25,6 +33,7 @@ const ROUTE_RECALC_DISTANCE_M = 250;
 
 const STATUS_CONFIG = {
   BOARDING:  { label: 'Boarding',      cls: 'bg-green-100 text-green-800 border-green-200'   },
+  QUEUED:    { label: 'Queued',        cls: 'bg-amber-100 text-amber-800 border-amber-300'   },
   DEPARTING: { label: 'Departing',     cls: 'bg-amber-100 text-amber-800 border-amber-200'   },
   DEPARTED:  { label: 'En Route',      cls: 'bg-blue-100 text-blue-800 border-blue-200'      },
   ARRIVING:  { label: 'Arriving Soon', cls: 'bg-emerald-100 text-emerald-800 border-emerald-200' },
@@ -33,6 +42,7 @@ const STATUS_CONFIG = {
 
 const STATUS_MARKER_STYLE = {
   BOARDING:  { glyph: '🧍', color: '#16a34a' },
+  QUEUED:    { glyph: '🅿️', color: '#d97706' },
   DEPARTING: { glyph: '🚦', color: '#d97706' },
   DEPARTED:  { glyph: '🚐', color: '#2563eb' },
   ARRIVING:  { glyph: '📍', color: '#059669' },
@@ -142,10 +152,6 @@ function normaliseFix(input) {
  *      arrives.
  *   3. Van's registered capacity — final fallback so we always render a
  *      number instead of blank.
- *
- * The previous version only checked (1) and (3), which is why seat counts
- * appeared to "reset" on cold load: the HTTP response carries the persisted
- * count on the trip, not inside `liveLocation`.
  */
 function resolveSeatInfo(trip, liveEntry) {
   const liveAvailable = liveEntry?.availableSeats;
@@ -157,8 +163,6 @@ function resolveSeatInfo(trip, liveEntry) {
   const available = liveAvailable ?? tripAvailable ?? vanCapacity;
   const total     = liveTotal     ?? tripTotal     ?? vanCapacity ?? available;
 
-  // Only flag as "live" when we have an actual socket value — a count read
-  // off the trip row is authoritative but not pushed in real time.
   const isLive = typeof liveAvailable === 'number';
 
   return { available, total, isLive };
@@ -167,10 +171,6 @@ function resolveSeatInfo(trip, liveEntry) {
 /**
  * Returns the driver's contact numbers as an array, regardless of which
  * shape the backend sends.
- *
- * New accounts write `contactNumbers: string[]`; older accounts only have
- * the singular `contactNumber`. This collapses both into one array so every
- * call site (popup, cards, panel) renders all numbers consistently.
  */
 function getDriverContacts(driver) {
   if (!driver) return [];
@@ -181,6 +181,49 @@ function getDriverContacts(driver) {
     return [driver.contactNumber];
   }
   return [];
+}
+
+function cooperativeName(trip) {
+  return trip?.van?.cooperative?.name ?? null;
+}
+
+/**
+ * A trip's physical endpoints, direction-aware. For the OUTBOUND leg this
+ * is origin municipality → terminal, as before. For the RETURN leg the van
+ * is coming FROM the terminal back TO the same municipality, so the
+ * endpoints flip — used both for the fallback marker position (while
+ * stationary, pre-GPS) and for building the road route line.
+ */
+function getTripEndpoints(trip) {
+  const originCoords =
+    getCoordinatesForDestination(trip.route?.origin) ??
+    (isHomeTerminal(trip.route?.origin) ? VIRAC_HUB : null);
+  const destinationCoords =
+    getCoordinatesForDestination(trip.route?.destination) ??
+    (isHomeTerminal(trip.route?.destination) ? VIRAC_HUB : null);
+
+  if (trip.direction === 'RETURN') {
+    return { start: VIRAC_HUB, end: originCoords ?? VIRAC_HUB };
+  }
+  return { start: originCoords ?? VIRAC_HUB, end: destinationCoords ?? VIRAC_HUB };
+}
+
+function tripRouteLabel(trip) {
+  const originShort = shortPlaceName(trip.route?.origin);
+  return trip.direction === 'RETURN'
+    ? `${HOME_TERMINAL_SHORT} → ${originShort}`
+    : `${originShort} → ${HOME_TERMINAL_SHORT}`;
+}
+
+function tripDirectionText(trip) {
+  const originShort = shortPlaceName(trip.route?.origin);
+  if (trip.direction === 'RETURN') {
+    if (trip.status === 'QUEUED') return 'Queued at the terminal, waiting to board';
+    if (trip.status === 'BOARDING') return `Boarding at the terminal — heading to ${originShort}`;
+    return `Returning to ${originShort}`;
+  }
+  if (trip.status === 'BOARDING') return `Boarding at ${originShort}`;
+  return 'Heading to the terminal';
 }
 
 // ─── Icons ───────────────────────────────────────────────────────────────────
@@ -280,10 +323,9 @@ function EmptyState({ icon, text }) {
 }
 
 /**
- * Compact seat pill reused in every card + the selected van panel, so seat
- * availability is visible at every stage of a trip, not just while boarding.
- * `isLive` renders a small pulsing dot to signal the count is a real-time
- * socket value rather than a persisted/snapshot value.
+ * Compact seat pill reused in every card + the selected van panel. `isLive`
+ * renders a small pulsing dot to signal the count is a real-time socket
+ * value rather than a persisted/snapshot value.
  */
 function SeatPill({ available, total, isLive, size = 'sm' }) {
   if (available === null || available === undefined) return null;
@@ -313,9 +355,6 @@ function SeatPill({ available, total, isLive, size = 'sm' }) {
  * Renders every contact number the driver has on file. Accepts the driver
  * object and pulls from either the new array field or the legacy singular
  * field, so this works before and after the schema rollout.
- *
- *   variant="stacked" — one per line, used in the map popup and Selected Van panel
- *   variant="inline"  — comma-separated on one line, used in the compact cards
  */
 function DriverContacts({ driver, variant = 'inline', className = '' }) {
   const numbers = getDriverContacts(driver);
@@ -336,6 +375,13 @@ function DriverContacts({ driver, variant = 'inline', className = '' }) {
       📞 {numbers.join(' · ')}
     </span>
   );
+}
+
+/** Small "🏢 Cooperative Name" tag, shown wherever we have one. */
+function CooperativeTag({ trip, className = '' }) {
+  const name = cooperativeName(trip);
+  if (!name) return null;
+  return <div className={`text-xs font-semibold text-gray-500 ${className}`}>🏢 {name}</div>;
 }
 
 async function fetchOsrmRoute(startCoords, endCoords, signal) {
@@ -392,10 +438,6 @@ export default function PublicTracking() {
           if (!fix) continue;
           const existing = next[trip.id];
           if (!existing || (fix.lastSeen ?? 0) > (existing.lastSeen ?? 0)) {
-            // Preserve any seat data already known for this trip — a fresh
-            // GPS-only fix from the HTTP snapshot shouldn't wipe out a seat
-            // count we already received over the socket. (Seat values on the
-            // trip row itself are read by resolveSeatInfo, not stored here.)
             next[trip.id] = { ...fix, availableSeats: existing?.availableSeats, totalSeats: existing?.totalSeats };
           }
         }
@@ -453,8 +495,7 @@ export default function PublicTracking() {
 
     // Seat updates apply throughout the trip's life, not just BOARDING — this
     // handler never restricts by status, so the count stays current
-    // everywhere it's shown without needing a page refresh. The backend
-    // emits this whenever the driver persists a change via PATCH /seats.
+    // everywhere it's shown without needing a page refresh.
     const onSeatUpdate = (data) => {
       if (!data?.tripId || typeof data.availableSeats !== 'number') return;
       setLiveData((prev) => ({
@@ -567,6 +608,13 @@ export default function PublicTracking() {
     [activeTrips]
   );
 
+  const queuedTrips = useMemo(
+    () => activeTrips
+      .filter((t) => QUEUED_STATUSES.includes(t.status))
+      .sort((a, b) => new Date(a.actualArrival ?? a.scheduledTime ?? 0) - new Date(b.actualArrival ?? b.scheduledTime ?? 0)),
+    [activeTrips]
+  );
+
   const drivingTrips = useMemo(
     () => activeTrips.filter((t) => DRIVING_STATUSES.includes(t.status)),
     [activeTrips]
@@ -579,23 +627,31 @@ export default function PublicTracking() {
 
   const resolveTripPosition = useCallback((trip) => {
     const data = liveData[trip.id];
-    if (!data) return { position: null, hasFix: false, isStale: false, isTrusted: false, accuracy: null };
 
-    const hasFix = typeof data.lat === 'number' && typeof data.lng === 'number';
-    const accuracy = typeof data.accuracy === 'number' ? data.accuracy : null;
-    const isStale = hasFix && data.lastSeen && Date.now() - data.lastSeen > GPS_STALE_THRESHOLD_MS;
+    const hasGps = typeof data?.lat === 'number' && typeof data?.lng === 'number';
+    const accuracy = typeof data?.accuracy === 'number' ? data.accuracy : null;
+    const isStale = hasGps && data.lastSeen && Date.now() - data.lastSeen > GPS_STALE_THRESHOLD_MS;
     const isTrusted =
-      data.positionTrusted !== false &&
+      data?.positionTrusted !== false &&
       (accuracy === null || accuracy <= UNUSABLE_ACCURACY_M);
-    const canPlot = hasFix && !isStale && isTrusted;
+    const canPlotGps = hasGps && !isStale && isTrusted;
 
-    return {
-      position: canPlot ? [data.lat, data.lng] : null,
-      hasFix: Boolean(hasFix),
-      isStale: Boolean(isStale),
-      isTrusted,
-      accuracy,
-    };
+    if (canPlotGps) {
+      return { position: [data.lat, data.lng], hasFix: true, isStale: false, isTrusted, accuracy };
+    }
+
+    // No usable live fix yet — for stationary pre-departure states, fall
+    // back to the van's known physical location (origin municipality while
+    // boarding outbound, or the terminal while boarding/queued for the
+    // return leg) so it still appears on the map.
+    if (trip.status === 'BOARDING' || trip.status === 'QUEUED') {
+      const fallback = getTripEndpoints(trip).start;
+      if (fallback) {
+        return { position: fallback, hasFix: Boolean(hasGps), isStale: Boolean(isStale), isTrusted, accuracy };
+      }
+    }
+
+    return { position: null, hasFix: Boolean(hasGps), isStale: Boolean(isStale), isTrusted, accuracy };
   }, [liveData]);
 
   const activeVanPositions = useMemo(
@@ -628,19 +684,14 @@ export default function PublicTracking() {
       return;
     }
 
-    const destCoords = getCoordinatesForDestination(selectedTrip.route?.destination);
+    const endpoints = getTripEndpoints(selectedTrip);
     const liveStart =
       typeof selectedTripLive?.lat === 'number' && typeof selectedTripLive?.lng === 'number'
         ? [selectedTripLive.lat, selectedTripLive.lng]
         : null;
 
-    const plannedStart =
-      getCoordinatesForDestination(selectedTrip.route?.origin) ??
-      (isHomeTerminal(selectedTrip.route?.origin) ? VIRAC_HUB : null) ??
-      VIRAC_HUB;
-
-    const startCoords = liveStart ?? plannedStart;
-    const endCoords = destCoords ?? VIRAC_HUB;
+    const startCoords = liveStart ?? endpoints.start;
+    const endCoords = endpoints.end;
 
     if (!startCoords || !endCoords) {
       setSelectedRoute({ coords: [], loading: false, error: 'Route coordinates are unavailable.', distanceMeters: null, durationSeconds: null });
@@ -791,7 +842,7 @@ export default function PublicTracking() {
                 <div className="min-w-[180px] space-y-1">
                   <p className="font-bold text-gray-800 text-sm leading-snug">{HOME_TERMINAL_NAME}</p>
                   <p className="text-xs text-gray-500">
-                    {boardingTrips.length} boarding · {drivingTrips.length} on road
+                    {boardingTrips.length} boarding · {queuedTrips.length} queued · {drivingTrips.length} on road
                   </p>
                 </div>
               </Popup>
@@ -829,14 +880,12 @@ export default function PublicTracking() {
                           {trip.driver?.name || 'Assigned Driver'}
                         </div>
                         <DriverContacts driver={trip.driver} variant="stacked" />
+                        <CooperativeTag trip={trip} />
                         <div className="text-xs text-gray-500 font-semibold uppercase tracking-wide truncate">
                           <span className="text-emerald-700">{trip.van?.plateNumber ?? '—'}</span>
-                          {trip.status === 'BOARDING'
-                            ? ' · Loading passengers'
-                            : trip.status === 'DEPARTED'
-                            ? ' · En route'
-                            : ` · ${STATUS_CONFIG[trip.status]?.label ?? trip.status}`}
+                          {' · '}{STATUS_CONFIG[trip.status]?.label ?? trip.status}
                         </div>
+                        <div className="text-[11px] text-gray-400">{tripDirectionText(trip)}</div>
                         <div>
                           <SeatPill available={seatInfo.available} total={seatInfo.total} isLive={seatInfo.isLive} />
                         </div>
@@ -888,6 +937,7 @@ export default function PublicTracking() {
           <div className="flex border-b border-gray-100 divide-x divide-gray-100 bg-slate-50 shrink-0">
             {[
               { count: boardingTrips.length, label: 'Boarding', color: 'text-emerald-700' },
+              { count: queuedTrips.length, label: 'Queued', color: 'text-amber-700' },
               { count: drivingTrips.length, label: 'On Road', color: 'text-blue-700' },
               { count: Object.keys(liveEtas).length, label: 'ETA Live', color: 'text-indigo-700' },
             ].map(({ count, label, color }) => (
@@ -947,7 +997,11 @@ export default function PublicTracking() {
                                 {trip.van?.plateNumber ?? 'Unknown plate'}
                               </span>
                             </div>
+                            <CooperativeTag trip={trip} className="mt-0.5" />
                             <DriverContacts driver={trip.driver} className="block mt-1" />
+                            <div className="text-xs text-emerald-700 font-semibold mt-1">
+                              {tripDirectionText(trip)}
+                            </div>
                           </div>
 
                           <div
@@ -999,6 +1053,66 @@ export default function PublicTracking() {
             </section>
 
             <section className="border-t border-gray-100 pt-4">
+              <h2 className="font-black text-amber-800 text-sm uppercase tracking-widest flex items-center gap-2 mb-3">
+                🅿️ Queued at Terminal
+                {queuedTrips.length > 0 && (
+                  <span className="ml-auto text-xs font-bold bg-amber-100 text-amber-800 px-2 py-0.5 rounded-full">
+                    {queuedTrips.length}
+                  </span>
+                )}
+              </h2>
+
+              {queuedTrips.length === 0 ? (
+                <EmptyState icon="🅿️" text="No vans waiting in the terminal queue" />
+              ) : (
+                <div className="space-y-3">
+                  {queuedTrips.map((trip, index) => {
+                    const isSelected = selectedTripId === trip.id;
+                    return (
+                      <button
+                        key={trip.id}
+                        type="button"
+                        onClick={() => setSelectedTripId(trip.id)}
+                        className={`w-full text-left p-4 rounded-xl border-2 shadow-sm transition-all ${
+                          isSelected
+                            ? 'bg-amber-100 border-amber-400 ring-2 ring-amber-200'
+                            : 'bg-amber-50 border-amber-200 hover:shadow-md'
+                        }`}
+                      >
+                        <div className="flex justify-between items-start gap-3">
+                          <div className="min-w-0 flex-1">
+                            <div className={`text-base leading-tight ${
+                              trip.driver?.name ? 'font-black text-gray-900' : 'font-medium italic text-gray-400'
+                            }`}>
+                              {trip.driver?.name ?? 'No driver assigned'}
+                            </div>
+                            <div className="text-xs text-gray-500 uppercase tracking-widest mt-1 truncate">
+                              <span className="text-amber-700 font-black">{trip.van?.plateNumber ?? 'Unknown plate'}</span>
+                            </div>
+                            <CooperativeTag trip={trip} className="mt-0.5" />
+                            <div className="text-xs text-amber-700 font-semibold mt-1">
+                              {tripDirectionText(trip)}
+                            </div>
+                          </div>
+                          <div className="shrink-0 text-center px-3 py-2 rounded-lg bg-white shadow-sm border border-amber-200 text-amber-700 min-w-[56px]">
+                            <div className="text-xl font-black leading-none">#{index + 1}</div>
+                            <div className="text-[9px] font-bold uppercase mt-0.5">In line</div>
+                          </div>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+
+              <p className="text-[11px] text-gray-400 mt-2">
+                Queue position is counted within each van's own cooperative — a van
+                from a different cooperative boarding at the same time doesn't
+                affect this position.
+              </p>
+            </section>
+
+            <section className="border-t border-gray-100 pt-4">
               <h2 className="font-black text-blue-900 text-sm uppercase tracking-widest flex items-center gap-2 mb-3">
                 🚐 On the Road
                 {drivingTrips.length > 0 && (
@@ -1041,7 +1155,11 @@ export default function PublicTracking() {
                             <div className="text-xs text-gray-400 font-bold uppercase tracking-widest mt-0.5 truncate">
                               <span className="text-blue-700">{trip.van?.plateNumber ?? '—'}</span>
                             </div>
+                            <CooperativeTag trip={trip} className="mt-0.5" />
                             <DriverContacts driver={trip.driver} className="block mt-1" />
+                            <div className="text-xs text-blue-700 font-semibold mt-1">
+                              {tripDirectionText(trip)}
+                            </div>
                           </div>
 
                           <span className={`shrink-0 text-xs font-bold px-2 py-1 rounded border ${STATUS_CONFIG[trip.status]?.cls ?? STATUS_CONFIG.DEPARTED.cls}`}>
@@ -1117,6 +1235,7 @@ export default function PublicTracking() {
                       <div className="text-xs text-gray-500 uppercase tracking-widest mt-1">
                         {selectedTrip.van?.plateNumber ?? 'Unknown plate'}
                       </div>
+                      <CooperativeTag trip={selectedTrip} className="mt-1" />
                     </div>
 
                     <button
@@ -1143,15 +1262,11 @@ export default function PublicTracking() {
                   <div className="text-sm text-gray-600 space-y-1">
                     <p>
                       <span className="font-semibold text-gray-900">Route:</span>{' '}
-                      {shortPlaceName(selectedTrip.route?.origin)} → {shortPlaceName(selectedTrip.route?.destination)}
+                      {tripRouteLabel(selectedTrip)}
                     </p>
                     <p>
-                      <span className="font-semibold text-gray-900">Direction:</span>{' '}
-                      {selectedTrip.status === 'BOARDING'
-                        ? 'Loading at terminal'
-                        : isHomeTerminal(selectedTrip.route?.destination)
-                        ? 'Returning to Terminal'
-                        : 'Heading out'}
+                      <span className="font-semibold text-gray-900">Status:</span>{' '}
+                      {tripDirectionText(selectedTrip)}
                     </p>
                     {getDriverContacts(selectedTrip.driver).length > 0 && (
                       <div>
