@@ -2,36 +2,22 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { MapContainer, TileLayer, Marker, Popup, useMap } from 'react-leaflet';
 import { useNavigate } from 'react-router-dom';
 import L from 'leaflet';
+import 'leaflet/dist/leaflet.css';
 import apiClient from '../api/axios';
 import { socket } from '../api/socket';
 import QRScannerModal from '../components/QRScannerModal';
-import CreateTripModal from '../components/CreateTripModal';
 import { VIRAC_HUB, getCoordinatesForDestination } from '../components/townCoordinates';
-
-// ─── leaflet default icon fix (kept for any component still using the default) ─
-
-import icon from 'leaflet/dist/images/marker-icon.png';
-import iconShadow from 'leaflet/dist/images/marker-shadow.png';
-
-const DefaultIcon = L.icon({
-  iconUrl:    icon,
-  shadowUrl:  iconShadow,
-  iconAnchor: [12, 41],
-});
-L.Marker.prototype.options.icon = DefaultIcon;
 
 // ─── constants & helpers ──────────────────────────────────────────────────────
 
-const MAP_CENTER         = [13.5820477, 124.2192987];
-const MAP_ZOOM           = 10;
-const SUCCESS_BANNER_TTL = 5000; // ms
+const MAP_CENTER          = [13.5820477, 124.2192987];
+const MAP_ZOOM            = 10;
+const SUCCESS_BANNER_TTL  = 5000; // ms
 const REFETCH_INTERVAL_MS = 30_000;
 
 const HOME_TERMINAL_NAME = 'Provincial Integrated Transport Terminal and Business Complex';
 
-// Full-height container that behaves on mobile browsers (dynamic viewport
-// height ignores the collapsing address bar). Falls back to h-screen where
-// 100dvh isn't supported.
+// Dynamic viewport height ignores the collapsing mobile address bar.
 const FULL_HEIGHT_STYLE = { height: '100dvh' };
 
 function isHomeTerminal(name) {
@@ -57,7 +43,7 @@ const STATUS_MARKER_STYLE = {
   DEPARTING: { glyph: '🚦', color: '#d97706' },
   DEPARTED:  { glyph: '🚐', color: '#2563eb' },
   ARRIVING:  { glyph: '📍', color: '#059669' },
-  QUEUED:    { glyph: '🅿️', color: '#d97706' },
+  QUEUED:    { glyph: '⏳', color: '#d97706' },
   DELAYED:   { glyph: '⏱️', color: '#ea580c' },
 };
 const DEFAULT_MARKER_STYLE = { glyph: '🚐', color: '#6b7280' };
@@ -66,7 +52,7 @@ const statusIconCache = new Map();
 function getVanIconForStatus(status) {
   if (statusIconCache.has(status)) return statusIconCache.get(status);
   const { glyph, color } = STATUS_MARKER_STYLE[status] ?? DEFAULT_MARKER_STYLE;
-  const icon = L.divIcon({
+  const markerIcon = L.divIcon({
     className: '',
     html: `
       <div style="
@@ -87,8 +73,8 @@ function getVanIconForStatus(status) {
     iconAnchor: [18, 18],
     popupAnchor: [0, -22],
   });
-  statusIconCache.set(status, icon);
-  return icon;
+  statusIconCache.set(status, markerIcon);
+  return markerIcon;
 }
 
 function mpsToKph(mps) {
@@ -100,13 +86,17 @@ function formatSpeed(mps) {
   return kph > 0 ? `${kph} km/h` : 'Stopped';
 }
 
-// A van's known physical location when it has no live GPS fix yet: still
-// near the origin municipality while boarding the outbound leg, or at the
-// terminal itself while boarding/queued for the return leg.
+function originPlace(trip) {
+  return trip.route?.origin ?? trip.route?.name?.split('→')[0]?.trim() ?? 'origin';
+}
+
+// Where a van sits when it has no live GPS fix yet: at its origin
+// municipality while boarding the outbound leg, or at the terminal once it
+// has been scanned in for the return leg.
 function fallbackPositionForTrip(trip) {
   if (trip.direction === 'RETURN') return VIRAC_HUB;
-  const originName = trip.route?.origin ?? trip.route?.name?.split('→')[0]?.trim();
-  return getCoordinatesForDestination(originName) ?? (isHomeTerminal(originName) ? VIRAC_HUB : null);
+  const name = originPlace(trip);
+  return getCoordinatesForDestination(name) ?? (isHomeTerminal(name) ? VIRAC_HUB : null);
 }
 
 function directionLabel(trip) {
@@ -117,10 +107,23 @@ function cooperativeName(trip) {
   return trip.van?.cooperative?.name ?? 'Unassigned';
 }
 
+// Arrived at the terminal on the outbound leg and waiting for the dispatcher's scan.
+function isAwaitingScan(trip) {
+  return trip.direction !== 'RETURN' && trip.status === 'ARRIVING';
+}
+
+function locationHint(trip, hasGps, liveData) {
+  if (hasGps) return formatSpeed(liveData.speed);
+  if (trip.status === 'BOARDING') {
+    return trip.direction === 'RETURN' ? 'Boarding at the terminal' : `Boarding at ${originPlace(trip)}`;
+  }
+  if (trip.status === 'QUEUED') return 'Waiting in line at the terminal';
+  return 'Awaiting GPS…';
+}
+
 // ─── map helper ───────────────────────────────────────────────────────────────
-// The map is hidden (display:none) on mobile while another tab is active.
-// Leaflet measures its container on mount, so when the tab is revealed we
-// must tell it to re-measure or tiles render grey/partial.
+// On phones the map is hidden while another tab is active. Leaflet measures
+// its container on mount, so it must re-measure when the tab is revealed.
 
 function MapInvalidator({ active }) {
   const map = useMap();
@@ -156,7 +159,11 @@ function MetricCard({ label, value, highlight }) {
 
 function TripCard({ trip, liveData, isSelected, onClick }) {
   const hasGps = typeof liveData?.lat === 'number' && typeof liveData?.lng === 'number';
-  const isBoarding = trip.status === 'BOARDING';
+  const dotClass = hasGps
+    ? 'bg-blue-500 animate-ping'
+    : trip.status === 'BOARDING'
+    ? 'bg-green-500'
+    : 'bg-amber-400';
 
   return (
     <button
@@ -195,23 +202,24 @@ function TripCard({ trip, liveData, isSelected, onClick }) {
         🏢 {cooperativeName(trip)}
       </div>
 
-      <div className="flex items-center justify-between gap-2 mt-1 bg-slate-50 px-2 py-1.5 rounded-lg border border-slate-100">
+      {isAwaitingScan(trip) && (
+        <div className="text-xs font-bold text-indigo-700 bg-indigo-50 border border-indigo-100 rounded-lg px-2 py-1.5 mb-2">
+          📸 Arrived — ready to be scanned
+        </div>
+      )}
+
+      <div className="flex items-center justify-between gap-2 bg-slate-50 px-2 py-1.5 rounded-lg border border-slate-100">
         <div className="flex items-center gap-1.5 min-w-0">
-          <span
-            className={`w-2 h-2 rounded-full flex-shrink-0 ${
-              hasGps ? 'bg-blue-500 animate-ping' : isBoarding ? 'bg-green-500' : 'bg-amber-400'
-            }`}
-            aria-hidden="true"
-          />
+          <span className={`w-2 h-2 rounded-full flex-shrink-0 ${dotClass}`} aria-hidden="true" />
           <span className="text-xs font-semibold text-slate-600 truncate">
-            {hasGps ? formatSpeed(liveData.speed) : isBoarding ? 'At Terminal/Origin' : 'Awaiting GPS…'}
+            {locationHint(trip, hasGps, liveData)}
           </span>
         </div>
 
         {(trip.seatInfo?.totalSeats > 0 || trip.van?.capacity > 0) && (
           <span className="text-xs font-bold text-slate-600 shrink-0">
-            {trip.seatInfo?.availableSeats ?? trip.van?.capacity}/
-            {trip.seatInfo?.totalSeats ?? trip.van?.capacity} seats
+            {trip.seatInfo?.availableSeats ?? trip.availableSeats ?? trip.van?.capacity}/
+            {trip.seatInfo?.totalSeats ?? trip.totalSeats ?? trip.van?.capacity} seats
           </span>
         )}
       </div>
@@ -219,87 +227,89 @@ function TripCard({ trip, liveData, isSelected, onClick }) {
   );
 }
 
-// ─── TerminalVanCard ──────────────────────────────────────────────────────────
-// A van's state at the terminal: arrived and awaiting the dispatcher's scan,
-// boarding for the return leg, queued behind vans of the SAME cooperative,
-// or idle.
+// ─── Terminal line-up ─────────────────────────────────────────────────────────
+// A van only appears here AFTER the dispatcher has scanned it at the
+// terminal. It is placed straight into its own cooperative's line: the first
+// van is "Now boarding", every other van waits behind it in scan order.
+// Cooperatives never block each other — each has its own lane.
 
-function TerminalVanCard({ entry, terminalStatus }) {
-  const isAwaitingScan = terminalStatus === 'AWAITING_SCAN';
-  const isBoarding     = terminalStatus === 'BOARDING';
-  const isQueued       = terminalStatus === 'QUEUED';
+function LineCard({ entry, kind }) {
+  const isBoarding = kind === 'BOARDING';
+  const heading = isBoarding
+    ? 'Now boarding'
+    : entry.queuePosition === 1
+    ? 'Next in line'
+    : `${entry.queuePosition}${entry.queuePosition === 2 ? 'nd' : entry.queuePosition === 3 ? 'rd' : 'th'} in line`;
 
-  const palette = isBoarding
-    ? { card: 'border-green-200 bg-green-50', badge: 'bg-green-100 text-green-800 border-green-200', label: 'Boarding' }
-    : isQueued
-    ? { card: 'border-amber-200 bg-amber-50', badge: 'bg-amber-100 text-amber-800 border-amber-200', label: `Queued · #${entry.queuePosition}` }
-    : isAwaitingScan
-    ? { card: 'border-indigo-200 bg-indigo-50', badge: 'bg-indigo-100 text-indigo-800 border-indigo-200', label: 'Scan to check in' }
-    : { card: 'border-slate-200 bg-white', badge: 'bg-slate-100 text-slate-600 border-slate-200', label: 'Idle' };
+  const available = entry.trip?.availableSeats;
+  const total = entry.trip?.totalSeats;
 
   return (
-    <div className={`p-3 rounded-xl border ${palette.card}`}>
-      <div className="flex justify-between items-start gap-2">
-        <div className="min-w-0">
-          <div className="font-black text-slate-800 text-sm truncate">
-            {entry.driver?.name ?? 'No driver on file'}
+    <div className={`p-3 rounded-xl border ${isBoarding ? 'border-green-200 bg-green-50' : 'border-amber-200 bg-amber-50'}`}>
+      <div className="flex items-center gap-3">
+        <div
+          className={`shrink-0 w-10 h-10 rounded-full flex items-center justify-center text-sm font-black ${
+            isBoarding ? 'bg-green-600 text-white' : 'bg-white text-amber-700 border border-amber-300'
+          }`}
+          aria-hidden="true"
+        >
+          {isBoarding ? '🧍' : `#${entry.queuePosition}`}
+        </div>
+
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-black text-slate-800 text-sm truncate">
+              {entry.driver?.name ?? 'No driver on file'}
+            </span>
+            <span
+              className={`shrink-0 text-[11px] font-bold px-2 py-0.5 rounded border ${
+                isBoarding
+                  ? 'bg-green-100 text-green-800 border-green-200'
+                  : 'bg-amber-100 text-amber-800 border-amber-200'
+              }`}
+            >
+              {heading}
+            </span>
           </div>
           <div className="text-xs font-bold text-emerald-700 uppercase tracking-widest mt-0.5">
             {entry.plateNumber}
           </div>
         </div>
-        <span className={`shrink-0 text-xs font-bold px-2 py-0.5 rounded border ${palette.badge}`}>
-          {palette.label}
-        </span>
       </div>
 
-      {(isBoarding || isQueued) && entry.trip?.routeName && (
-        <div className={`text-xs mt-2 pt-2 border-t ${isBoarding ? 'border-green-100 text-slate-500' : 'border-amber-100 text-amber-700'}`}>
-          Route: <span className="font-semibold text-slate-700">{entry.trip.routeName}</span>
-          {isQueued && <div className="mt-0.5">Waiting for this cooperative's boarding slot to free up.</div>}
-        </div>
-      )}
-
-      {isAwaitingScan && (
-        <div className="text-xs text-indigo-600 mt-2 pt-2 border-t border-indigo-100">
-          Arrived at the terminal — scan this van's QR to check it in.
-        </div>
-      )}
-
-      {!isBoarding && !isQueued && !isAwaitingScan && (
-        <div className="text-xs text-slate-400 mt-2 pt-2 border-t border-slate-100">
-          Ready — waiting for driver to start a trip.
-        </div>
-      )}
+      <div
+        className={`text-xs mt-2 pt-2 border-t flex items-center justify-between gap-2 ${
+          isBoarding ? 'border-green-100 text-slate-600' : 'border-amber-100 text-amber-800'
+        }`}
+      >
+        <span className="truncate">
+          {entry.trip?.origin ? `Heading to ${entry.trip.origin}` : (entry.trip?.routeName ?? 'Return trip')}
+        </span>
+        {isBoarding && typeof available === 'number' && typeof total === 'number' && (
+          <span className="font-bold shrink-0">🪑 {available}/{total}</span>
+        )}
+      </div>
     </div>
   );
 }
 
-// Every van at the terminal grouped under its cooperative — each
-// cooperative's Boarding / Queued lists are independent of the others.
-function CooperativeTerminalGroup({ group }) {
-  const total = group.awaitingScan.length + group.boarding.length + group.queued.length + group.idle.length;
+function CooperativeLane({ group }) {
+  const total = group.boarding.length + group.queued.length;
 
   return (
     <div className="rounded-2xl border border-slate-200 bg-white overflow-hidden shadow-sm">
       <div className="bg-slate-800 text-white text-xs font-black uppercase tracking-wide px-3 py-2.5 flex items-center justify-between">
         <span className="truncate">🏢 {group.cooperativeName}</span>
         <span className="text-slate-300 font-normal normal-case shrink-0 ml-2">
-          {total} van{total === 1 ? '' : 's'}
+          {total} in line
         </span>
       </div>
       <div className="p-2 flex flex-col gap-2">
         {group.boarding.map((entry) => (
-          <TerminalVanCard key={entry.vanId} entry={entry} terminalStatus="BOARDING" />
+          <LineCard key={entry.vanId} entry={entry} kind="BOARDING" />
         ))}
         {group.queued.map((entry) => (
-          <TerminalVanCard key={entry.vanId} entry={entry} terminalStatus="QUEUED" />
-        ))}
-        {group.awaitingScan.map((entry) => (
-          <TerminalVanCard key={entry.vanId} entry={entry} terminalStatus="AWAITING_SCAN" />
-        ))}
-        {group.idle.map((entry) => (
-          <TerminalVanCard key={entry.vanId} entry={entry} terminalStatus="IDLE" />
+          <LineCard key={entry.vanId} entry={entry} kind="QUEUED" />
         ))}
       </div>
     </div>
@@ -326,91 +336,10 @@ function ErrorState({ message, onRetry }) {
   );
 }
 
-// Bottom sheet on phones, centered dialog from `sm` up.
-function DepartureModal({ scan, onConfirm, onDismiss, isSubmitting }) {
-  const [departureTime, setDepartureTime] = useState('');
-  const [error, setError]                 = useState('');
-
-  useEffect(() => {
-    if (!scan) return;
-    const soon = new Date(Date.now() + 5 * 60_000);
-    const pad  = (n) => String(n).padStart(2, '0');
-    setDepartureTime(`${pad(soon.getHours())}:${pad(soon.getMinutes())}`);
-    setError('');
-  }, [scan]);
-
-  if (!scan) return null;
-
-  const handleSubmit = () => {
-    if (!departureTime) {
-      setError('Please enter a departure time.');
-      return;
-    }
-    setError('');
-    onConfirm({ tripId: scan.tripId, departureTime });
-  };
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/40 backdrop-blur-sm sm:p-4">
-      <div className="bg-white rounded-t-2xl sm:rounded-2xl shadow-xl w-full sm:max-w-sm overflow-hidden pb-[env(safe-area-inset-bottom)]">
-        <div className="bg-blue-900 text-white px-5 py-4">
-          <h2 className="font-bold text-base">🕐 Set expected departure</h2>
-          <p className="text-xs text-blue-300 mt-0.5">Passenger arrived — when does this van depart?</p>
-        </div>
-        <div className="px-5 pt-4 pb-2">
-          <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 text-sm space-y-1.5">
-            <div className="flex justify-between gap-3">
-              <span className="text-slate-500">Passenger</span>
-              <span className="font-semibold text-slate-800 truncate">{scan.passengerName ?? '—'}</span>
-            </div>
-            <div className="flex justify-between gap-3">
-              <span className="text-slate-500">Van</span>
-              <span className="font-semibold text-slate-800 truncate">{scan.plateNumber ?? '—'}</span>
-            </div>
-            <div className="flex justify-between gap-3">
-              <span className="text-slate-500">Route</span>
-              <span className="font-semibold text-slate-800 truncate">{scan.routeName ?? '—'}</span>
-            </div>
-          </div>
-        </div>
-        <div className="px-5 py-3">
-          <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wider mb-1.5">
-            Expected departure time
-          </label>
-          <input
-            type="time"
-            value={departureTime}
-            onChange={(e) => { setDepartureTime(e.target.value); setError(''); }}
-            className="w-full px-3 py-3 text-base font-semibold border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500"
-            autoFocus
-          />
-          {error && <p className="text-xs text-red-600 mt-1.5 font-medium">{error}</p>}
-        </div>
-        <div className="px-5 pb-5 flex gap-2">
-          <button
-            onClick={onDismiss}
-            disabled={isSubmitting}
-            className="flex-1 py-3 text-sm font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-xl transition-colors disabled:opacity-50"
-          >
-            Skip
-          </button>
-          <button
-            onClick={handleSubmit}
-            disabled={isSubmitting}
-            className="flex-grow-[2] py-3 text-sm font-bold text-white bg-blue-600 hover:bg-blue-700 rounded-xl transition-colors disabled:opacity-60 flex items-center justify-center gap-2"
-          >
-            {isSubmitting ? 'Saving…' : '✅ Confirm departure'}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 // Bottom tab bar — phones/tablets only. Desktop shows sidebar + map together.
 function MobileTabBar({ activeTab, onChange, terminalCount, fleetCount }) {
   const tabs = [
-    { key: 'terminal', icon: '🅿️', label: 'Terminal', count: terminalCount },
+    { key: 'terminal', icon: '🚏', label: 'Terminal', count: terminalCount },
     { key: 'fleet',    icon: '🚐', label: 'Fleet',    count: fleetCount },
     { key: 'map',      icon: '🗺️', label: 'Map',      count: null },
   ];
@@ -436,9 +365,11 @@ function MobileTabBar({ activeTab, onChange, terminalCount, fleetCount }) {
             <span className="flex items-center gap-1">
               {tab.label}
               {tab.count != null && tab.count > 0 && (
-                <span className={`min-w-[18px] px-1 rounded-full text-[10px] leading-[18px] text-center ${
-                  isActive ? 'bg-blue-600 text-white' : 'bg-slate-200 text-slate-700'
-                }`}>
+                <span
+                  className={`min-w-[18px] px-1 rounded-full text-[10px] leading-[18px] text-center ${
+                    isActive ? 'bg-blue-600 text-white' : 'bg-slate-200 text-slate-700'
+                  }`}
+                >
                   {tab.count}
                 </span>
               )}
@@ -453,38 +384,34 @@ function MobileTabBar({ activeTab, onChange, terminalCount, fleetCount }) {
 // ─── main component ───────────────────────────────────────────────────────────
 
 export default function DispatcherDashboard() {
-  const [activeTrips, setActiveTrips]     = useState([]);
-  const [liveLocations, setLiveLocations] = useState({});
-  const [loading, setLoading]             = useState(true);
-  const [error, setError]                 = useState('');
+  const [activeTrips, setActiveTrips]       = useState([]);
+  const [liveLocations, setLiveLocations]   = useState({});
+  const [loading, setLoading]               = useState(true);
+  const [error, setError]                   = useState('');
   const [selectedTripId, setSelectedTripId] = useState(null);
-  const [reloadToken, setReloadToken]     = useState(0);
+  const [reloadToken, setReloadToken]       = useState(0);
 
-  const [terminalGroups, setTerminalGroups] = useState([]);
+  const [terminalGroups, setTerminalGroups]   = useState([]);
   const [terminalLoading, setTerminalLoading] = useState(true);
-  const [terminalError, setTerminalError] = useState('');
+  const [terminalError, setTerminalError]     = useState('');
 
   const [isScannerOpen, setIsScannerOpen] = useState(false);
-  const [isCreateOpen, setIsCreateOpen]   = useState(false);
   const [successMessage, setSuccessMessage] = useState('');
-  const [departureScan, setDepartureScan] = useState(null);
-  const [isDepartureSubmitting, setIsDepartureSubmitting] = useState(false);
 
-  // Mobile-only: which full-screen view is showing. On lg+ everything is
+  // Phones only: which full-screen view is showing. On lg+ everything is
   // visible at once, so this has no effect there.
   const [activeTab, setActiveTab] = useState('terminal');
 
-  const navigate = useNavigate();
+  const navigate        = useNavigate();
   const successTimerRef = useRef(null);
   const mapRef          = useRef(null);
 
-  // ── API Fetching ───────────────────────────────────────────────────────────
+  // ── API fetching ───────────────────────────────────────────────────────────
 
   const fetchActiveTrips = useCallback(async (signal) => {
     try {
       const response = await apiClient.get('/trips/live', { signal });
-      const trips    = Array.isArray(response.data) ? response.data : [];
-      setActiveTrips(trips);
+      setActiveTrips(Array.isArray(response.data) ? response.data : []);
       setError('');
     } catch (err) {
       if (err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') return;
@@ -502,13 +429,14 @@ export default function DispatcherDashboard() {
       setTerminalError('');
     } catch (err) {
       if (err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') return;
-      setTerminalError('Could not load vans at the terminal.');
+      setTerminalError('Could not load the terminal line-up.');
       console.error('[DispatcherDashboard] fetchTerminalVans error:', err);
     } finally {
       setTerminalLoading(false);
     }
   }, []);
 
+  // Safety-net poll in case a socket event is missed.
   useEffect(() => {
     const id = setInterval(() => {
       const ctrl = new AbortController();
@@ -544,8 +472,14 @@ export default function DispatcherDashboard() {
     const handleSeatUpdate = (data) => {
       if (!data?.tripId || typeof data.availableSeats !== 'number') return;
       setActiveTrips((prev) =>
-        prev.map((t) => t.id === data.tripId ? { ...t, seatInfo: { availableSeats: data.availableSeats, totalSeats: data.totalSeats } } : t)
+        prev.map((t) =>
+          t.id === data.tripId
+            ? { ...t, seatInfo: { availableSeats: data.availableSeats, totalSeats: data.totalSeats } }
+            : t
+        )
       );
+      // Boarding vans in the line-up show their seats too.
+      fetchTerminalVans();
     };
 
     const handleTripStatusChanged = ({ tripId, status, trip }) => {
@@ -559,13 +493,14 @@ export default function DispatcherDashboard() {
         if (trip) return [trip, ...prev];
         return prev;
       });
+      // A scan, a departure from the boarding slot, or a queue promotion
+      // all change the line-up.
       fetchTerminalVans();
     };
 
     const handleTripDispatched = ({ trip }) => {
       if (!trip?.id) return;
       setActiveTrips((prev) => (prev.some((t) => t.id === trip.id) ? prev : [trip, ...prev]));
-      fetchTerminalVans();
     };
 
     socket.connect();
@@ -573,19 +508,17 @@ export default function DispatcherDashboard() {
 
     socket.on('initial_locations',     handleInitialLocations);
     socket.on('van_moved',             handleVanMoved);
-    socket.on('seat_update',           handleSeatUpdate);           // Legacy support
-    socket.on('seat_update_broadcast', handleSeatUpdate);           // New broadcast
+    socket.on('seat_update_broadcast', handleSeatUpdate);
     socket.on('trip_status_changed',   handleTripStatusChanged);
     socket.on('trip_dispatched',       handleTripDispatched);
 
     return () => {
       controller.abort();
-      socket.off('initial_locations',   handleInitialLocations);
-      socket.off('van_moved',           handleVanMoved);
-      socket.off('seat_update',         handleSeatUpdate);
+      socket.off('initial_locations',     handleInitialLocations);
+      socket.off('van_moved',             handleVanMoved);
       socket.off('seat_update_broadcast', handleSeatUpdate);
-      socket.off('trip_status_changed', handleTripStatusChanged);
-      socket.off('trip_dispatched',     handleTripDispatched);
+      socket.off('trip_status_changed',   handleTripStatusChanged);
+      socket.off('trip_dispatched',       handleTripDispatched);
       socket.disconnect();
       if (successTimerRef.current) clearTimeout(successTimerRef.current);
     };
@@ -599,36 +532,18 @@ export default function DispatcherDashboard() {
     successTimerRef.current = setTimeout(() => setSuccessMessage(''), SUCCESS_BANNER_TTL);
   }, []);
 
+  // After a scan the van is already in its cooperative's line — on a phone,
+  // jump to the Terminal tab so the dispatcher sees it lined up.
   const handleScanSuccess = useCallback((result) => {
     showSuccess(typeof result === 'string' ? result : 'QR scan successful.');
     fetchActiveTrips();
     fetchTerminalVans();
-  }, [fetchActiveTrips, fetchTerminalVans, showSuccess]);
-
-  const handleDepartureConfirm = useCallback(async ({ tripId, departureTime }) => {
-    setIsDepartureSubmitting(true);
-    try {
-      await apiClient.patch(`/trips/${tripId}/departure`, { expectedDepartureTime: departureTime });
-      showSuccess(`Departure set to ${departureTime} — van is ready to roll.`);
-      fetchActiveTrips();
-    } catch (err) {
-      console.error('[DispatcherDashboard] setDeparture error:', err);
-      showSuccess('Departure time saved locally — sync failed, will retry.');
-    } finally {
-      setIsDepartureSubmitting(false);
-      setDepartureScan(null);
-    }
-  }, [fetchActiveTrips, showSuccess]);
-
-  const handleCreateSuccess = useCallback((message) => {
-    showSuccess(message);
-    fetchActiveTrips();
-    fetchTerminalVans();
+    if (!isDesktopViewport()) setActiveTab('terminal');
   }, [fetchActiveTrips, fetchTerminalVans, showSuccess]);
 
   // `focusMap` is used by list cards: on phones, tapping a van jumps to the
   // Map tab and centers on it. On desktop the map is already visible, so a
-  // second tap simply deselects, as before.
+  // second tap simply deselects.
   const handleTripSelect = useCallback((tripId, { focusMap = false } = {}) => {
     const onPhone = !isDesktopViewport();
 
@@ -641,7 +556,7 @@ export default function DispatcherDashboard() {
 
     const loc = liveLocations[tripId];
     if (loc) {
-      // Delay so the map has been revealed + resized before re-centering.
+      // Delay so the map is revealed and resized before re-centering.
       setTimeout(() => {
         mapRef.current?.setView([loc.lat, loc.lng], 14, { animate: true });
       }, focusMap && onPhone ? 140 : 0);
@@ -660,30 +575,26 @@ export default function DispatcherDashboard() {
     }
   }, [navigate]);
 
-  // ── Derived Metrics ────────────────────────────────────────────────────────
+  // ── Derived data ───────────────────────────────────────────────────────────
 
-  const liveCount = activeTrips.filter((t) => liveLocations[t.id]).length;
-  const totalPax  = activeTrips.reduce((acc, t) => {
-    const avail = t.seatInfo?.availableSeats ?? t.van?.capacity ?? 0;
-    const total = t.seatInfo?.totalSeats ?? t.van?.capacity ?? 0;
-    return acc + Math.max(0, total - avail);
-  }, 0);
+  // Only cooperatives that actually have a scanned van in line. Anything the
+  // backend still sends about idle or not-yet-scanned vans is ignored here.
+  const lanes = terminalGroups
+    .map((g) => ({
+      ...g,
+      boarding: Array.isArray(g.boarding) ? g.boarding : [],
+      queued: Array.isArray(g.queued) ? g.queued : [],
+    }))
+    .filter((g) => g.boarding.length + g.queued.length > 0);
 
-  const avgSpeedKph = liveCount === 0 ? 0 : Math.round(
-    activeTrips
-      .filter((t) => liveLocations[t.id])
-      .reduce((acc, t) => acc + mpsToKph(liveLocations[t.id]?.speed), 0) / liveCount
-  );
+  const boardingCount = lanes.reduce((acc, g) => acc + g.boarding.length, 0);
+  const queuedCount   = lanes.reduce((acc, g) => acc + g.queued.length, 0);
+  const lineUpCount   = boardingCount + queuedCount;
 
-  const terminalVanCount = terminalGroups.reduce(
-    (acc, g) => acc + g.awaitingScan.length + g.boarding.length + g.queued.length + g.idle.length,
-    0,
-  );
+  const liveCount          = activeTrips.filter((t) => liveLocations[t.id]).length;
+  const awaitingScanCount  = activeTrips.filter(isAwaitingScan).length;
 
-  // Vans that need the dispatcher's attention right now (arrived, unscanned).
-  const awaitingScanCount = terminalGroups.reduce((acc, g) => acc + g.awaitingScan.length, 0);
-
-  // ── Render States ──────────────────────────────────────────────────────────
+  // ── Render states ──────────────────────────────────────────────────────────
 
   if (loading) {
     return (
@@ -713,37 +624,31 @@ export default function DispatcherDashboard() {
             {activeTrips.length} {activeTrips.length === 1 ? 'Trip' : 'Trips'}
           </span>
 
-          <button 
-  onClick={handleLogout} 
-  aria-label="Log out" 
-  className="bg-red-500/10 hover:bg-red-500/20 active:bg-red-500/30 text-red-500 hover:text-red-400 text-sm font-bold h-10 px-4 rounded-lg transition-colors border border-red-500/30 hover:border-red-500/50 flex items-center"
->
-  Logout
-</button>
-
-        </div>
-
-        {/* Primary actions — big, full-width thumb targets on phones */}
-        <div className="grid grid-cols-2 gap-2 mt-2.5 sm:flex sm:justify-end">
           <button
-            onClick={() => setIsScannerOpen(true)}
-            className="relative bg-emerald-500 hover:bg-emerald-400 active:bg-emerald-600 text-white text-sm font-bold min-h-[44px] px-4 rounded-xl transition-colors shadow-sm flex items-center justify-center gap-2"
+            onClick={handleLogout}
+            aria-label="Log out"
+            className="bg-slate-700/50 hover:bg-slate-700 active:bg-slate-800 text-white text-sm font-bold h-10 px-3 rounded-lg transition-colors border border-slate-600 flex items-center gap-1.5"
           >
-            📸 Scan QR
-            {awaitingScanCount > 0 && (
-              <span className="min-w-[20px] h-5 px-1.5 rounded-full bg-white text-emerald-700 text-[11px] font-black flex items-center justify-center">
-                {awaitingScanCount}
-              </span>
-            )}
-          </button>
-
-          <button
-            onClick={() => setIsCreateOpen(true)}
-            className="bg-blue-500 hover:bg-blue-400 active:bg-blue-600 text-white text-sm font-bold min-h-[44px] px-4 rounded-xl transition-colors shadow-sm flex items-center justify-center gap-2"
-          >
-            ➕ Dispatch
+            <span aria-hidden="true">🚪</span>
+            <span className="hidden sm:inline">Logout</span>
           </button>
         </div>
+
+        {/* The dispatcher's one job: scan vans in. Big thumb target on phones. */}
+        <button
+          onClick={() => setIsScannerOpen(true)}
+          className="mt-2.5 w-full sm:w-auto sm:ml-auto bg-emerald-500 hover:bg-emerald-400 active:bg-emerald-600 text-white text-sm font-bold min-h-[44px] px-5 rounded-xl transition-colors shadow-sm flex items-center justify-center gap-2"
+        >
+          📸 Scan QR
+          {awaitingScanCount > 0 && (
+            <span
+              className="px-2 h-5 rounded-full bg-white text-emerald-700 text-[11px] font-black flex items-center justify-center"
+              title="Vans that have arrived and are waiting to be scanned"
+            >
+              {awaitingScanCount} waiting
+            </span>
+          )}
+        </button>
       </header>
 
       {successMessage && (
@@ -763,19 +668,19 @@ export default function DispatcherDashboard() {
           className={`${activeTab === 'map' ? 'hidden' : 'flex'} lg:flex w-full lg:w-80 xl:w-96 bg-white lg:border-r border-slate-200 flex-col overflow-hidden lg:shadow-2xl z-10`}
         >
           <div className="p-3 lg:p-4 border-b border-slate-100 grid grid-cols-4 lg:grid-cols-2 gap-2 lg:gap-3 bg-slate-50/50 shrink-0">
-            <MetricCard label="Active"     value={activeTrips.length} />
-            <MetricCard label="GPS Live"   value={liveCount}          highlight />
-            <MetricCard label="Passengers" value={totalPax} />
-            <MetricCard label="Avg Speed"  value={`${avgSpeedKph}`} />
+            <MetricCard label="Active"   value={activeTrips.length} />
+            <MetricCard label="Boarding" value={boardingCount} highlight />
+            <MetricCard label="In line"  value={queuedCount} />
+            <MetricCard label="GPS live" value={liveCount} />
           </div>
 
           <div className="flex-1 overflow-y-auto overscroll-contain p-3 lg:p-4 bg-slate-50 space-y-6">
 
-            {/* ── At the Terminal (grouped by cooperative) ───────────────── */}
+            {/* ── Terminal line-up, one lane per cooperative ───────────────── */}
             <div className={activeTab === 'terminal' ? 'block' : 'hidden lg:block'}>
               <h2 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-3 flex justify-between items-center">
-                🅿️ At the Terminal
-                <span className="text-purple-500 font-bold">{terminalVanCount}</span>
+                🚏 Terminal Line-up
+                <span className="text-purple-500 font-bold">{lineUpCount}</span>
               </h2>
 
               {terminalError && (
@@ -786,34 +691,37 @@ export default function DispatcherDashboard() {
 
               {terminalLoading ? (
                 <div className="text-center py-8 border-2 border-dashed border-slate-200 rounded-2xl bg-white">
-                  <p className="text-xs font-semibold text-slate-400">Loading terminal status…</p>
+                  <p className="text-xs font-semibold text-slate-400">Loading line-up…</p>
                 </div>
-              ) : terminalGroups.length === 0 ? (
-                <div className="text-center py-8 border-2 border-dashed border-slate-200 rounded-2xl bg-white">
-                  <span className="text-2xl mb-1 block">🚐</span>
-                  <p className="text-xs font-bold text-slate-500">No vans at the terminal right now.</p>
+              ) : lanes.length === 0 ? (
+                <div className="text-center py-8 px-4 border-2 border-dashed border-slate-200 rounded-2xl bg-white">
+                  <span className="text-2xl mb-1 block">📸</span>
+                  <p className="text-xs font-bold text-slate-500">No scanned vans yet.</p>
+                  <p className="text-xs text-slate-400 mt-1">
+                    A van joins its cooperative's line here as soon as you scan its QR at the terminal.
+                  </p>
                 </div>
               ) : (
                 <div className="flex flex-col gap-4">
-                  {terminalGroups.map((group) => (
-                    <CooperativeTerminalGroup key={group.cooperativeId ?? 'unassigned'} group={group} />
+                  {lanes.map((group) => (
+                    <CooperativeLane key={group.cooperativeId ?? 'unassigned'} group={group} />
                   ))}
                 </div>
               )}
             </div>
 
-            {/* ── Live Fleet Status ────────────────────────────────────────── */}
+            {/* ── Live fleet ───────────────────────────────────────────────── */}
             <div className={activeTab === 'fleet' ? 'block' : 'hidden lg:block'}>
               <h2 className="text-xs font-black text-slate-400 uppercase tracking-widest mb-3 flex justify-between">
-                Live Fleet Status
+                Live Fleet
                 <span className="text-blue-500 font-bold">{activeTrips.length}</span>
               </h2>
 
               {activeTrips.length === 0 ? (
                 <div className="text-center py-12 border-2 border-dashed border-slate-200 rounded-2xl bg-white">
-                  <span className="text-3xl mb-2 block">🅿️</span>
-                  <p className="text-sm font-bold text-slate-600">Terminal is clear.</p>
-                  <p className="text-xs text-slate-400 mt-1 font-medium">Wait for drivers to self-start or dispatch manually.</p>
+                  <span className="text-3xl mb-2 block">🚐</span>
+                  <p className="text-sm font-bold text-slate-600">No active trips.</p>
+                  <p className="text-xs text-slate-400 mt-1 font-medium">Trips appear here when drivers start them.</p>
                 </div>
               ) : (
                 <div className="flex flex-col gap-3">
@@ -898,7 +806,6 @@ export default function DispatcherDashboard() {
             })}
           </MapContainer>
 
-          {/* No GPS overlay */}
           {activeTrips.length > 0 && liveCount === 0 && (
             <div className="absolute bottom-4 lg:bottom-6 left-1/2 -translate-x-1/2 w-[calc(100%-2rem)] max-w-sm bg-white/90 backdrop-blur-sm border-2 border-amber-200 text-amber-800 text-xs font-bold px-4 py-2.5 rounded-full shadow-lg pointer-events-none z-[1000] flex items-center justify-center gap-2 text-center">
               <span className="animate-spin text-base leading-none">⏳</span>
@@ -912,28 +819,15 @@ export default function DispatcherDashboard() {
       <MobileTabBar
         activeTab={activeTab}
         onChange={setActiveTab}
-        terminalCount={terminalVanCount}
+        terminalCount={lineUpCount}
         fleetCount={activeTrips.length}
       />
 
-      {/* ── Modals ─────────────────────────────────────────────────────────── */}
+      {/* ── Modal ──────────────────────────────────────────────────────────── */}
       <QRScannerModal
         isOpen={isScannerOpen}
         onClose={() => setIsScannerOpen(false)}
         onSuccess={handleScanSuccess}
-      />
-
-      <DepartureModal
-        scan={departureScan}
-        onConfirm={handleDepartureConfirm}
-        onDismiss={() => setDepartureScan(null)}
-        isSubmitting={isDepartureSubmitting}
-      />
-
-      <CreateTripModal
-        isOpen={isCreateOpen}
-        onClose={() => setIsCreateOpen(false)}
-        onSuccess={handleCreateSuccess}
       />
     </div>
   );
