@@ -19,7 +19,9 @@ import { VIRAC_HUB } from '../components/townCoordinates';
 //
 //   RETURN    terminal → municipality
 //     (QUEUED →) BOARDING → DEPARTING → DEPARTED → ARRIVING
-//     No scan at the municipality — the driver taps "Finish Trip".
+//     At DEPARTING the driver shows a QR code again. The dispatcher's scan
+//     releases the van from the terminal (DEPARTED). There is no scan at
+//     the municipality — the driver taps "Finish Trip".
 
 const GPS_OPTIONS = { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 };
 
@@ -252,7 +254,7 @@ function legOriginLabel(trip) {
 }
 
 // The single driver-facing button for the current status (null when the
-// driver has nothing to tap — e.g. waiting for the dispatcher's scan).
+// driver has nothing to tap — e.g. waiting for a dispatcher scan).
 function getAdvanceStep(trip) {
   if (!trip) return null;
   const dest = legDestinationLabel(trip);
@@ -260,6 +262,9 @@ function getAdvanceStep(trip) {
     case 'BOARDING':
       return { next: 'DEPARTING', actionLabel: '🚦 Ready to Depart', actionHint: 'Tap once all passengers are seated.' };
     case 'DEPARTING':
+      // On the RETURN leg the dispatcher's exit scan confirms departure —
+      // the driver just shows their QR code.
+      if (getDirection(trip) === 'RETURN') return null;
       return { next: 'DEPARTED', actionLabel: '🚐 Confirm Departure', actionHint: 'Tap the moment you actually pull out.' };
     case 'DEPARTED':
       return { next: 'ARRIVING', actionLabel: `📍 Approaching ${dest}`, actionHint: `Tap when you're close to ${dest}.` };
@@ -768,17 +773,21 @@ function ETACountdown({ eta }) {
 }
 
 // ── TripQrPanel ────────────────────────────────────────────────────────────
-// Shown ONLY on the outbound leg's ARRIVING status — it's the van's ticket
-// to the dispatcher's terminal check-in scan.
+// The van's ticket for a dispatcher scan at the terminal. Shown at TWO points:
+//   mode="CHECK_IN" — OUTBOUND leg, ARRIVING (van has reached the terminal)
+//   mode="EXIT"     — RETURN leg, DEPARTING (van is ready to leave the terminal)
 
-function TripQrPanel({ trip, onRefresh }) {
+function TripQrPanel({ trip, onRefresh, mode = 'CHECK_IN' }) {
   const van = trip?.van;
+  const isExit = mode === 'EXIT';
 
   if (!van?.qrToken) {
     return (
       <section className="bg-amber-50 border border-amber-200 rounded-xl p-5 text-center">
         <p className="text-sm font-semibold text-amber-800">QR code unavailable</p>
-        <p className="text-xs text-amber-600 mt-1">Tap refresh below, or ask your dispatcher to check you in manually.</p>
+        <p className="text-xs text-amber-600 mt-1">
+          Tap refresh below, or ask your dispatcher to {isExit ? 'release you' : 'check you in'} manually.
+        </p>
         <button onClick={onRefresh} className="mt-3 text-xs text-amber-700 hover:text-amber-900 underline underline-offset-2">
           Refresh
         </button>
@@ -787,11 +796,17 @@ function TripQrPanel({ trip, onRefresh }) {
   }
 
   return (
-    <section className="bg-white border-2 border-indigo-200 rounded-2xl p-6 text-center" aria-label="Terminal check-in QR code">
-      <p className="text-sm font-bold text-indigo-900 mb-1">You've reached the terminal 🎉</p>
+    <section
+      className="bg-white border-2 border-indigo-200 rounded-2xl p-6 text-center"
+      aria-label={isExit ? 'Terminal exit QR code' : 'Terminal check-in QR code'}
+    >
+      <p className="text-sm font-bold text-indigo-900 mb-1">
+        {isExit ? 'Ready to leave the terminal 🚐' : "You've reached the terminal 🎉"}
+      </p>
       <p className="text-xs text-indigo-500 mb-4">
-        Show this to your dispatcher. Scanning it checks you into your cooperative's
-        boarding line — first in line starts boarding right away, otherwise you'll be queued.
+        {isExit
+          ? `Show this to your dispatcher. Once scanned, your trip to ${legDestinationLabel(trip)} starts and you're cleared to leave.`
+          : "Show this to your dispatcher. Scanning it checks you into your cooperative's boarding line — first in line starts boarding right away, otherwise you'll be queued."}
       </p>
       <div className="flex justify-center mb-4">
         <div className="p-4 bg-white rounded-xl border-2 border-indigo-100 shadow-sm">
@@ -822,10 +837,11 @@ function StatusControlPanel({
   const dest = legDestinationLabel(trip);
   const step = getAdvanceStep(trip);
 
-  const awaitingScan = direction === 'OUTBOUND' && trip.status === 'ARRIVING';
-  const canFinish    = direction === 'RETURN' && trip.status === 'ARRIVING';
-  const isQueued     = trip.status === 'QUEUED';
-  const showEta      = ETA_STATUSES.includes(trip.status);
+  const awaitingScan     = direction === 'OUTBOUND' && trip.status === 'ARRIVING';
+  const awaitingExitScan = direction === 'RETURN' && trip.status === 'DEPARTING';
+  const canFinish        = direction === 'RETURN' && trip.status === 'ARRIVING';
+  const isQueued         = trip.status === 'QUEUED';
+  const showEta          = ETA_STATUSES.includes(trip.status);
 
   return (
     <section className="bg-indigo-50 p-4 rounded-xl border-2 border-indigo-200" aria-label="Trip status control">
@@ -887,7 +903,13 @@ function StatusControlPanel({
 
       {awaitingScan && (
         <div className="mt-2">
-          <TripQrPanel trip={trip} onRefresh={onRefresh} />
+          <TripQrPanel trip={trip} onRefresh={onRefresh} mode="CHECK_IN" />
+        </div>
+      )}
+
+      {awaitingExitScan && (
+        <div className="mt-2">
+          <TripQrPanel trip={trip} onRefresh={onRefresh} mode="EXIT" />
         </div>
       )}
 
@@ -1344,6 +1366,7 @@ export default function DriverDashboard() {
   //    response or a socket broadcast (dispatcher scan, queue promotion).
   //    • COMPLETED/CANCELLED  → clean up and go back to the setup screen
   //    • direction flipped    → a new leg began: reset ETA + seats
+  //    • RETURN → DEPARTED    → the dispatcher's exit scan: start the ETA clock
   //    • otherwise            → merge, keeping the van's QR token
   const applyTripUpdate = useCallback((updated) => {
     if (!updated?.id) return;
@@ -1376,6 +1399,19 @@ export default function DriverDashboard() {
       setDelayMinutes(0);
       // Passengers got off at the terminal — the van starts the return leg empty.
       setSeatCounts((prev) => ({ ...prev, available: prev.total }));
+    }
+
+    // Dispatcher's exit scan moved the RETURN leg to DEPARTED — the van has
+    // actually left now, so restart the ETA clock from this moment.
+    if (
+      prevTrip &&
+      prevTrip.id === updated.id &&
+      prevTrip.status !== 'DEPARTED' &&
+      updated.status === 'DEPARTED' &&
+      updated.direction === 'RETURN'
+    ) {
+      setDepartureTime(new Date());
+      setDelayMinutes(0);
     }
 
     setTrip((prev) => mergeTrip(prev, updated));
@@ -1658,8 +1694,9 @@ export default function DriverDashboard() {
   }, [gpsState, clearWatch]);
 
   // Status changes pushed from the server for MY trip: the dispatcher's
-  // terminal scan (ARRIVING → BOARDING/QUEUED, direction flips to RETURN),
-  // queue promotion (QUEUED → BOARDING), etc.
+  // terminal check-in scan (ARRIVING → BOARDING/QUEUED, direction flips to
+  // RETURN), the dispatcher's exit scan (DEPARTING → DEPARTED on the RETURN
+  // leg), queue promotion (QUEUED → BOARDING), etc.
   useEffect(() => {
     const handleRemoteStatusChange = (payload) => {
       if (!payload?.tripId || payload.tripId !== tripIdRef.current) return;
