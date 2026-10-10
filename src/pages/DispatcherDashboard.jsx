@@ -107,9 +107,14 @@ function cooperativeName(trip) {
   return trip.van?.cooperative?.name ?? 'Unassigned';
 }
 
-// Arrived at the terminal on the outbound leg and waiting for the dispatcher's scan.
+// A van is waiting for the dispatcher's scan at one of two checkpoints:
+//   • OUTBOUND + ARRIVING  → arrived at the terminal, needs to be checked in
+//   • RETURN   + DEPARTING → ready to leave the terminal, needs to be released
 function isAwaitingScan(trip) {
-  return trip.direction !== 'RETURN' && trip.status === 'ARRIVING';
+  return (
+    (trip.direction !== 'RETURN' && trip.status === 'ARRIVING') ||
+    (trip.direction === 'RETURN' && trip.status === 'DEPARTING')
+  );
 }
 
 function locationHint(trip, hasGps, liveData) {
@@ -118,6 +123,7 @@ function locationHint(trip, hasGps, liveData) {
     return trip.direction === 'RETURN' ? 'Boarding at the terminal' : `Boarding at ${originPlace(trip)}`;
   }
   if (trip.status === 'QUEUED') return 'Waiting in line at the terminal';
+  if (trip.direction === 'RETURN' && trip.status === 'DEPARTING') return 'At the terminal — waiting for exit scan';
   return 'Awaiting GPS…';
 }
 
@@ -204,7 +210,9 @@ function TripCard({ trip, liveData, isSelected, onClick }) {
 
       {isAwaitingScan(trip) && (
         <div className="text-xs font-bold text-indigo-700 bg-indigo-50 border border-indigo-100 rounded-lg px-2 py-1.5 mb-2">
-          📸 Arrived — ready to be scanned
+          {trip.direction === 'RETURN'
+            ? '📸 Ready to leave — scan to release'
+            : '📸 Arrived — ready to be scanned'}
         </div>
       )}
 
@@ -231,29 +239,57 @@ function TripCard({ trip, liveData, isSelected, onClick }) {
 // A van only appears here AFTER the dispatcher has scanned it at the
 // terminal. It is placed straight into its own cooperative's line: the first
 // van is "Now boarding", every other van waits behind it in scan order.
+// A van that has tapped "Ready to Depart" shows first as "Scan to release"
+// until the dispatcher scans it again to let it leave.
 // Cooperatives never block each other — each has its own lane.
 
+const LINE_CARD_TONES = {
+  DEPARTING: {
+    box:   'border-indigo-200 bg-indigo-50',
+    badge: 'bg-indigo-100 text-indigo-800 border-indigo-200',
+    rule:  'border-indigo-100 text-indigo-800',
+    circle: 'bg-indigo-600 text-white',
+  },
+  BOARDING: {
+    box:   'border-green-200 bg-green-50',
+    badge: 'bg-green-100 text-green-800 border-green-200',
+    rule:  'border-green-100 text-slate-600',
+    circle: 'bg-green-600 text-white',
+  },
+  QUEUED: {
+    box:   'border-amber-200 bg-amber-50',
+    badge: 'bg-amber-100 text-amber-800 border-amber-200',
+    rule:  'border-amber-100 text-amber-800',
+    circle: 'bg-white text-amber-700 border border-amber-300',
+  },
+};
+
 function LineCard({ entry, kind }) {
-  const isBoarding = kind === 'BOARDING';
-  const heading = isBoarding
+  const isBoarding  = kind === 'BOARDING';
+  const isDeparting = kind === 'DEPARTING';
+  const tone = LINE_CARD_TONES[kind] ?? LINE_CARD_TONES.QUEUED;
+
+  const heading = isDeparting
+    ? 'Scan to release'
+    : isBoarding
     ? 'Now boarding'
     : entry.queuePosition === 1
     ? 'Next in line'
     : `${entry.queuePosition}${entry.queuePosition === 2 ? 'nd' : entry.queuePosition === 3 ? 'rd' : 'th'} in line`;
 
+  const glyph = isDeparting ? '📸' : isBoarding ? '🧍' : `#${entry.queuePosition}`;
+
   const available = entry.trip?.availableSeats;
   const total = entry.trip?.totalSeats;
 
   return (
-    <div className={`p-3 rounded-xl border ${isBoarding ? 'border-green-200 bg-green-50' : 'border-amber-200 bg-amber-50'}`}>
+    <div className={`p-3 rounded-xl border ${tone.box}`}>
       <div className="flex items-center gap-3">
         <div
-          className={`shrink-0 w-10 h-10 rounded-full flex items-center justify-center text-sm font-black ${
-            isBoarding ? 'bg-green-600 text-white' : 'bg-white text-amber-700 border border-amber-300'
-          }`}
+          className={`shrink-0 w-10 h-10 rounded-full flex items-center justify-center text-sm font-black ${tone.circle}`}
           aria-hidden="true"
         >
-          {isBoarding ? '🧍' : `#${entry.queuePosition}`}
+          {glyph}
         </div>
 
         <div className="min-w-0 flex-1">
@@ -261,13 +297,7 @@ function LineCard({ entry, kind }) {
             <span className="font-black text-slate-800 text-sm truncate">
               {entry.driver?.name ?? 'No driver on file'}
             </span>
-            <span
-              className={`shrink-0 text-[11px] font-bold px-2 py-0.5 rounded border ${
-                isBoarding
-                  ? 'bg-green-100 text-green-800 border-green-200'
-                  : 'bg-amber-100 text-amber-800 border-amber-200'
-              }`}
-            >
+            <span className={`shrink-0 text-[11px] font-bold px-2 py-0.5 rounded border ${tone.badge}`}>
               {heading}
             </span>
           </div>
@@ -278,14 +308,12 @@ function LineCard({ entry, kind }) {
       </div>
 
       <div
-        className={`text-xs mt-2 pt-2 border-t flex items-center justify-between gap-2 ${
-          isBoarding ? 'border-green-100 text-slate-600' : 'border-amber-100 text-amber-800'
-        }`}
+        className={`text-xs mt-2 pt-2 border-t flex items-center justify-between gap-2 ${tone.rule}`}
       >
         <span className="truncate">
           {entry.trip?.origin ? `Heading to ${entry.trip.origin}` : (entry.trip?.routeName ?? 'Return trip')}
         </span>
-        {isBoarding && typeof available === 'number' && typeof total === 'number' && (
+        {(isBoarding || isDeparting) && typeof available === 'number' && typeof total === 'number' && (
           <span className="font-bold shrink-0">🪑 {available}/{total}</span>
         )}
       </div>
@@ -294,7 +322,8 @@ function LineCard({ entry, kind }) {
 }
 
 function CooperativeLane({ group }) {
-  const total = group.boarding.length + group.queued.length;
+  const departing = Array.isArray(group.departing) ? group.departing : [];
+  const total = departing.length + group.boarding.length + group.queued.length;
 
   return (
     <div className="rounded-2xl border border-slate-200 bg-white overflow-hidden shadow-sm">
@@ -305,6 +334,9 @@ function CooperativeLane({ group }) {
         </span>
       </div>
       <div className="p-2 flex flex-col gap-2">
+        {departing.map((entry) => (
+          <LineCard key={entry.vanId} entry={entry} kind="DEPARTING" />
+        ))}
         {group.boarding.map((entry) => (
           <LineCard key={entry.vanId} entry={entry} kind="BOARDING" />
         ))}
@@ -493,8 +525,8 @@ export default function DispatcherDashboard() {
         if (trip) return [trip, ...prev];
         return prev;
       });
-      // A scan, a departure from the boarding slot, or a queue promotion
-      // all change the line-up.
+      // A check-in scan, an exit scan, a departure from the boarding slot,
+      // or a queue promotion all change the line-up.
       fetchTerminalVans();
     };
 
@@ -532,8 +564,9 @@ export default function DispatcherDashboard() {
     successTimerRef.current = setTimeout(() => setSuccessMessage(''), SUCCESS_BANNER_TTL);
   }, []);
 
-  // After a scan the van is already in its cooperative's line — on a phone,
-  // jump to the Terminal tab so the dispatcher sees it lined up.
+  // After a scan the line-up has changed (van checked in, or released from
+  // the terminal) — on a phone, jump to the Terminal tab so the dispatcher
+  // sees the result.
   const handleScanSuccess = useCallback((result) => {
     showSuccess(typeof result === 'string' ? result : 'QR scan successful.');
     fetchActiveTrips();
@@ -577,19 +610,22 @@ export default function DispatcherDashboard() {
 
   // ── Derived data ───────────────────────────────────────────────────────────
 
-  // Only cooperatives that actually have a scanned van in line. Anything the
-  // backend still sends about idle or not-yet-scanned vans is ignored here.
+  // Only cooperatives that actually have a scanned van in line (including
+  // vans waiting for their exit scan). Anything the backend still sends
+  // about idle or not-yet-scanned vans is ignored here.
   const lanes = terminalGroups
     .map((g) => ({
       ...g,
+      departing: Array.isArray(g.departing) ? g.departing : [],
       boarding: Array.isArray(g.boarding) ? g.boarding : [],
       queued: Array.isArray(g.queued) ? g.queued : [],
     }))
-    .filter((g) => g.boarding.length + g.queued.length > 0);
+    .filter((g) => g.departing.length + g.boarding.length + g.queued.length > 0);
 
-  const boardingCount = lanes.reduce((acc, g) => acc + g.boarding.length, 0);
-  const queuedCount   = lanes.reduce((acc, g) => acc + g.queued.length, 0);
-  const lineUpCount   = boardingCount + queuedCount;
+  const departingCount = lanes.reduce((acc, g) => acc + g.departing.length, 0);
+  const boardingCount  = lanes.reduce((acc, g) => acc + g.boarding.length, 0);
+  const queuedCount    = lanes.reduce((acc, g) => acc + g.queued.length, 0);
+  const lineUpCount    = departingCount + boardingCount + queuedCount;
 
   const liveCount          = activeTrips.filter((t) => liveLocations[t.id]).length;
   const awaitingScanCount  = activeTrips.filter(isAwaitingScan).length;
@@ -634,7 +670,7 @@ export default function DispatcherDashboard() {
           </button>
         </div>
 
-        {/* The dispatcher's one job: scan vans in. Big thumb target on phones. */}
+        {/* The dispatcher's one job: scan vans in and out. Big thumb target on phones. */}
         <button
           onClick={() => setIsScannerOpen(true)}
           className="mt-2.5 w-full sm:w-auto sm:ml-auto bg-emerald-500 hover:bg-emerald-400 active:bg-emerald-600 text-white text-sm font-bold min-h-[44px] px-5 rounded-xl transition-colors shadow-sm flex items-center justify-center gap-2"
@@ -643,7 +679,7 @@ export default function DispatcherDashboard() {
           {awaitingScanCount > 0 && (
             <span
               className="px-2 h-5 rounded-full bg-white text-emerald-700 text-[11px] font-black flex items-center justify-center"
-              title="Vans that have arrived and are waiting to be scanned"
+              title="Vans waiting to be scanned in or out of the terminal"
             >
               {awaitingScanCount} waiting
             </span>
@@ -698,7 +734,7 @@ export default function DispatcherDashboard() {
                   <span className="text-2xl mb-1 block">📸</span>
                   <p className="text-xs font-bold text-slate-500">No scanned vans yet.</p>
                   <p className="text-xs text-slate-400 mt-1">
-                    A van joins its cooperative's line here as soon as you scan its QR at the terminal.
+                    A van joins its cooperative's line when you scan its QR at the terminal, and leaves it when you scan it again.
                   </p>
                 </div>
               ) : (
@@ -763,7 +799,12 @@ export default function DispatcherDashboard() {
               let position = null;
               if (hasGps) {
                 position = [loc.lat, loc.lng];
-              } else if (trip.status === 'BOARDING' || trip.status === 'QUEUED') {
+              } else if (
+                trip.status === 'BOARDING' ||
+                trip.status === 'QUEUED' ||
+                // A return-leg van waiting for its exit scan is still at the terminal.
+                (trip.status === 'DEPARTING' && trip.direction === 'RETURN')
+              ) {
                 position = fallbackPositionForTrip(trip);
               }
 
