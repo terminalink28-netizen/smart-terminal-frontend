@@ -1,117 +1,157 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { QRCodeSVG } from 'qrcode.react';
 import apiClient from '../api/axios';
 
-// ─── Module-level constants ───────────────────────────────────────────────────
+// ─── Constants ────────────────────────────────────────────────────────────────
 
 const EMPTY_DATA = {
   stats: { activeTrips: 0, totalTrips: 0, totalVans: 0, totalUsers: 0 },
   staff: [],
   vans: [],
 };
-
 const EMPTY_STAFF_FORM = { name: '', email: '', role: '', password: '' };
 
-const VAN_STATUSES = ['IDLE', 'DISPATCHED', 'MAINTENANCE', 'OUT_OF_SERVICE'];
+const VAN_STATUS_META = {
+  IDLE:        { label: 'Idle',        tone: 'warn' },
+  ON_TRIP:     { label: 'On trip',     tone: 'ok' },
+  MAINTENANCE: { label: 'Maintenance', tone: 'bad' },
+};
+const ROLE_TONE = { ADMIN: 'violet', DISPATCHER: 'info', DRIVER: 'muted' };
 
-const AUDIT_STORAGE_KEY = 'terminalink_admin_audit_history_v1';
-const AUDIT_REFRESH_MS  = 24 * 60 * 60 * 1000;
-const AUDIT_MAX_STORED  = 5000;
+const THEME_KEY = 'terminalink_admin_theme';
+
 const AUDIT_PAGE_SIZE   = 50;
+const AUDIT_EXPORT_MAX  = 5000;
+const AUDIT_POLL_MS     = 30_000;
+const EMPTY_AUDIT_FILTERS = { search: '', action: '', from: '', to: '' };
 
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
+const EMAIL_RE     = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const PASSWORD_MIN = 4;
 
-const VAN_STATUS_BAR_COLORS = {
-  IDLE: 'bg-yellow-400',
-  DISPATCHED: 'bg-green-500',
-  MAINTENANCE: 'bg-orange-400',
-  OUT_OF_SERVICE: 'bg-red-500',
-};
-const ROLE_BAR_COLORS = {
-  ADMIN: 'bg-purple-500',
-  DISPATCHER: 'bg-blue-500',
-  DRIVER: 'bg-gray-400',
-};
-const APPROVAL_BAR_COLORS = {
-  APPROVED: 'bg-green-500',
-  PENDING: 'bg-amber-400',
-  REJECTED: 'bg-red-500',
+// ─── Neumorphic theme ─────────────────────────────────────────────────────────
+//
+// Every surface shares the page background and is shaped only by a light and a
+// dark shadow. Colours come from CSS variables, so the light/dark switch is a
+// single data-theme attribute. Text and status colours are chosen for contrast
+// first; the soft shadows are decoration, never the only cue.
+
+const THEME_CSS = `
+.nm-root{
+  --bg:#e2e7ee;--hi:#ffffff;--lo:#b3bfd0;--line:rgba(110,125,150,.28);
+  --text:#1b2433;--muted:#4f5b6d;--accent:#0f766e;--on-accent:#ffffff;
+  --ok:#047857;--warn:#b45309;--bad:#be123c;--info:#1d4ed8;--violet:#6d28d9;
+  --scrim:rgba(27,36,51,.45);
+  background:var(--bg);color:var(--text);color-scheme:light;
+}
+.nm-root[data-theme="dark"]{
+  --bg:#20252f;--hi:#2c3441;--lo:#141820;--line:rgba(160,175,200,.16);
+  --text:#e8ecf3;--muted:#9ba6b8;--accent:#5eead4;--on-accent:#0b1f1c;
+  --ok:#6ee7b7;--warn:#fbbf24;--bad:#fda4af;--info:#93c5fd;--violet:#c4b5fd;
+  --scrim:rgba(4,7,11,.68);color-scheme:dark;
+}
+.nm-root :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.nm-muted{color:var(--muted)}
+.nm-line{border-color:var(--line)}
+.nm-card{background:var(--bg);box-shadow:9px 9px 18px var(--lo),-9px -9px 18px var(--hi)}
+.nm-raised{background:var(--bg);box-shadow:5px 5px 10px var(--lo),-5px -5px 10px var(--hi)}
+.nm-inset{background:var(--bg);box-shadow:inset 4px 4px 8px var(--lo),inset -4px -4px 8px var(--hi)}
+.nm-chip{background:var(--bg);box-shadow:inset 2px 2px 4px var(--lo),inset -2px -2px 4px var(--hi)}
+.nm-btn{background:var(--bg);color:var(--text);box-shadow:5px 5px 10px var(--lo),-5px -5px 10px var(--hi);transition:box-shadow .15s,opacity .15s}
+.nm-btn:hover:not(:disabled){box-shadow:3px 3px 6px var(--lo),-3px -3px 6px var(--hi)}
+.nm-btn:active:not(:disabled){box-shadow:inset 3px 3px 6px var(--lo),inset -3px -3px 6px var(--hi)}
+.nm-btn:disabled{opacity:.5;cursor:not-allowed}
+.nm-btn.nm-primary{background:var(--accent);color:var(--on-accent)}
+.nm-input{background:var(--bg);color:var(--text);border:1.5px solid transparent;box-shadow:inset 3px 3px 6px var(--lo),inset -3px -3px 6px var(--hi)}
+.nm-input::placeholder{color:var(--muted);opacity:.8}
+.nm-input:focus{outline:none;border-color:var(--accent)}
+.nm-input.nm-invalid{border-color:var(--bad)}
+.nm-fill{background:var(--accent)}
+.tone-ok{color:var(--ok)}.tone-warn{color:var(--warn)}.tone-bad{color:var(--bad)}
+.tone-info{color:var(--info)}.tone-violet{color:var(--violet)}.tone-muted{color:var(--muted)}
+.nm-table th{color:var(--muted);font-weight:600;font-size:.75rem}
+.nm-table tr+tr td{border-top:1px solid var(--line)}
+.nm-table thead tr td,.nm-table thead th{border-bottom:1px solid var(--line)}
+`;
+
+// ─── Icons ────────────────────────────────────────────────────────────────────
+
+const ICONS = {
+  sun:      'M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6L7 7M17 17l1.4 1.4M5.6 18.4L7 17M17 7l1.4-1.4M12 16a4 4 0 100-8 4 4 0 000 8z',
+  moon:     'M20 14.5A8 8 0 019.5 4 8 8 0 1020 14.5z',
+  refresh:  'M20 11a8 8 0 00-14.9-3M4 5v4h4M4 13a8 8 0 0014.9 3M20 19v-4h-4',
+  logout:   'M15 4h3a2 2 0 012 2v12a2 2 0 01-2 2h-3M10 8l-4 4 4 4M6 12h10',
+  search:   'M11 18a7 7 0 100-14 7 7 0 000 14zM21 21l-4.3-4.3',
+  x:        'M6 6l12 12M18 6L6 18',
+  plus:     'M12 5v14M5 12h14',
+  qr:       'M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h2v2h-2zM18 14h2v6h-4M14 18h2v2h-2z',
+  trash:    'M4 7h16M10 11v6M14 11v6M6 7l1 12a2 2 0 002 2h6a2 2 0 002-2l1-12M9 7V4h6v3',
+  check:    'M5 13l4 4L19 7',
+  doc:      'M7 3h7l5 5v13a1 1 0 01-1 1H7a1 1 0 01-1-1V4a1 1 0 011-1zM14 3v5h5M9 13h6M9 17h6',
+  users:    'M16 20v-1a4 4 0 00-4-4H8a4 4 0 00-4 4v1M10 11a3.5 3.5 0 100-7 3.5 3.5 0 000 7zM20 20v-1a4 4 0 00-3-3.9M16 4.1a3.5 3.5 0 010 6.8',
+  van:      'M3 16V7a1 1 0 011-1h9l5 5h2a1 1 0 011 1v4M3 16h2m12 0h-6M7 18a1.5 1.5 0 100-3 1.5 1.5 0 000 3zM17 18a1.5 1.5 0 100-3 1.5 1.5 0 000 3z',
+  clock:    'M12 7v5l3 2M21 12a9 9 0 11-18 0 9 9 0 0118 0z',
+  copy:     'M9 9h10a1 1 0 011 1v10a1 1 0 01-1 1H9a1 1 0 01-1-1V10a1 1 0 011-1zM5 15H4a1 1 0 01-1-1V4a1 1 0 011-1h10a1 1 0 011 1v1',
+  download: 'M12 4v11M8 11l4 4 4-4M5 20h14',
+  dice:     'M5 3h14a2 2 0 012 2v14a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2zM8 8h.01M16 8h.01M8 16h.01M16 16h.01M12 12h.01',
+  eye:      'M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12zM12 15a3 3 0 100-6 3 3 0 000 6z',
+  eyeOff:   'M3 3l18 18M10.6 5.1A9.6 9.6 0 0112 5c6 0 10 7 10 7a17 17 0 01-3.2 4M6.5 6.6A16.6 16.6 0 002 12s4 7 10 7c1.8 0 3.4-.5 4.8-1.2M9.9 9.9a3 3 0 004.2 4.2',
+  alert:    'M12 9v4M12 17h.01M10.3 4l-8 14a2 2 0 001.7 3h16a2 2 0 001.7-3l-8-14a2 2 0 00-3.4 0z',
 };
 
-const inputCls = (hasError) =>
-  `w-full px-3 py-2 border rounded-lg text-sm focus:outline-none focus:ring-2
-   focus:ring-blue-400 transition ${
-     hasError
-       ? 'border-red-400 bg-red-50 focus:ring-red-300'
-       : 'border-gray-300 focus:border-blue-400'
-   }`;
+function Icon({ name, className = 'h-4 w-4' }) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
+      strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
+      <path d={ICONS[name]} />
+    </svg>
+  );
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function toCsvField(value) {
   const str = String(value ?? '');
-  if (/[",\n]/.test(str)) return `"${str.replace(/"/g, '""')}"`;
-  return str;
+  return /[",\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
 }
 
 function describeApiError(err, fallback) {
-  if (err?.code === 'ECONNABORTED') {
-    return 'The request timed out. Please check your connection and try again.';
-  }
+  if (err?.code === 'ECONNABORTED') return 'The request timed out. Check your connection and try again.';
   if (err?.response) {
-    if (Array.isArray(err.response.data?.errors)) {
-      return err.response.data.errors.map(e => e.msg || e.message).join(', ');
-    }
+    if (Array.isArray(err.response.data?.errors)) return err.response.data.errors.map((e) => e.msg || e.message).join(', ');
     return err.response.data?.error ?? err.response.data?.message ?? fallback;
   }
-  if (err?.request) {
-    return 'Network error — could not reach the server. Please check your connection and try again.';
-  }
+  if (err?.request) return 'Network error. Could not reach the server.';
   return err?.message ?? fallback;
 }
 
-const handleAuthFailure = (err) => {
+const isCanceled = (err) => err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED';
+
+function handleAuthFailure(err) {
   if (err?.response?.status === 401 || err?.response?.status === 403) {
     localStorage.removeItem('user');
     window.location.replace('/login');
     return true;
   }
   return false;
-};
+}
 
-// ─── Random PIN Generator ─────────────────────────────────────────────────────
+function formatTimestamp(value) {
+  if (!value) return '—';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return '—';
+  return d.toLocaleString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
 
-const WEAK_PASSWORD_PATTERNS = new Set([
-  '0000','1111','2222','3333','4444','5555','6666','7777','8888','9999',
-  '00000','11111','22222','33333','44444','55555','66666','77777','88888','99999',
-  '000000','111111','222222','333333','444444','555555','666666','777777','888888','999999',
-  '0000000','1111111','2222222','3333333','4444444','5555555','6666666','7777777','8888888','9999999',
-  '00000000','11111111','22222222','33333333','44444444','55555555','66666666','77777777','88888888','99999999',
-  '0123','1234','2345','3456','4567','5678','6789',
-  '3210','4321','5432','6543','7654','8765','9876',
-  '01234','12345','23456','34567','45678','56789',
-  '43210','54321','65432','76543','87654','98765',
-  '012345','123456','234567','345678','456789',
-  '543210','654321','765432','876543','987654',
-  '0123456','1234567','2345678','3456789',
-  '6543210','7654321','8765432','9876543',
-  '01234567','12345678','23456789',
-  '76543210','87654321','98765432',
-  '1212','2121','1122','2211','1010','0101',
-  '123123','112233','121212','696969','101010',
-  '12341234','12121212','11112222',
-]);
+const auditTarget = (e) => [e.targetType, e.target].filter(Boolean).join(': ') || '—';
 
+// A PIN is weak when it is one repeated digit, a straight run, or a repeated block (1212, 123123).
 function isWeakPassword(pw) {
   if (!pw) return true;
-  if (/^(.)\1+$/.test(pw)) return true;
-  if (WEAK_PASSWORD_PATTERNS.has(pw)) return true;
+  if (/^(\d+)\1+$/.test(pw)) return true;
   if (/^\d+$/.test(pw)) {
-    const digits = pw.split('').map(Number);
-    let asc = true, desc = true;
-    for (let i = 1; i < digits.length; i++) {
-      if (digits[i] !== digits[i - 1] + 1) asc = false;
-      if (digits[i] !== digits[i - 1] - 1) desc = false;
-    }
+    const d = pw.split('').map(Number);
+    const asc = d.every((n, i) => i === 0 || n === d[i - 1] + 1);
+    const desc = d.every((n, i) => i === 0 || n === d[i - 1] - 1);
     if (asc || desc) return true;
   }
   return false;
@@ -122,53 +162,569 @@ function generateRandomPassword(minLen = 4, maxLen = 8) {
   let pw = '';
   let attempts = 0;
   do {
-    pw = '';
-    for (let i = 0; i < len; i++) pw += Math.floor(Math.random() * 10);
-    attempts++;
+    pw = Array.from({ length: len }, () => Math.floor(Math.random() * 10)).join('');
+    attempts += 1;
   } while (isWeakPassword(pw) && attempts < 200);
   return pw;
 }
 
-// ─── AdminDashboard ───────────────────────────────────────────────────────────
+function useTheme() {
+  const [theme, setTheme] = useState(() => {
+    try {
+      const saved = localStorage.getItem(THEME_KEY);
+      if (saved === 'light' || saved === 'dark') return saved;
+    } catch { /* ignore */ }
+    return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  });
+  useEffect(() => {
+    try { localStorage.setItem(THEME_KEY, theme); } catch { /* ignore */ }
+  }, [theme]);
+  const toggle = useCallback(() => setTheme((t) => (t === 'dark' ? 'light' : 'dark')), []);
+  return [theme, toggle];
+}
+
+// ─── Audit trail data (server-driven: filters, paging and export all run on the API) ───
+
+function mergeAuditRows(existing, incoming) {
+  const byId = new Map(existing.map((e) => [e.id, e]));
+  incoming.forEach((e) => byId.set(e.id, e));
+  return Array.from(byId.values()).sort(
+    (a, b) => new Date(b.timestamp) - new Date(a.timestamp) || (a.id < b.id ? 1 : -1),
+  );
+}
+
+function useAuditTrail(isOpen) {
+  const [filters, setFilters]   = useState(EMPTY_AUDIT_FILTERS);
+  const [applied, setApplied]   = useState(EMPTY_AUDIT_FILTERS);
+  const [logs, setLogs]         = useState([]);
+  const [nextCursor, setNextCursor] = useState(null);
+  const [total, setTotal]       = useState(0);
+  const [actions, setActions]   = useState([]);
+  const [loading, setLoading]   = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [error, setError]       = useState('');
+  const [lastSync, setLastSync] = useState(null);
+  const abortRef = useRef(null);
+
+  // Typing in the search box shouldn't fire a request per keystroke.
+  useEffect(() => {
+    const id = setTimeout(() => setApplied(filters), 300);
+    return () => clearTimeout(id);
+  }, [filters]);
+
+  const buildParams = useCallback((extra = {}) => {
+    const params = { limit: AUDIT_PAGE_SIZE, ...extra };
+    if (applied.search.trim()) params.search = applied.search.trim();
+    if (applied.action) params.action = applied.action;
+    if (applied.from) params.from = new Date(`${applied.from}T00:00:00`).toISOString();
+    if (applied.to) params.to = new Date(`${applied.to}T23:59:59.999`).toISOString();
+    return params;
+  }, [applied]);
+
+  // mode: 'replace' (first page), 'append' (load more), 'head' (background refresh that keeps loaded pages)
+  const load = useCallback(async (mode = 'replace', cursor = null) => {
+    abortRef.current?.abort();
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+
+    if (mode === 'append') setLoadingMore(true);
+    if (mode === 'replace') { setLoading(true); setLoadingMore(false); }
+    if (mode !== 'head') setError('');
+
+    try {
+      const { data } = await apiClient.get('/admin/audit-logs', {
+        params: buildParams(cursor ? { cursor } : {}),
+        signal: ctrl.signal,
+      });
+      const incoming = Array.isArray(data?.logs) ? data.logs : [];
+
+      if (mode === 'replace') { setLogs(incoming); setNextCursor(data?.nextCursor ?? null); }
+      else if (mode === 'append') { setLogs((prev) => mergeAuditRows(prev, incoming)); setNextCursor(data?.nextCursor ?? null); }
+      else setLogs((prev) => mergeAuditRows(prev, incoming));
+
+      if (typeof data?.total === 'number') setTotal(data.total);
+      if (Array.isArray(data?.actions)) setActions(data.actions);
+      setLastSync(new Date().toISOString());
+    } catch (err) {
+      if (isCanceled(err) || handleAuthFailure(err)) return;
+      if (mode !== 'head') setError(describeApiError(err, 'Could not load the audit trail.'));
+    } finally {
+      if (abortRef.current === ctrl) { setLoading(false); setLoadingMore(false); }
+    }
+  }, [buildParams]);
+
+  // Open the modal, or change a filter → first page.
+  useEffect(() => {
+    if (!isOpen) return undefined;
+    load('replace');
+    return () => abortRef.current?.abort();
+  }, [isOpen, load]);
+
+  // While open, pick up new entries without losing the pages already loaded.
+  useEffect(() => {
+    if (!isOpen) return undefined;
+    const id = setInterval(() => load('head'), AUDIT_POLL_MS);
+    return () => clearInterval(id);
+  }, [isOpen, load]);
+
+  const fetchForExport = useCallback(async () => {
+    const { data } = await apiClient.get('/admin/audit-logs', { params: buildParams({ limit: AUDIT_EXPORT_MAX }) });
+    return Array.isArray(data?.logs) ? data.logs : [];
+  }, [buildParams]);
+
+  const setFilter = useCallback((key, value) => setFilters((p) => ({ ...p, [key]: value })), []);
+  const clearFilters = useCallback(() => { setFilters(EMPTY_AUDIT_FILTERS); setApplied(EMPTY_AUDIT_FILTERS); }, []);
+  const hasFilters = Boolean(filters.search || filters.action || filters.from || filters.to);
+
+  return {
+    filters, setFilter, clearFilters, hasFilters,
+    logs, total, actions, nextCursor, loading, loadingMore, error, lastSync,
+    refresh: () => load('replace'),
+    loadMore: () => nextCursor && load('append', nextCursor),
+    fetchForExport,
+  };
+}
+
+// ─── Primitives ───────────────────────────────────────────────────────────────
+
+const BTN_BASE = 'inline-flex items-center justify-center gap-2 rounded-xl text-sm font-semibold';
+function Btn({ variant = 'default', size = 'md', className = '', type = 'button', children, ...rest }) {
+  const sizing = size === 'sm' ? 'h-8 px-3 text-xs' : size === 'icon' ? 'h-10 w-10' : 'h-10 px-4';
+  const tone = variant === 'primary' ? 'nm-primary' : variant === 'danger' ? 'tone-bad' : variant === 'success' ? 'tone-ok' : '';
+  return <button type={type} className={`nm-btn ${BTN_BASE} ${sizing} ${tone} ${className}`} {...rest}>{children}</button>;
+}
+
+function Card({ className = '', children, ...rest }) {
+  return <section className={`nm-card rounded-2xl ${className}`} {...rest}>{children}</section>;
+}
+
+function Chip({ tone = 'muted', children }) {
+  return (
+    <span className={`nm-chip inline-flex items-center whitespace-nowrap rounded-full px-2.5 py-0.5 text-xs font-semibold tone-${tone}`}>
+      {children}
+    </span>
+  );
+}
+
+function Spinner({ className = 'h-4 w-4' }) {
+  return <span className={`inline-block animate-spin rounded-full border-2 border-current border-t-transparent ${className}`} role="status" />;
+}
+
+function SearchInput({ value, onChange, placeholder, ariaLabel }) {
+  return (
+    <div className="relative">
+      <span className="nm-muted pointer-events-none absolute inset-y-0 left-3 flex items-center"><Icon name="search" /></span>
+      <input type="text" value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} aria-label={ariaLabel}
+        className="nm-input h-10 w-full rounded-xl pl-9 pr-9 text-sm" />
+      {value && (
+        <button type="button" onClick={() => onChange('')} aria-label="Clear search"
+          className="nm-muted absolute inset-y-0 right-2 flex items-center rounded-lg px-1.5"><Icon name="x" className="h-3.5 w-3.5" /></button>
+      )}
+    </div>
+  );
+}
+
+function Field({ label, required, error, hint, action, children }) {
+  return (
+    <div>
+      <div className="mb-1.5 flex flex-wrap items-baseline justify-between gap-x-2">
+        <label className="text-sm font-semibold">{label}{required && <span className="tone-bad ml-0.5" aria-hidden="true">*</span>}</label>
+        {action}
+      </div>
+      {children}
+      {hint && !error && <p className="nm-muted mt-1.5 text-xs">{hint}</p>}
+      {error && <p role="alert" className="tone-bad mt-1.5 text-xs font-medium">{error}</p>}
+    </div>
+  );
+}
+
+function Notice({ tone = 'bad', children }) {
+  return (
+    <div role={tone === 'bad' ? 'alert' : undefined} className="nm-inset flex items-start gap-2 rounded-xl px-3 py-2.5 text-sm">
+      <span className={`tone-${tone} mt-0.5`}><Icon name="alert" /></span>
+      <div className="min-w-0 flex-1 font-medium">{children}</div>
+    </div>
+  );
+}
+
+function EmptyRow({ colSpan, children }) {
+  return <tr><td colSpan={colSpan} className="nm-muted px-3 py-8 text-center text-sm">{children}</td></tr>;
+}
+
+function Modal({ open, onClose, locked = false, size = 'max-w-md', labelledBy, children }) {
+  useEffect(() => {
+    if (!open) return undefined;
+    const onKey = (e) => { if (e.key === 'Escape' && !locked) onClose(); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [open, locked, onClose]);
+
+  if (!open) return null;
+  return (
+    <div role="dialog" aria-modal="true" aria-labelledby={labelledBy}
+      className="fixed inset-0 z-50 flex items-end justify-center p-0 sm:items-center sm:p-4" style={{ background: 'var(--scrim)' }}
+      onMouseDown={(e) => { if (e.target === e.currentTarget && !locked) onClose(); }}>
+      <div className={`nm-card flex max-h-[95vh] w-full ${size} flex-col rounded-t-2xl sm:max-h-[90vh] sm:rounded-2xl`}>{children}</div>
+    </div>
+  );
+}
+
+function ModalHeader({ id, title, subtitle, onClose, disabled }) {
+  return (
+    <div className="nm-line flex items-start justify-between gap-3 border-b p-4 sm:p-5">
+      <div className="min-w-0">
+        <h2 id={id} className="text-base font-bold tracking-tight sm:text-lg">{title}</h2>
+        {subtitle && <p className="nm-muted mt-0.5 text-xs">{subtitle}</p>}
+      </div>
+      <Btn size="icon" onClick={onClose} disabled={disabled} aria-label="Close" className="!h-8 !w-8 shrink-0"><Icon name="x" /></Btn>
+    </div>
+  );
+}
+
+function ThemeToggle({ theme, onToggle }) {
+  const dark = theme === 'dark';
+  return (
+    <Btn size="icon" onClick={onToggle} aria-label={dark ? 'Switch to light mode' : 'Switch to dark mode'} title={dark ? 'Light mode' : 'Dark mode'}>
+      <Icon name={dark ? 'sun' : 'moon'} className="h-[18px] w-[18px]" />
+    </Btn>
+  );
+}
+
+function RoleBadge({ role }) {
+  return <Chip tone={ROLE_TONE[role] ?? 'muted'}>{role ?? 'UNKNOWN'}</Chip>;
+}
+
+function VanStatusBadge({ status }) {
+  const meta = VAN_STATUS_META[status];
+  return <Chip tone={meta?.tone ?? 'muted'}>{meta?.label ?? status ?? 'Unknown'}</Chip>;
+}
+
+function StatCard({ icon, label, value, tone }) {
+  return (
+    <Card className="flex items-center gap-4 p-4 sm:p-5">
+      <span className={`nm-inset flex h-11 w-11 shrink-0 items-center justify-center rounded-xl tone-${tone}`}><Icon name={icon} className="h-5 w-5" /></span>
+      <div className="min-w-0">
+        <p className="nm-muted truncate text-xs font-medium">{label}</p>
+        <p className="text-2xl font-bold tabular-nums tracking-tight">{value ?? 0}</p>
+      </div>
+    </Card>
+  );
+}
+
+function SectionHeader({ title, count, children }) {
+  return (
+    <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+      <h2 className="flex items-center gap-2 text-base font-bold tracking-tight">
+        {title}
+        {count !== undefined && <Chip>{count}</Chip>}
+      </h2>
+      {children}
+    </div>
+  );
+}
+
+function CopyButton({ text }) {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch { /* clipboard unavailable */ }
+  };
+  return (
+    <Btn size="sm" onClick={copy}>
+      <Icon name={copied ? 'check' : 'copy'} className="h-3.5 w-3.5" /> {copied ? 'Copied' : 'Copy code'}
+    </Btn>
+  );
+}
+
+function AuditActionBadge({ action }) {
+  const key = (action ?? '').toUpperCase();
+  const tone =
+    /DELETE|REJECT/.test(key) ? 'bad'
+    : /DISABLE/.test(key) ? 'warn'
+    : /CREATE|APPROVE|ENABLE/.test(key) ? 'ok'
+    : /UPDATE/.test(key) ? 'info'
+    : /LOGIN|LOGOUT/.test(key) ? 'violet'
+    : 'muted';
+  return <Chip tone={tone}>{(action ?? 'UNKNOWN').replace(/_/g, ' ')}</Chip>;
+}
+
+// ─── Modals ───────────────────────────────────────────────────────────────────
+
+function StaffFormModal({ isOpen, onClose, onSubmit, isLoading, serverError, onClearError }) {
+  const [form, setForm]     = useState(EMPTY_STAFF_FORM);
+  const [errors, setErrors] = useState({});
+  const [showPin, setShowPin] = useState(false);
+  const nameRef = useRef(null);
+
+  useEffect(() => {
+    if (!isOpen) return undefined;
+    setForm(EMPTY_STAFF_FORM);
+    setErrors({});
+    setShowPin(false);
+    onClearError();
+    const id = setTimeout(() => nameRef.current?.focus(), 60);
+    return () => clearTimeout(id);
+  }, [isOpen, onClearError]);
+
+  const change = (e) => {
+    const { name, value } = e.target;
+    setForm((p) => ({ ...p, [name]: value }));
+    setErrors((p) => ({ ...p, [name]: '' }));
+    if (serverError) onClearError();
+  };
+
+  const generate = () => {
+    setForm((p) => ({ ...p, password: generateRandomPassword() }));
+    setErrors((p) => ({ ...p, password: '' }));
+    setShowPin(true);
+    if (serverError) onClearError();
+  };
+
+  const submit = () => {
+    const e = {};
+    const name = form.name.trim();
+    const email = form.email.trim();
+    if (!name) e.name = 'Full name is required.';
+    else if (name.length > 100) e.name = 'Name must be 100 characters or fewer.';
+    if (!form.role) e.role = 'Role is required.';
+    if (!email) e.email = 'Email address is required.';
+    else if (!EMAIL_RE.test(email)) e.email = 'Enter a valid email address.';
+    if (!form.password) e.password = 'A PIN is required.';
+    else if (form.password.length < PASSWORD_MIN) e.password = `PIN must be at least ${PASSWORD_MIN} characters.`;
+    if (Object.keys(e).length) { setErrors(e); return; }
+    onSubmit({ name, role: form.role, email, password: form.password });
+  };
+
+  return (
+    <Modal open={isOpen} onClose={onClose} locked={isLoading} labelledBy="staff-modal-title">
+      <ModalHeader id="staff-modal-title" title="Add staff account" subtitle="Admins and dispatchers. Drivers sign up on their own." onClose={onClose} disabled={isLoading} />
+      <div className="space-y-4 overflow-y-auto p-4 sm:p-5">
+        {serverError && <Notice>{serverError}</Notice>}
+        <Field label="Full name" required error={errors.name}>
+          <input ref={nameRef} name="name" value={form.name} onChange={change} placeholder="e.g. Juan dela Cruz" autoComplete="name" maxLength={100}
+            className={`nm-input h-11 w-full rounded-xl px-3 text-sm ${errors.name ? 'nm-invalid' : ''}`} />
+        </Field>
+        <Field label="Role" required error={errors.role}>
+          <select name="role" value={form.role} onChange={change} className={`nm-input h-11 w-full rounded-xl px-3 text-sm ${errors.role ? 'nm-invalid' : ''}`}>
+            <option value="">Select a role</option>
+            <option value="ADMIN">Admin</option>
+            <option value="DISPATCHER">Dispatcher</option>
+          </select>
+        </Field>
+        <Field label="Email address" required error={errors.email}>
+          <input name="email" type="email" value={form.email} onChange={change} placeholder="staff@terminal.gov.ph" autoComplete="email"
+            className={`nm-input h-11 w-full rounded-xl px-3 text-sm ${errors.email ? 'nm-invalid' : ''}`} />
+        </Field>
+        <Field label="PIN" required error={errors.password} hint={`At least ${PASSWORD_MIN} characters. The generator avoids obvious patterns.`}
+          action={<button type="button" onClick={generate} className="tone-info inline-flex items-center gap-1 text-xs font-semibold underline-offset-2 hover:underline"><Icon name="dice" className="h-3.5 w-3.5" /> Generate</button>}>
+          <div className="relative">
+            <input name="password" type={showPin ? 'text' : 'password'} value={form.password} onChange={change} placeholder="Enter a PIN" autoComplete="new-password" maxLength={128}
+              className={`nm-input h-11 w-full rounded-xl pl-3 pr-11 text-sm ${errors.password ? 'nm-invalid' : ''}`} />
+            <button type="button" onClick={() => setShowPin((v) => !v)} aria-label={showPin ? 'Hide PIN' : 'Show PIN'}
+              className="nm-muted absolute inset-y-0 right-0 flex items-center px-3"><Icon name={showPin ? 'eyeOff' : 'eye'} /></button>
+          </div>
+        </Field>
+      </div>
+      <div className="nm-line flex flex-col-reverse gap-3 border-t p-4 sm:flex-row sm:p-5">
+        <Btn onClick={onClose} disabled={isLoading} className="flex-1">Cancel</Btn>
+        <Btn variant="primary" onClick={submit} disabled={isLoading} className="flex-1">
+          {isLoading ? <><Spinner /> Creating…</> : 'Create account'}
+        </Btn>
+      </div>
+    </Modal>
+  );
+}
+
+function VanQrModal({ van, onClose }) {
+  return (
+    <Modal open={Boolean(van)} onClose={onClose} size="max-w-sm" labelledBy="qr-title">
+      {van && (
+        <>
+          <ModalHeader id="qr-title" title={van.plateNumber} subtitle="Terminal scan code" onClose={onClose} />
+          <div className="space-y-4 overflow-y-auto p-5 text-center">
+            {van.qrToken ? (
+              <>
+                <div className="mx-auto inline-block rounded-2xl p-4" style={{ background: '#ffffff' }}>
+                  <QRCodeSVG value={van.qrToken} size={196} bgColor="#ffffff" fgColor="#0f172a" />
+                </div>
+                <p className="nm-muted text-xs">The same code every time. Reprint it if the sticker is lost or damaged.</p>
+                <CopyButton text={van.qrToken} />
+              </>
+            ) : (
+              <Notice tone="warn">The server did not return a QR token for this van.</Notice>
+            )}
+          </div>
+        </>
+      )}
+    </Modal>
+  );
+}
+
+function LicensePhotoModal({ driver, onClose }) {
+  return (
+    <Modal open={Boolean(driver)} onClose={onClose} size="max-w-lg" labelledBy="license-title">
+      {driver && (
+        <>
+          <ModalHeader id="license-title" title={driver.name} subtitle="Driver's license" onClose={onClose} />
+          <div className="overflow-auto p-4">
+            <img src={driver.licensePhotoUrl} alt="Driver's license" className="h-auto w-full rounded-xl" />
+          </div>
+        </>
+      )}
+    </Modal>
+  );
+}
+
+function RejectDriverModal({ target, reason, onReasonChange, onClose, onConfirm, isLoading, serverError }) {
+  return (
+    <Modal open={Boolean(target)} onClose={onClose} locked={isLoading} size="max-w-sm" labelledBy="reject-title">
+      {target && (
+        <>
+          <ModalHeader id="reject-title" title="Reject application?" onClose={onClose} disabled={isLoading} />
+          <div className="space-y-4 p-5">
+            <p className="nm-muted text-sm">
+              <strong style={{ color: 'var(--text)' }}>{target.name}</strong>'s application will be rejected and the van they registered will be removed. A reason is optional.
+            </p>
+            <textarea value={reason} onChange={(e) => onReasonChange(e.target.value)} placeholder="Reason (optional)" rows={3} maxLength={300}
+              className="nm-input w-full rounded-xl px-3 py-2 text-sm" />
+            {serverError && <Notice>{serverError}</Notice>}
+          </div>
+          <div className="nm-line flex flex-col-reverse gap-3 border-t p-4 sm:flex-row sm:p-5">
+            <Btn onClick={onClose} disabled={isLoading} className="flex-1">Cancel</Btn>
+            <Btn variant="danger" onClick={onConfirm} disabled={isLoading} className="flex-1">
+              {isLoading ? <><Spinner /> Rejecting…</> : 'Reject application'}
+            </Btn>
+          </div>
+        </>
+      )}
+    </Modal>
+  );
+}
+
+function ConfirmDeleteModal({ target, onClose, onConfirm, isLoading, serverError }) {
+  const isVan = target?.kind === 'van';
+  return (
+    <Modal open={Boolean(target)} onClose={onClose} locked={isLoading} size="max-w-sm" labelledBy="delete-title">
+      {target && (
+        <>
+          <ModalHeader id="delete-title" title={isVan ? 'Remove van?' : 'Delete account?'} onClose={onClose} disabled={isLoading} />
+          <div className="space-y-4 overflow-y-auto p-5">
+            <div className="nm-inset rounded-xl px-4 py-3">
+              <p className="break-all font-bold">{target.label}</p>
+              <div className="mt-1.5">{isVan ? <span className="nm-muted text-xs">{target.sublabel}</span> : <RoleBadge role={target.role} />}</div>
+            </div>
+            {target.role === 'ADMIN' && <Notice tone="warn">This is an admin account. At least one other admin must remain.</Notice>}
+            <p className="nm-muted text-sm">
+              This is permanent. {isVan ? 'The van can no longer be assigned to trips.' : "The account's data is removed. If the person has trips on record, disable the account instead."}
+            </p>
+            {serverError && <Notice>{serverError}</Notice>}
+          </div>
+          <div className="nm-line flex flex-col-reverse gap-3 border-t p-4 sm:flex-row sm:p-5">
+            <Btn onClick={onClose} disabled={isLoading} className="flex-1">Cancel</Btn>
+            <Btn variant="danger" onClick={onConfirm} disabled={isLoading} className="flex-1">
+              {isLoading ? <><Spinner /> Deleting…</> : isVan ? 'Remove van' : 'Delete account'}
+            </Btn>
+          </div>
+        </>
+      )}
+    </Modal>
+  );
+}
+
+function AuditTrailModal({ isOpen, onClose, trail, onExport, exporting }) {
+  const { filters, setFilter, clearFilters, hasFilters, logs, total, actions, nextCursor, loading, loadingMore, error, lastSync } = trail;
+
+  return (
+    <Modal open={isOpen} onClose={onClose} size="max-w-5xl" labelledBy="audit-title">
+      <ModalHeader id="audit-title" title="Audit trail"
+        subtitle={`${total} ${total === 1 ? 'entry' : 'entries'}${hasFilters ? ' match your filters' : ''}${lastSync ? ` · updated ${formatTimestamp(lastSync)}` : ''}`}
+        onClose={onClose} />
+
+      <div className="nm-line space-y-3 border-b p-4 sm:p-5">
+        <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_12rem_auto]">
+          <SearchInput value={filters.search} onChange={(v) => setFilter('search', v)} placeholder="Search actor, action, target, details…" ariaLabel="Search audit trail" />
+          <select value={filters.action} onChange={(e) => setFilter('action', e.target.value)} aria-label="Filter by action" className="nm-input h-10 rounded-xl px-3 text-sm">
+            <option value="">All actions</option>
+            {actions.map((a) => <option key={a} value={a}>{a.replace(/_/g, ' ')}</option>)}
+          </select>
+          <div className="flex items-center gap-2">
+            <input type="date" value={filters.from} max={filters.to || undefined} onChange={(e) => setFilter('from', e.target.value)} aria-label="From date" className="nm-input h-10 min-w-0 flex-1 rounded-xl px-2 text-sm" />
+            <span className="nm-muted text-xs">to</span>
+            <input type="date" value={filters.to} min={filters.from || undefined} onChange={(e) => setFilter('to', e.target.value)} aria-label="To date" className="nm-input h-10 min-w-0 flex-1 rounded-xl px-2 text-sm" />
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Btn size="sm" onClick={trail.refresh} disabled={loading}>{loading ? <Spinner className="h-3.5 w-3.5" /> : <Icon name="refresh" className="h-3.5 w-3.5" />} Refresh</Btn>
+          <Btn size="sm" onClick={onExport} disabled={exporting || total === 0}>{exporting ? <Spinner className="h-3.5 w-3.5" /> : <Icon name="download" className="h-3.5 w-3.5" />} Export CSV</Btn>
+          {hasFilters && <Btn size="sm" onClick={clearFilters}>Clear filters</Btn>}
+        </div>
+        {error && <Notice tone="warn">{error}</Notice>}
+      </div>
+
+      <div className="flex-1 overflow-auto">
+        <table className="nm-table w-full min-w-[640px] text-left text-sm">
+          <thead>
+            <tr>
+              <th className="sticky top-0 px-4 py-3" style={{ background: 'var(--bg)' }}>Time</th>
+              <th className="sticky top-0 px-4 py-3" style={{ background: 'var(--bg)' }}>Actor</th>
+              <th className="sticky top-0 px-4 py-3" style={{ background: 'var(--bg)' }}>Action</th>
+              <th className="sticky top-0 px-4 py-3" style={{ background: 'var(--bg)' }}>Target</th>
+              <th className="sticky top-0 px-4 py-3" style={{ background: 'var(--bg)' }}>Details</th>
+            </tr>
+          </thead>
+          <tbody>
+            {logs.length === 0 ? (
+              <EmptyRow colSpan={5}>{loading ? 'Loading audit trail…' : hasFilters ? 'No entries match these filters.' : 'Nothing has been recorded yet. Admin actions appear here as they happen.'}</EmptyRow>
+            ) : logs.map((entry) => (
+              <tr key={entry.id} className="align-top">
+                <td className="nm-muted whitespace-nowrap px-4 py-3 text-xs">{formatTimestamp(entry.timestamp)}</td>
+                <td className="px-4 py-3 font-semibold">{entry.actorName ?? 'System'}</td>
+                <td className="px-4 py-3"><AuditActionBadge action={entry.action} /></td>
+                <td className="px-4 py-3">{auditTarget(entry)}</td>
+                <td className="nm-muted max-w-xs px-4 py-3 text-xs">{entry.details ?? '—'}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {nextCursor && (
+          <div className="p-4 text-center">
+            <Btn size="sm" onClick={trail.loadMore} disabled={loadingMore}>
+              {loadingMore ? <><Spinner className="h-3.5 w-3.5" /> Loading…</> : `Load more (${Math.max(total - logs.length, 0)} remaining)`}
+            </Btn>
+          </div>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+// ─── Page ─────────────────────────────────────────────────────────────────────
 
 export default function AdminDashboard() {
-  const [data, setData]             = useState(EMPTY_DATA);
-  const [loading, setLoading]       = useState(true);
-  const [fetchError, setFetchError] = useState('');
+  const [theme, toggleTheme] = useTheme();
+
+  const [data, setData]               = useState(EMPTY_DATA);
+  const [loading, setLoading]         = useState(true);
+  const [fetchError, setFetchError]   = useState('');
   const [reloadToken, setReloadToken] = useState(0);
-  const [loggingOut, setLoggingOut] = useState(false);
+  const [loggingOut, setLoggingOut]   = useState(false);
 
   const [isStaffModalOpen, setIsStaffModalOpen] = useState(false);
-  const [mutationLoading, setMutationLoading] = useState(false);
-  const [mutationError, setMutationError]     = useState('');
-  const [togglingId, setTogglingId]           = useState(null);
-
-  const [vanMutationLoading, setVanMutationLoading] = useState(false);
-  const [vanMutationError, setVanMutationError]     = useState('');
-
-  const [viewingQrVan, setViewingQrVan] = useState(null);
+  const [staffSaving, setStaffSaving] = useState(false);
+  const [staffError, setStaffError]   = useState('');
+  const [togglingId, setTogglingId]   = useState(null);
 
   const [pendingDelete, setPendingDelete] = useState(null);
+  const [deleting, setDeleting]           = useState(false);
+  const [deleteError, setDeleteError]     = useState('');
 
-  const [toast, setToast] = useState(null);
-  const toastTimer = useRef(null);
+  const [viewingQrVan, setViewingQrVan] = useState(null);
+  const [vanSearch, setVanSearch]       = useState('');
+  const [staffSearch, setStaffSearch]   = useState('');
 
-  const [vanSearch, setVanSearch]     = useState('');
-  const [staffSearch, setStaffSearch] = useState('');
-
-  const [isAuditOpen, setIsAuditOpen]     = useState(false);
-  const [auditLogs, setAuditLogs]         = useState([]);
-  const [auditLoading, setAuditLoading]   = useState(true);
-  const [auditError, setAuditError]       = useState('');
-  const [auditSearch, setAuditSearch]     = useState('');
-  const [auditActionFilter, setAuditActionFilter] = useState('');
-  const [auditDateFrom, setAuditDateFrom] = useState('');
-  const [auditDateTo, setAuditDateTo]     = useState('');
-  const [auditVisible, setAuditVisible]   = useState(AUDIT_PAGE_SIZE);
-  const [lastAuditSync, setLastAuditSync] = useState(null);
-  const lastAuditSyncRef = useRef(null);
-
-  // ── Pending driver applications ──────────────────────────────────────────
   const [pendingDrivers, setPendingDrivers] = useState([]);
   const [pendingLoading, setPendingLoading] = useState(true);
   const [pendingError, setPendingError]     = useState('');
@@ -179,192 +735,117 @@ export default function AdminDashboard() {
   const [rejectSubmitting, setRejectSubmitting] = useState(false);
   const [rejectError, setRejectError]       = useState('');
 
+  const [isAuditOpen, setIsAuditOpen] = useState(false);
+  const [exporting, setExporting]     = useState(false);
+  const trail = useAuditTrail(isAuditOpen);
+
+  const [toast, setToast] = useState(null);
+  const toastTimer = useRef(null);
   const showToast = useCallback((type, message) => {
     clearTimeout(toastTimer.current);
     setToast({ type, message });
     toastTimer.current = setTimeout(() => setToast(null), 5000);
   }, []);
-
   useEffect(() => () => clearTimeout(toastTimer.current), []);
 
-  const fetchAdminData = useCallback(async (signal) => {
-    setLoading(true);
-    setFetchError('');
-    try {
-      const { data: raw } = await apiClient.get('/admin/dashboard', { signal });
-      setData({
-        stats: { ...EMPTY_DATA.stats, ...(raw?.stats ?? {}) },
-        staff: Array.isArray(raw?.staff) ? raw.staff : Array.isArray(raw?.users) ? raw.users : [],
-        vans: Array.isArray(raw?.vans) ? raw.vans : Array.isArray(raw?.fleet) ? raw.fleet : [],
-      });
-    } catch (err) {
-      if (err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') return;
-      if (handleAuthFailure(err)) return;
-      console.error('Failed to load admin dashboard data:', err);
-      setFetchError(describeApiError(err, 'Failed to load admin data. Please try again.'));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const reload = useCallback(() => setReloadToken((n) => n + 1), []);
 
+  // ── Data ──
   useEffect(() => {
     const ctrl = new AbortController();
-    fetchAdminData(ctrl.signal);
-    return () => ctrl.abort();
-  }, [fetchAdminData, reloadToken]);
-
-  const fetchPendingDrivers = useCallback(async (signal) => {
-    setPendingLoading(true);
-    setPendingError('');
-    try {
-      const { data: raw } = await apiClient.get('/admin/drivers/pending', { signal });
-      setPendingDrivers(Array.isArray(raw) ? raw : []);
-    } catch (err) {
-      if (err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') return;
-      if (handleAuthFailure(err)) return;
-      console.error('Failed to load pending drivers:', err);
-      setPendingError(describeApiError(err, 'Failed to load pending driver applications.'));
-    } finally {
-      setPendingLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    const ctrl = new AbortController();
-    fetchPendingDrivers(ctrl.signal);
-    return () => ctrl.abort();
-  }, [fetchPendingDrivers, reloadToken]);
-
-  const persistAuditHistory = useCallback((logs, syncTime) => {
-    try {
-      const trimmed = logs.slice(0, AUDIT_MAX_STORED);
-      localStorage.setItem(AUDIT_STORAGE_KEY, JSON.stringify({ logs: trimmed, lastSync: syncTime }));
-    } catch { /* ignore */ }
-  }, []);
-
-  const fetchAuditLogs = useCallback(async ({ silent = false } = {}) => {
-    if (!silent) setAuditLoading(true);
-    setAuditError('');
-    try {
-      const since = lastAuditSyncRef.current;
-      const { data: raw } = await apiClient.get('/admin/audit-logs', { params: since ? { since } : undefined });
-      const incoming = Array.isArray(raw?.logs) ? raw.logs : Array.isArray(raw) ? raw : [];
-
-      setAuditLogs((prev) => {
-        const byId = new Map(prev.map((entry) => [entry.id, entry]));
-        incoming.forEach((entry) => { if (entry?.id != null) byId.set(entry.id, entry); });
-        const merged = Array.from(byId.values()).sort((a, b) => new Date(b.timestamp ?? b.createdAt ?? 0) - new Date(a.timestamp ?? a.createdAt ?? 0));
-        const syncTime = new Date().toISOString();
-        lastAuditSyncRef.current = syncTime;
-        setLastAuditSync(syncTime);
-        persistAuditHistory(merged, syncTime);
-        return merged;
-      });
-    } catch (err) {
-      if (err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') return;
-      setAuditError('Could not refresh the audit trail. Showing the last saved history.');
-    } finally {
-      if (!silent) setAuditLoading(false);
-    }
-  }, [persistAuditHistory]);
-
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(AUDIT_STORAGE_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed?.logs)) setAuditLogs(parsed.logs);
-        if (parsed?.lastSync) {
-          lastAuditSyncRef.current = parsed.lastSync;
-          setLastAuditSync(parsed.lastSync);
-        }
+    (async () => {
+      setLoading(true);
+      setFetchError('');
+      try {
+        const { data: raw } = await apiClient.get('/admin/dashboard', { signal: ctrl.signal });
+        setData({
+          stats: { ...EMPTY_DATA.stats, ...(raw?.stats ?? {}) },
+          staff: Array.isArray(raw?.staff) ? raw.staff : Array.isArray(raw?.users) ? raw.users : [],
+          vans: Array.isArray(raw?.vans) ? raw.vans : Array.isArray(raw?.fleet) ? raw.fleet : [],
+        });
+      } catch (err) {
+        if (isCanceled(err) || handleAuthFailure(err)) return;
+        setFetchError(describeApiError(err, 'Failed to load admin data. Please try again.'));
+      } finally {
+        setLoading(false);
       }
-    } catch { /* ignore */ }
+    })();
+    return () => ctrl.abort();
+  }, [reloadToken]);
 
-    fetchAuditLogs();
-    const id = setInterval(() => fetchAuditLogs({ silent: true }), AUDIT_REFRESH_MS);
-    return () => clearInterval(id);
-  }, [fetchAuditLogs]);
+  useEffect(() => {
+    const ctrl = new AbortController();
+    (async () => {
+      setPendingLoading(true);
+      setPendingError('');
+      try {
+        const { data: raw } = await apiClient.get('/admin/drivers/pending', { signal: ctrl.signal });
+        setPendingDrivers(Array.isArray(raw) ? raw : []);
+      } catch (err) {
+        if (isCanceled(err) || handleAuthFailure(err)) return;
+        setPendingError(describeApiError(err, 'Failed to load pending driver applications.'));
+      } finally {
+        setPendingLoading(false);
+      }
+    })();
+    return () => ctrl.abort();
+  }, [reloadToken]);
 
-  const handleClearAuditHistory = useCallback(() => {
-    if (!window.confirm('Clear all locally saved audit history on this device? This does not delete anything on the server.')) return;
-    try { localStorage.removeItem(AUDIT_STORAGE_KEY); } catch { /* ignore */ }
-    setAuditLogs([]);
-    setAuditVisible(AUDIT_PAGE_SIZE);
-    lastAuditSyncRef.current = null;
-    setLastAuditSync(null);
-    fetchAuditLogs();
-  }, [fetchAuditLogs]);
-
+  // ── Actions ──
   const handleLogout = useCallback(async () => {
     setLoggingOut(true);
+    try { await apiClient.post('/auth/logout'); } catch (err) { console.error('Logout request failed, logging out locally anyway:', err); }
+    localStorage.removeItem('token');
+    localStorage.removeItem('user');
+    window.location.replace('/login');
+  }, []);
+
+  const clearStaffError = useCallback(() => setStaffError(''), []);
+  const closeStaffModal = useCallback(() => { if (!staffSaving) { setStaffError(''); setIsStaffModalOpen(false); } }, [staffSaving]);
+
+  const handleSubmitStaff = useCallback(async (form) => {
+    setStaffSaving(true);
+    setStaffError('');
     try {
-      await apiClient.post('/auth/logout');
-    } catch (err) {
-      console.error('Logout request failed, logging out locally anyway:', err);
-    } finally {
-      localStorage.removeItem('token');
-      localStorage.removeItem('user');
-      try { localStorage.removeItem(AUDIT_STORAGE_KEY); } catch (err) { console.error(err); }
-      window.location.replace('/login');
-    }
-  }, []);
-
-  const openAddStaffModal = useCallback(() => { setMutationError(''); setIsStaffModalOpen(true); }, []);
-  const closeStaffModal = useCallback(() => { if (mutationLoading) return; setMutationError(''); setIsStaffModalOpen(false); }, [mutationLoading]);
-
-  const openDeleteUserModal = useCallback((user) => {
-    setMutationError('');
-    setPendingDelete({ kind: 'user', id: user.id, label: user.name ?? 'this user', sublabel: user.email || user.driverId || '', role: user.role });
-  }, []);
-
-  const openDeleteVanModal = useCallback((van) => {
-    setVanMutationError('');
-    setPendingDelete({ kind: 'van', id: van.id, label: van.plateNumber ?? 'this van', sublabel: `${van.capacity ?? 0} pax · ${van.status ?? 'UNKNOWN'}` });
-  }, []);
-
-  const closeDeleteModal = useCallback(() => {
-    if (mutationLoading || vanMutationLoading) return;
-    setMutationError(''); setVanMutationError(''); setPendingDelete(null);
-  }, [mutationLoading, vanMutationLoading]);
-
-  const handleSubmitStaff = useCallback(async (formData) => {
-    setMutationLoading(true);
-    setMutationError('');
-    try {
-      await apiClient.post('/admin/users', formData);
-      showToast('success', `${formData.name} has been added as ${formData.role}.`);
+      await apiClient.post('/admin/users', form);
+      showToast('success', `${form.name} was added as ${form.role.toLowerCase()}.`);
       setIsStaffModalOpen(false);
-      setReloadToken((n) => n + 1);
+      reload();
     } catch (err) {
       if (handleAuthFailure(err)) return;
-      console.error('Failed to save staff account:', err);
-      setMutationError(describeApiError(err, 'Failed to save this account. Please check the details and try again.'));
+      setStaffError(describeApiError(err, 'Failed to save this account. Check the details and try again.'));
     } finally {
-      setMutationLoading(false);
+      setStaffSaving(false);
     }
-  }, [showToast]);
+  }, [showToast, reload]);
+
+  const openDeleteUser = useCallback((u) => {
+    setDeleteError('');
+    setPendingDelete({ kind: 'user', id: u.id, label: u.name ?? 'this user', role: u.role });
+  }, []);
+  const openDeleteVan = useCallback((v) => {
+    setDeleteError('');
+    setPendingDelete({ kind: 'van', id: v.id, label: v.plateNumber ?? 'this van', sublabel: `${v.capacity ?? 0} seats · ${VAN_STATUS_META[v.status]?.label ?? v.status ?? 'Unknown'}` });
+  }, []);
+  const closeDelete = useCallback(() => { if (!deleting) { setDeleteError(''); setPendingDelete(null); } }, [deleting]);
 
   const handleConfirmDelete = useCallback(async () => {
     if (!pendingDelete) return;
     const isVan = pendingDelete.kind === 'van';
-    isVan ? setVanMutationLoading(true) : setMutationLoading(true);
-    isVan ? setVanMutationError('') : setMutationError('');
+    setDeleting(true);
+    setDeleteError('');
     try {
       await apiClient.delete(isVan ? `/admin/vans/${pendingDelete.id}` : `/admin/users/${pendingDelete.id}`);
-      setData((prev) => isVan ? { ...prev, vans: prev.vans.filter((v) => v.id !== pendingDelete.id) } : { ...prev, staff: prev.staff.filter((u) => u.id !== pendingDelete.id) });
-      showToast('success', isVan ? `${pendingDelete.label} has been removed from the vans list.` : `${pendingDelete.label}'s account has been permanently removed.`);
+      showToast('success', isVan ? `${pendingDelete.label} was removed.` : `${pendingDelete.label}'s account was deleted.`);
       setPendingDelete(null);
-      setReloadToken((n) => n + 1);
+      reload();
     } catch (err) {
       if (handleAuthFailure(err)) return;
-      console.error(`Failed to delete ${isVan ? 'van' : 'user'}:`, err);
-      const message = describeApiError(err, `Could not delete ${isVan ? 'this van' : 'this account'}. The server rejected the request.`);
-      isVan ? setVanMutationError(message) : setMutationError(message);
+      setDeleteError(describeApiError(err, `Could not delete ${isVan ? 'this van' : 'this account'}.`));
     } finally {
-      isVan ? setVanMutationLoading(false) : setMutationLoading(false);
+      setDeleting(false);
     }
-  }, [pendingDelete, showToast]);
+  }, [pendingDelete, showToast, reload]);
 
   const handleToggleActive = useCallback(async (user) => {
     if (togglingId !== null) return;
@@ -372,12 +853,11 @@ export default function AdminDashboard() {
     const next = !user.isActive;
     try {
       await apiClient.patch(`/admin/users/${user.id}`, { isActive: next });
-      setData((prev) => ({ ...prev, staff: prev.staff.map((u) => u.id === user.id ? { ...u, isActive: next } : u) }));
-      showToast('success', `${user.name ?? 'User'} has been ${next ? 'activated' : 'deactivated'}.`);
+      setData((prev) => ({ ...prev, staff: prev.staff.map((u) => (u.id === user.id ? { ...u, isActive: next } : u)) }));
+      showToast('success', `${user.name ?? 'User'} was ${next ? 'enabled' : 'disabled'}.`);
     } catch (err) {
       if (handleAuthFailure(err)) return;
-      console.error('Failed to toggle user active status:', err);
-      showToast('error', describeApiError(err, `Could not update ${user.name ?? 'this user'}'s status. Please try again.`));
+      showToast('error', describeApiError(err, `Could not update ${user.name ?? 'this user'}.`));
     } finally {
       setTogglingId(null);
     }
@@ -389,386 +869,208 @@ export default function AdminDashboard() {
     try {
       await apiClient.patch(`/admin/drivers/${driver.id}/approve`);
       setPendingDrivers((prev) => prev.filter((d) => d.id !== driver.id));
-      showToast('success', `${driver.name} has been approved and can now log in.`);
-      setReloadToken((n) => n + 1);
+      showToast('success', `${driver.name} was approved and can now log in.`);
+      reload();
     } catch (err) {
       if (handleAuthFailure(err)) return;
-      console.error('Failed to approve driver:', err);
-      showToast('error', describeApiError(err, `Could not approve ${driver.name}. Please try again.`));
+      showToast('error', describeApiError(err, `Could not approve ${driver.name}.`));
     } finally {
       setDriverActionId(null);
     }
-  }, [driverActionId, showToast]);
+  }, [driverActionId, showToast, reload]);
 
-  const openRejectModal = useCallback((driver) => {
-    setRejectError('');
-    setRejectReason('');
-    setRejectTarget(driver);
-  }, []);
-
-  const closeRejectModal = useCallback(() => {
-    if (rejectSubmitting) return;
-    setRejectTarget(null);
-    setRejectReason('');
-    setRejectError('');
-  }, [rejectSubmitting]);
+  const openReject = useCallback((driver) => { setRejectError(''); setRejectReason(''); setRejectTarget(driver); }, []);
+  const closeReject = useCallback(() => { if (!rejectSubmitting) { setRejectTarget(null); setRejectReason(''); setRejectError(''); } }, [rejectSubmitting]);
 
   const handleConfirmReject = useCallback(async () => {
     if (!rejectTarget) return;
     setRejectSubmitting(true);
     setRejectError('');
     try {
-      await apiClient.patch(`/admin/drivers/${rejectTarget.id}/reject`, {
-        reason: rejectReason.trim() || undefined,
-      });
+      await apiClient.patch(`/admin/drivers/${rejectTarget.id}/reject`, { reason: rejectReason.trim() || undefined });
       setPendingDrivers((prev) => prev.filter((d) => d.id !== rejectTarget.id));
-      showToast('success', `${rejectTarget.name}'s application has been rejected.`);
+      showToast('success', `${rejectTarget.name}'s application was rejected.`);
       setRejectTarget(null);
       setRejectReason('');
-      setReloadToken((n) => n + 1);
+      reload();
     } catch (err) {
       if (handleAuthFailure(err)) return;
-      console.error('Failed to reject driver:', err);
-      setRejectError(describeApiError(err, 'Could not reject this application. Please try again.'));
+      setRejectError(describeApiError(err, 'Could not reject this application.'));
     } finally {
       setRejectSubmitting(false);
     }
-  }, [rejectTarget, rejectReason, showToast]);
+  }, [rejectTarget, rejectReason, showToast, reload]);
 
-  const staffTableData = useMemo(
-    () => data.staff.filter((u) => !(u.role === 'DRIVER' && u.approvalStatus === 'PENDING')),
-    [data.staff],
-  );
+  const handleExportAudit = useCallback(async () => {
+    setExporting(true);
+    try {
+      const rows = await trail.fetchForExport();
+      if (rows.length === 0) { showToast('error', 'There is nothing to export with the current filters.'); return; }
+      const header = ['Time', 'Actor', 'Action', 'Target', 'Details'];
+      const body = rows.map((e) => [formatTimestamp(e.timestamp), e.actorName ?? 'System', e.action ?? '', auditTarget(e) === '—' ? '' : auditTarget(e), e.details ?? '']);
+      const csv = [header, ...body].map((r) => r.map(toCsvField).join(',')).join('\r\n');
+      const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8;' }));
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `audit-trail-${new Date().toISOString().slice(0, 10)}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      showToast('success', `Exported ${rows.length} ${rows.length === 1 ? 'entry' : 'entries'}.`);
+    } catch (err) {
+      if (handleAuthFailure(err)) return;
+      showToast('error', describeApiError(err, 'Could not export the audit trail.'));
+    } finally {
+      setExporting(false);
+    }
+  }, [trail, showToast]);
+
+  // ── Derived ──
+  // Pending drivers have their own list above, so they're left out of the staff table.
+  const staffRows = useMemo(() => data.staff.filter((u) => !(u.role === 'DRIVER' && u.approvalStatus === 'PENDING')), [data.staff]);
 
   const filteredVans = useMemo(() => {
     const q = vanSearch.trim().toLowerCase();
     if (!q) return data.vans;
-    return data.vans.filter((van) => {
-      const driverName = van.driverName ?? van.driver?.name ?? '';
-      return (
-        String(van.plateNumber ?? '').toLowerCase().includes(q) ||
-        String(van.status ?? '').toLowerCase().includes(q) ||
-        String(van.capacity ?? '').toLowerCase().includes(q) ||
-        String(driverName).toLowerCase().includes(q)
-      );
-    });
+    return data.vans.filter((v) => [v.plateNumber, v.status, v.capacity, v.driver?.name ?? v.driverName]
+      .some((f) => String(f ?? '').toLowerCase().includes(q)));
   }, [data.vans, vanSearch]);
 
   const filteredStaff = useMemo(() => {
     const q = staffSearch.trim().toLowerCase();
-    if (!q) return staffTableData;
-    return staffTableData.filter((user) => (
-      String(user.name ?? '').toLowerCase().includes(q) ||
-      String(user.email ?? '').toLowerCase().includes(q) ||
-      String(user.driverId ?? '').toLowerCase().includes(q) ||
-      String(user.contactNumber ?? '').toLowerCase().includes(q) ||
-      String(user.role ?? '').toLowerCase().includes(q)
-    ));
-  }, [staffTableData, staffSearch]);
+    if (!q) return staffRows;
+    return staffRows.filter((u) => [u.name, u.email, u.driverId, u.contactNumber, u.role]
+      .some((f) => String(f ?? '').toLowerCase().includes(q)));
+  }, [staffRows, staffSearch]);
 
-  const auditActionOptions = useMemo(() => {
-    const set = new Set();
-    auditLogs.forEach((entry) => { if (entry?.action) set.add(entry.action); });
-    return Array.from(set).sort();
-  }, [auditLogs]);
+  // ── Render ──
+  const shell = (children) => (
+    <div className="nm-root min-h-screen" data-theme={theme}>
+      <style>{THEME_CSS}</style>
+      {children}
+    </div>
+  );
 
-  const filteredAuditLogs = useMemo(() => {
-    const q = auditSearch.trim().toLowerCase();
-    const from = auditDateFrom ? new Date(`${auditDateFrom}T00:00:00`) : null;
-    const to   = auditDateTo ? new Date(`${auditDateTo}T23:59:59`) : null;
-
-    return auditLogs.filter((entry) => {
-      if (auditActionFilter && entry.action !== auditActionFilter) return false;
-      if (from || to) {
-        const t = new Date(entry.timestamp ?? entry.createdAt ?? 0);
-        if (Number.isNaN(t.getTime())) return false;
-        if (from && t < from) return false;
-        if (to && t > to) return false;
-      }
-      if (!q) return true;
-      const haystack = [entry.actorName, entry.actor, entry.action, entry.targetType, entry.target, entry.details, entry.description].filter(Boolean).join(' ').toLowerCase();
-      return haystack.includes(q);
-    });
-  }, [auditLogs, auditSearch, auditActionFilter, auditDateFrom, auditDateTo]);
-
-  const visibleAuditLogs = filteredAuditLogs.slice(0, auditVisible);
-
-  const handleExportAuditCsv = useCallback(() => {
-    if (filteredAuditLogs.length === 0) {
-      showToast('error', 'There is nothing to export with the current filters.');
-      return;
-    }
-    const header = ['Timestamp', 'Actor', 'Action', 'Target', 'Details'];
-    const rows = filteredAuditLogs.map((entry) => [
-      formatAuditTimestamp(entry.timestamp ?? entry.createdAt),
-      entry.actorName ?? entry.actor ?? 'System',
-      entry.action ?? 'UNKNOWN',
-      entry.targetType ?? entry.target ?? '',
-      entry.details ?? entry.description ?? '',
-    ]);
-    const csv = [header, ...rows].map((row) => row.map(toCsvField).join(',')).join('\r\n');
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-    const url  = URL.createObjectURL(blob);
-    const a    = document.createElement('a');
-    a.href = url;
-    a.download = `audit-trail-${new Date().toISOString().slice(0, 10)}.csv`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-    showToast('success', `Exported ${filteredAuditLogs.length} audit ${filteredAuditLogs.length === 1 ? 'entry' : 'entries'}.`);
-  }, [filteredAuditLogs, showToast]);
-
-  const clearAuditFilters = useCallback(() => {
-    setAuditSearch(''); setAuditActionFilter(''); setAuditDateFrom(''); setAuditDateTo(''); setAuditVisible(AUDIT_PAGE_SIZE);
-  }, []);
-
-  // ── Analytics ──────────────────────────────────────────────────────────
-  const roleBreakdown = useMemo(() => {
-    const counts = { ADMIN: 0, DISPATCHER: 0, DRIVER: 0 };
-    data.staff.forEach((u) => { if (counts[u.role] !== undefined) counts[u.role] += 1; });
-    return counts;
-  }, [data.staff]);
-
-  const vanStatusBreakdown = useMemo(() => {
-    const counts = {};
-    VAN_STATUSES.forEach((s) => { counts[s] = 0; });
-    data.vans.forEach((v) => { if (counts[v.status] !== undefined) counts[v.status] += 1; });
-    return counts;
-  }, [data.vans]);
-
-  const driverApprovalBreakdown = useMemo(() => {
-    const counts = { APPROVED: 0, PENDING: 0, REJECTED: 0 };
-    data.staff.forEach((u) => {
-      if (u.role !== 'DRIVER') return;
-      const status = u.approvalStatus ?? 'APPROVED';
-      if (counts[status] !== undefined) counts[status] += 1;
-    });
-    return counts;
-  }, [data.staff]);
-
-  if (loading) return <PageState loading title="Loading Command Center…" />;
-
-  if (fetchError) {
-    return <PageState title="Dashboard unavailable" message={fetchError} actionLabel="Retry" onAction={() => setReloadToken((n) => n + 1)} />;
+  if (loading) {
+    return shell(
+      <div className="flex min-h-screen items-center justify-center p-6">
+        <Card className="flex items-center gap-3 px-6 py-5"><Spinner className="tone-info h-5 w-5" /><span className="font-semibold">Loading command center…</span></Card>
+      </div>,
+    );
   }
 
-  const anyMutationBusy = mutationLoading || vanMutationLoading;
+  if (fetchError) {
+    return shell(
+      <div className="flex min-h-screen items-center justify-center p-6">
+        <Card className="w-full max-w-md space-y-4 p-6 text-center">
+          <h1 className="text-lg font-bold">Dashboard unavailable</h1>
+          <Notice>{fetchError}</Notice>
+          <Btn variant="primary" className="w-full" onClick={reload}>Retry</Btn>
+        </Card>
+      </div>,
+    );
+  }
 
-  return (
-    <div className="min-h-screen bg-gray-100 p-3 sm:p-4 md:p-6">
+  return shell(
+    <div className="p-3 sm:p-5 lg:p-8">
       {toast && (
-        <div
-          role="status"
-          aria-live="polite"
-          className={`fixed top-3 left-1/2 -translate-x-1/2 z-50 px-4 py-3 rounded-xl shadow-xl font-semibold text-sm flex items-center gap-3 max-w-[calc(100%-1.5rem)] sm:max-w-sm w-full border ${
-            toast.type === 'success' ? 'bg-green-50 text-green-800 border-green-200' : 'bg-red-50 text-red-800 border-red-200'
-          }`}
-        >
-          <span className="flex-1">{toast.type === 'success' ? '✅' : '⚠️'} {toast.message}</span>
-          <button onClick={() => setToast(null)} aria-label="Dismiss" className="opacity-50 hover:opacity-100 font-bold text-base leading-none">✕</button>
+        <div role="status" aria-live="polite" className="fixed left-1/2 top-4 z-[60] w-full max-w-sm -translate-x-1/2 px-3">
+          <div className="nm-card flex items-center gap-3 rounded-2xl px-4 py-3 text-sm font-semibold">
+            <span className={toast.type === 'success' ? 'tone-ok' : 'tone-bad'}><Icon name={toast.type === 'success' ? 'check' : 'alert'} className="h-5 w-5" /></span>
+            <span className="flex-1">{toast.message}</span>
+            <button onClick={() => setToast(null)} aria-label="Dismiss" className="nm-muted rounded-lg p-1"><Icon name="x" /></button>
+          </div>
         </div>
       )}
 
-      {/* ── Header ─────────────────────────────────────────────────────── */}
-      <div className="max-w-6xl mx-auto bg-white p-4 sm:p-5 rounded-xl shadow-sm border mb-4 sm:mb-6 flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3">
-        <div className="min-w-0">
-          <h1 className="text-xl sm:text-2xl font-extrabold text-gray-900 leading-tight">Catanduanes Command Center</h1>
-          <p className="text-xs sm:text-sm text-gray-500 mt-0.5">System Administration &amp; Analytics</p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <button
-            onClick={() => setIsAuditOpen(true)}
-            title="View the full audit trail"
-            className="text-xs sm:text-sm font-semibold px-3 sm:px-4 py-2 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-100 transition flex items-center gap-2 flex-1 sm:flex-initial justify-center"
-          >
-            🧾 <span className="hidden xs:inline sm:inline">Audit Trail</span>
-            <span className="bg-gray-100 text-gray-600 text-xs font-bold px-1.5 py-0.5 rounded">{auditLogs.length}</span>
-          </button>
-          <button
-            onClick={() => setReloadToken((n) => n + 1)}
-            title="Refresh dashboard"
-            aria-label="Refresh dashboard"
-            className="p-2 rounded-lg text-gray-400 hover:text-gray-700 hover:bg-gray-100 transition"
-          >
-            🔄
-          </button>
-          <button
-            onClick={handleLogout}
-            disabled={loggingOut}
-            className="bg-red-50 text-red-600 font-bold px-3 sm:px-4 py-2 rounded-lg border border-red-200 hover:bg-red-100 transition text-xs sm:text-sm disabled:opacity-50 disabled:cursor-not-allowed flex-1 sm:flex-initial"
-          >
-            {loggingOut ? 'Logging out…' : 'Log out'}
-          </button>
-        </div>
-      </div>
-
-      <div className="max-w-6xl mx-auto space-y-4 sm:space-y-6">
-        {/* ── Stat cards ───────────────────────────────────────────────── */}
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 sm:gap-4">
-          <StatCard title="Active Trips" value={data.stats.activeTrips} color="text-green-600" icon="🚐" />
-          <StatCard title="Total Trips" value={data.stats.totalTrips} color="text-blue-600" icon="📊" />
-          <StatCard title="Total Vans" value={data.stats.totalVans} color="text-purple-600" icon="🚌" />
-          <StatCard title="Total Staff" value={data.stats.totalUsers} color="text-orange-600" icon="👥" />
-        </div>
-
-        {/* ── Analytics ────────────────────────────────────────────────── */}
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 sm:gap-4">
-          <BreakdownCard
-            title="Staff by Role"
-            entries={[
-              { label: 'Admin', count: roleBreakdown.ADMIN, colorClass: ROLE_BAR_COLORS.ADMIN },
-              { label: 'Dispatcher', count: roleBreakdown.DISPATCHER, colorClass: ROLE_BAR_COLORS.DISPATCHER },
-              { label: 'Driver', count: roleBreakdown.DRIVER, colorClass: ROLE_BAR_COLORS.DRIVER },
-            ]}
-          />
-          <BreakdownCard
-            title="Fleet Status"
-            entries={VAN_STATUSES.map((s) => ({
-              label: s.replace('_', ' '),
-              count: vanStatusBreakdown[s],
-              colorClass: VAN_STATUS_BAR_COLORS[s],
-            }))}
-          />
-          <BreakdownCard
-            title="Driver Approvals"
-            entries={[
-              { label: 'Approved', count: driverApprovalBreakdown.APPROVED, colorClass: APPROVAL_BAR_COLORS.APPROVED },
-              { label: 'Pending', count: driverApprovalBreakdown.PENDING, colorClass: APPROVAL_BAR_COLORS.PENDING },
-              { label: 'Rejected', count: driverApprovalBreakdown.REJECTED, colorClass: APPROVAL_BAR_COLORS.REJECTED },
-            ]}
-          />
-        </div>
-
-        {/* ── Pending driver applications ─────────────────────────────── */}
-        <div className="bg-white p-3 sm:p-4 rounded-xl shadow-sm border border-gray-200">
-          <div className="flex justify-between items-center mb-3 border-b pb-3">
-            <h2 className="text-base sm:text-lg font-bold text-gray-800 flex items-center gap-2">
-              Pending Driver Applications
-              <span className="text-xs font-bold bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full">{pendingDrivers.length}</span>
-            </h2>
+      <div className="mx-auto max-w-6xl space-y-6">
+        <Card className="flex flex-col gap-4 p-4 sm:flex-row sm:items-center sm:justify-between sm:p-5">
+          <div className="min-w-0">
+            <h1 className="text-xl font-bold tracking-tight sm:text-2xl">Command center</h1>
+            <p className="nm-muted text-sm">Catanduanes terminal administration</p>
           </div>
+          <div className="flex flex-wrap items-center gap-3">
+            <Btn onClick={() => setIsAuditOpen(true)}><Icon name="doc" /> Audit trail</Btn>
+            <Btn size="icon" onClick={reload} aria-label="Refresh dashboard" title="Refresh"><Icon name="refresh" className="h-[18px] w-[18px]" /></Btn>
+            <ThemeToggle theme={theme} onToggle={toggleTheme} />
+            <Btn onClick={handleLogout} disabled={loggingOut}><Icon name="logout" /> {loggingOut ? 'Logging out…' : 'Log out'}</Btn>
+          </div>
+        </Card>
 
+        <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+          <StatCard icon="van" label="Active trips" value={data.stats.activeTrips} tone="ok" />
+          <StatCard icon="van" label="Registered vans" value={data.stats.totalVans} tone="info" />
+          <StatCard icon="users" label="System users" value={data.stats.totalUsers} tone="violet" />
+          <StatCard icon="clock" label="Pending approvals" value={pendingDrivers.length} tone="warn" />
+        </div>
+
+        <Card className="p-4 sm:p-5">
+          <SectionHeader title="Driver applications" count={pendingDrivers.length} />
           {pendingLoading ? (
-            <p className="text-sm text-gray-400 text-center py-6">Loading applications…</p>
+            <p className="nm-muted flex items-center justify-center gap-2 py-8 text-sm"><Spinner /> Loading applications…</p>
           ) : pendingError ? (
-            <p className="text-sm text-red-600 text-center py-6">{pendingError}</p>
+            <Notice>{pendingError}</Notice>
           ) : pendingDrivers.length === 0 ? (
-            <p className="text-sm text-gray-400 text-center py-6 italic">No pending applications right now.</p>
+            <p className="nm-muted py-8 text-center text-sm">No applications waiting for review.</p>
           ) : (
-            <div className="space-y-3">
+            <ul className="space-y-3">
               {pendingDrivers.map((driver) => {
-                const isBusy = driverActionId === driver.id;
+                const busy = driverActionId === driver.id;
                 return (
-                  <div
-                    key={driver.id}
-                    className={`flex flex-col sm:flex-row sm:items-center gap-3 border border-gray-200 rounded-lg p-3 transition-opacity ${isBusy ? 'opacity-50' : ''}`}
-                  >
-                    <button
-                      type="button"
-                      onClick={() => driver.licensePhotoUrl && setLicensePhotoView(driver)}
-                      disabled={!driver.licensePhotoUrl}
-                      className="shrink-0 w-16 h-16 rounded-lg border border-gray-200 overflow-hidden bg-gray-50 disabled:cursor-default"
-                      title="View license photo"
-                    >
-                      {driver.licensePhotoUrl ? (
-                        <img src={driver.licensePhotoUrl} alt="License" className="w-full h-full object-cover" />
-                      ) : (
-                        <span className="flex items-center justify-center h-full text-xl">📄</span>
-                      )}
+                  <li key={driver.id} className={`nm-inset flex flex-col gap-3 rounded-2xl p-3 sm:flex-row sm:items-center ${busy ? 'opacity-60' : ''}`}>
+                    <button type="button" onClick={() => driver.licensePhotoUrl && setLicensePhotoView(driver)} disabled={!driver.licensePhotoUrl}
+                      aria-label={`View ${driver.name}'s license photo`} title="View license photo"
+                      className="nm-raised nm-muted flex h-16 w-16 shrink-0 items-center justify-center overflow-hidden rounded-xl">
+                      {driver.licensePhotoUrl ? <img src={driver.licensePhotoUrl} alt="" className="h-full w-full object-cover" /> : <Icon name="doc" className="h-6 w-6" />}
                     </button>
-
-                    <div className="flex-1 min-w-0">
-                      <div className="font-bold text-gray-800">{driver.name}</div>
-                      <div className="text-xs text-gray-400 mt-0.5 flex flex-wrap gap-x-3">
-                        <span>ID: {driver.driverId}</span>
-                        <span>Van: {driver.assignedVan?.plateNumber ?? '—'}</span>
-                        <span>📞 {driver.contactNumber || '—'}</span>
-                        <span>Applied {formatAuditTimestamp(driver.createdAt)}</span>
-                      </div>
+                    <div className="min-w-0 flex-1">
+                      <p className="font-bold">{driver.name}</p>
+                      <p className="nm-muted mt-0.5 flex flex-wrap gap-x-3 text-xs">
+                        <span>ID {driver.driverId ?? '—'}</span>
+                        <span>Van {driver.assignedVan?.plateNumber ?? '—'}</span>
+                        <span>{driver.contactNumber || 'No contact number'}</span>
+                        <span>Applied {formatTimestamp(driver.createdAt)}</span>
+                      </p>
                     </div>
-
-                    <div className="flex gap-2 shrink-0">
-                      <button
-                        onClick={() => handleApproveDriver(driver)}
-                        disabled={isBusy}
-                        className="text-xs font-bold px-3 py-1.5 rounded-lg border border-green-300 text-green-700 bg-green-50 hover:bg-green-100 transition disabled:opacity-40"
-                      >
-                        {isBusy ? '…' : '✓ Approve'}
-                      </button>
-                      <button
-                        onClick={() => openRejectModal(driver)}
-                        disabled={isBusy}
-                        className="text-xs font-bold px-3 py-1.5 rounded-lg border border-red-300 text-red-600 bg-red-50 hover:bg-red-100 transition disabled:opacity-40"
-                      >
-                        ✕ Reject
-                      </button>
+                    <div className="flex shrink-0 gap-2">
+                      <Btn variant="success" size="sm" onClick={() => handleApproveDriver(driver)} disabled={busy}>
+                        {busy ? <Spinner className="h-3.5 w-3.5" /> : <Icon name="check" className="h-3.5 w-3.5" />} Approve
+                      </Btn>
+                      <Btn variant="danger" size="sm" onClick={() => openReject(driver)} disabled={busy}><Icon name="x" className="h-3.5 w-3.5" /> Reject</Btn>
                     </div>
-                  </div>
+                  </li>
                 );
               })}
-            </div>
+            </ul>
           )}
-        </div>
+        </Card>
 
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-6">
-          {/* ── Vans card — view/delete only, registration happens via driver signup ─ */}
-          <div className="bg-white p-3 sm:p-4 rounded-xl shadow-sm border border-gray-200">
-            <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2 sm:gap-3 mb-3 border-b pb-3">
-              <h2 className="text-base sm:text-lg font-bold text-gray-800 flex items-center gap-2">
-                Registered Vans
-                <span className="text-xs font-bold bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full">{data.vans.length}</span>
-              </h2>
-            </div>
-            <p className="text-xs text-blue-600 font-medium mb-3">
-              Vans are registered by drivers themselves during sign-up — this list is view-only.
-            </p>
-
-            {data.vans.length > 0 && (
-              <div className="mb-3">
-                <SearchInput
-                  value={vanSearch}
-                  onChange={setVanSearch}
-                  placeholder="Search vans…"
-                  ariaLabel="Search vans"
-                />
-              </div>
-            )}
-
-            <div className="overflow-x-auto -mx-3 sm:mx-0">
-              <table className="w-full text-sm text-left min-w-[420px]">
-                <thead className="bg-gray-50 text-gray-500 text-xs uppercase tracking-wide">
-                  <tr>
-                    <th className="p-3">Plate</th>
-                    <th className="p-3">Capacity</th>
-                    <th className="p-3">Status</th>
-                    <th className="p-3 text-right">Actions</th>
-                  </tr>
-                </thead>
+        <div className="grid gap-6 lg:grid-cols-2">
+          <Card className="p-4 sm:p-5">
+            <SectionHeader title="Registered vans" count={data.vans.length} />
+            <p className="nm-muted mb-4 text-xs">Drivers register their own van when they sign up, so this list is view-only.</p>
+            {data.vans.length > 0 && <div className="mb-4"><SearchInput value={vanSearch} onChange={setVanSearch} placeholder="Search vans" ariaLabel="Search vans" /></div>}
+            <div className="overflow-x-auto">
+              <table className="nm-table w-full min-w-[420px] text-left text-sm">
+                <thead><tr><th className="px-3 py-2">Van</th><th className="px-3 py-2">Seats</th><th className="px-3 py-2">Status</th><th className="px-3 py-2 text-right">Actions</th></tr></thead>
                 <tbody>
                   {filteredVans.length === 0 ? (
-                    <EmptyTableRow
-                      colSpan={4}
-                      message={
-                        data.vans.length === 0
-                          ? 'No vans registered yet.'
-                          : 'No vans match your search.'
-                      }
-                    />
+                    <EmptyRow colSpan={4}>{data.vans.length === 0 ? 'No vans registered yet.' : 'No vans match your search.'}</EmptyRow>
                   ) : filteredVans.map((van) => {
-                    const driverName = van.driverName ?? van.driver?.name ?? null;
+                    const driverName = van.driver?.name ?? van.driverName;
                     return (
-                      <tr key={van.id} className="border-b hover:bg-gray-50">
-                        <td className="p-3">
-                          <div className="font-bold text-gray-800">{van.plateNumber ?? '—'}</div>
-                          {driverName && <div className="text-xs text-gray-400 mt-0.5">Driver: {driverName}</div>}
+                      <tr key={van.id}>
+                        <td className="px-3 py-3">
+                          <p className="font-bold">{van.plateNumber ?? '—'}</p>
+                          {driverName && <p className="nm-muted text-xs">{driverName}</p>}
                         </td>
-                        <td className="p-3 text-gray-600">{van.capacity ?? 0} pax</td>
-                        <td className="p-3"><VanStatusBadge status={van.status} /></td>
-                        <td className="p-3">
-                          <div className="flex gap-1.5 justify-end">
-                            <button onClick={() => setViewingQrVan(van)} title="View this van's scan QR" className="text-xs font-semibold px-2 py-1 rounded border border-purple-300 text-purple-700 bg-purple-50 hover:bg-purple-100 transition">QR</button>
-                            <button onClick={() => openDeleteVanModal(van)} className="text-xs font-semibold px-2 py-1 rounded border border-red-300 text-red-600 bg-red-50 hover:bg-red-100 transition">Delete</button>
+                        <td className="px-3 py-3 tabular-nums">{van.capacity ?? 0}</td>
+                        <td className="px-3 py-3"><VanStatusBadge status={van.status} /></td>
+                        <td className="px-3 py-3">
+                          <div className="flex justify-end gap-2">
+                            <Btn size="sm" onClick={() => setViewingQrVan(van)} aria-label={`Show QR for ${van.plateNumber}`}><Icon name="qr" className="h-3.5 w-3.5" /> QR</Btn>
+                            <Btn size="sm" variant="danger" onClick={() => openDeleteVan(van)} aria-label={`Delete ${van.plateNumber}`}><Icon name="trash" className="h-3.5 w-3.5" /></Btn>
                           </div>
                         </td>
                       </tr>
@@ -777,84 +1079,40 @@ export default function AdminDashboard() {
                 </tbody>
               </table>
             </div>
-          </div>
+          </Card>
 
-          {/* ── Staff card ────────────────────────────────────────────── */}
-          <div className="bg-white p-3 sm:p-4 rounded-xl shadow-sm border border-gray-200">
-            <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-2 sm:gap-3 mb-3 border-b pb-3">
-              <h2 className="text-base sm:text-lg font-bold text-gray-800 flex items-center gap-2">
-                System Users &amp; Drivers
-                <span className="text-xs font-bold bg-gray-100 text-gray-600 px-2 py-0.5 rounded-full">{staffTableData.length}</span>
-              </h2>
-              <button
-                onClick={openAddStaffModal}
-                className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-3 py-1.5 rounded-lg transition shadow-sm whitespace-nowrap self-stretch sm:self-auto"
-              >
-                ＋ Add Staff Account
-              </button>
-            </div>
-
-            {staffTableData.length > 0 && (
-              <div className="mb-3">
-                <SearchInput
-                  value={staffSearch}
-                  onChange={setStaffSearch}
-                  placeholder="Search staff…"
-                  ariaLabel="Search staff"
-                />
-              </div>
-            )}
-
-            <div className="overflow-x-auto -mx-3 sm:mx-0">
-              <table className="w-full text-sm text-left min-w-[560px]">
-                <thead className="bg-gray-50 text-gray-500 text-xs uppercase tracking-wide">
-                  <tr>
-                    <th className="p-3">Name</th>
-                    <th className="p-3">Contact</th>
-                    <th className="p-3">Role</th>
-                    <th className="p-3">Status</th>
-                    <th className="p-3 text-right">Actions</th>
-                  </tr>
-                </thead>
+          <Card className="p-4 sm:p-5">
+            <SectionHeader title="Users & drivers" count={staffRows.length}>
+              <Btn variant="primary" size="sm" onClick={() => { setStaffError(''); setIsStaffModalOpen(true); }}><Icon name="plus" className="h-3.5 w-3.5" /> Add staff</Btn>
+            </SectionHeader>
+            {staffRows.length > 0 && <div className="mb-4"><SearchInput value={staffSearch} onChange={setStaffSearch} placeholder="Search users" ariaLabel="Search users" /></div>}
+            <div className="overflow-x-auto">
+              <table className="nm-table w-full min-w-[480px] text-left text-sm">
+                <thead><tr><th className="px-3 py-2">Name</th><th className="px-3 py-2">Role</th><th className="px-3 py-2">Status</th><th className="px-3 py-2 text-right">Actions</th></tr></thead>
                 <tbody>
                   {filteredStaff.length === 0 ? (
-                    <EmptyTableRow
-                      colSpan={5}
-                      message={
-                        staffTableData.length === 0
-                          ? 'No staff accounts yet. Tap "Add Staff Account" to create one.'
-                          : 'No staff match your search.'
-                      }
-                    />
+                    <EmptyRow colSpan={4}>{staffRows.length === 0 ? 'No accounts yet. Use Add staff to create one.' : 'No users match your search.'}</EmptyRow>
                   ) : filteredStaff.map((user) => {
-                    const isBusy = togglingId === user.id;
-                    const anyToggling = togglingId !== null;
-                    const isRejectedDriver = user.role === 'DRIVER' && user.approvalStatus === 'REJECTED';
+                    const busy = togglingId === user.id;
+                    const rejected = user.role === 'DRIVER' && user.approvalStatus === 'REJECTED';
                     return (
-                      <tr key={user.id} className={`border-b hover:bg-gray-50 transition-opacity ${isBusy ? 'opacity-50' : ''}`}>
-                        <td className="p-3">
-                          <div className="font-bold text-gray-800 leading-tight">{user.name ?? 'Unnamed'}</div>
-                          <div className="text-xs text-gray-400 mt-0.5 break-all">{user.email || user.driverId || '—'}</div>
+                      <tr key={user.id} className={busy ? 'opacity-60' : ''}>
+                        <td className="px-3 py-3">
+                          <p className="font-bold leading-tight">{user.name ?? 'Unnamed'}</p>
+                          <p className="nm-muted break-all text-xs">{user.email || user.driverId || '—'}{user.contactNumber ? ` · ${user.contactNumber}` : ''}</p>
                         </td>
-                        <td className="p-3 text-gray-600 whitespace-nowrap">{user.contactNumber || '—'}</td>
-                        <td className="p-3"><RoleBadge role={user.role} /></td>
-                        <td className="p-3">
-                          {isRejectedDriver ? (
-                            <span className="px-2 py-0.5 rounded text-xs font-bold bg-red-100 text-red-700">Rejected</span>
-                          ) : (
-                            <span className={`px-2 py-0.5 rounded text-xs font-bold ${user.isActive ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-500'}`}>
-                              {user.isActive ? 'Active' : 'Disabled'}
-                            </span>
-                          )}
+                        <td className="px-3 py-3"><RoleBadge role={user.role} /></td>
+                        <td className="px-3 py-3">
+                          {rejected ? <Chip tone="bad">Rejected</Chip> : <Chip tone={user.isActive ? 'ok' : 'muted'}>{user.isActive ? 'Active' : 'Disabled'}</Chip>}
                         </td>
-                        <td className="p-3">
-                          <div className="flex flex-wrap gap-1.5 justify-end">
-                            {!isRejectedDriver && (
-                              <button onClick={() => handleToggleActive(user)} disabled={isBusy || anyToggling} className={`text-xs font-semibold px-2 py-1 rounded border transition disabled:opacity-40 disabled:cursor-not-allowed ${user.isActive ? 'border-yellow-300 text-yellow-700 bg-yellow-50 hover:bg-yellow-100' : 'border-green-300 text-green-700 bg-green-50 hover:bg-green-100'}`}>
-                                {isBusy ? '…' : user.isActive ? 'Disable' : 'Enable'}
-                              </button>
+                        <td className="px-3 py-3">
+                          <div className="flex justify-end gap-2">
+                            {!rejected && (
+                              <Btn size="sm" onClick={() => handleToggleActive(user)} disabled={togglingId !== null}>
+                                {busy ? <Spinner className="h-3.5 w-3.5" /> : user.isActive ? 'Disable' : 'Enable'}
+                              </Btn>
                             )}
-                            <button onClick={() => openDeleteUserModal(user)} disabled={isBusy || anyToggling} className="text-xs font-semibold px-2 py-1 rounded border border-red-300 text-red-600 bg-red-50 hover:bg-red-100 transition disabled:opacity-40 disabled:cursor-not-allowed">Delete</button>
+                            <Btn size="sm" variant="danger" onClick={() => openDeleteUser(user)} disabled={togglingId !== null} aria-label={`Delete ${user.name}`}><Icon name="trash" className="h-3.5 w-3.5" /></Btn>
                           </div>
                         </td>
                       </tr>
@@ -863,688 +1121,16 @@ export default function AdminDashboard() {
                 </tbody>
               </table>
             </div>
-          </div>
+          </Card>
         </div>
       </div>
 
-      <AuditTrailModal
-        isOpen={isAuditOpen} onClose={() => setIsAuditOpen(false)} logs={visibleAuditLogs} totalCount={filteredAuditLogs.length} fullCount={auditLogs.length}
-        loading={auditLoading} error={auditError} search={auditSearch} onSearchChange={(v) => { setAuditSearch(v); setAuditVisible(AUDIT_PAGE_SIZE); }}
-        actionFilter={auditActionFilter} onActionFilterChange={(v) => { setAuditActionFilter(v); setAuditVisible(AUDIT_PAGE_SIZE); }} actionOptions={auditActionOptions}
-        dateFrom={auditDateFrom} onDateFromChange={(v) => { setAuditDateFrom(v); setAuditVisible(AUDIT_PAGE_SIZE); }} dateTo={auditDateTo} onDateToChange={(v) => { setAuditDateTo(v); setAuditVisible(AUDIT_PAGE_SIZE); }}
-        onClearFilters={clearAuditFilters} lastSync={lastAuditSync} onRefresh={() => fetchAuditLogs()} onLoadMore={() => setAuditVisible((n) => n + AUDIT_PAGE_SIZE)}
-        onClearHistory={handleClearAuditHistory} onExportCsv={handleExportAuditCsv}
-      />
-      <StaffFormModal isOpen={isStaffModalOpen} onClose={closeStaffModal} onSubmit={handleSubmitStaff} isLoading={mutationLoading} serverError={mutationError} onClearError={() => setMutationError('')} />
-      <QrOnlyModal van={viewingQrVan} onClose={() => setViewingQrVan(null)} />
-      <ConfirmDeleteModal target={pendingDelete} onClose={closeDeleteModal} onConfirm={handleConfirmDelete} isLoading={anyMutationBusy} serverError={pendingDelete?.kind === 'van' ? vanMutationError : mutationError} />
+      <AuditTrailModal isOpen={isAuditOpen} onClose={() => setIsAuditOpen(false)} trail={trail} onExport={handleExportAudit} exporting={exporting} />
+      <StaffFormModal isOpen={isStaffModalOpen} onClose={closeStaffModal} onSubmit={handleSubmitStaff} isLoading={staffSaving} serverError={staffError} onClearError={clearStaffError} />
+      <VanQrModal van={viewingQrVan} onClose={() => setViewingQrVan(null)} />
+      <ConfirmDeleteModal target={pendingDelete} onClose={closeDelete} onConfirm={handleConfirmDelete} isLoading={deleting} serverError={deleteError} />
       <LicensePhotoModal driver={licensePhotoView} onClose={() => setLicensePhotoView(null)} />
-      <RejectDriverModal
-        target={rejectTarget}
-        reason={rejectReason}
-        onReasonChange={setRejectReason}
-        onClose={closeRejectModal}
-        onConfirm={handleConfirmReject}
-        isLoading={rejectSubmitting}
-        serverError={rejectError}
-      />
-    </div>
-  );
-}
-
-// ─── StaffFormModal (Add only — Admin & Dispatcher accounts) ─────────────────
-
-function StaffFormModal({ isOpen, onClose, onSubmit, isLoading, serverError, onClearError }) {
-  const [form, setForm]     = useState(EMPTY_STAFF_FORM);
-  const [errors, setErrors] = useState({});
-  const [passwordVisible, setPasswordVisible] = useState(false);
-  const nameRef              = useRef(null);
-
-  useEffect(() => {
-    if (isOpen) {
-      setForm(EMPTY_STAFF_FORM);
-      setErrors({});
-      setPasswordVisible(false);
-      onClearError();
-      const id = setTimeout(() => nameRef.current?.focus(), 60);
-      return () => clearTimeout(id);
-    }
-  }, [isOpen, onClearError]);
-
-  useEffect(() => {
-    if (!isOpen) return;
-    const fn = (e) => { if (e.key === 'Escape' && !isLoading) onClose(); };
-    document.addEventListener('keydown', fn);
-    return () => document.removeEventListener('keydown', fn);
-  }, [isOpen, isLoading, onClose]);
-
-  const change = (e) => {
-    const { name, value } = e.target;
-    setForm((p) => ({ ...p, [name]: value }));
-    setErrors((p) => ({ ...p, [name]: '' }));
-    if (serverError) onClearError();
-  };
-
-  const handleGeneratePassword = () => {
-    const pw = generateRandomPassword();
-    setForm((p) => ({ ...p, password: pw }));
-    setErrors((p) => ({ ...p, password: '' }));
-    setPasswordVisible(true);
-    if (serverError) onClearError();
-  };
-
-  const validate = () => {
-    const e   = {};
-    const nm  = form.name.trim();
-    const em  = form.email.trim();
-
-    if (!nm) e.name = 'Full name is required.';
-    else if (nm.length > 100) e.name = 'Name must be 100 characters or fewer.';
-
-    if (!form.role) e.role = 'Role is required.';
-
-    if (!em) e.email = 'Email address is required.';
-    else if (!EMAIL_RE.test(em)) e.email = 'Enter a valid email address.';
-
-    if (!form.password) e.password = 'A PIN is required.';
-    else if (form.password.length < PASSWORD_MIN) e.password = `PIN must be at least ${PASSWORD_MIN} characters.`;
-
-    return e;
-  };
-
-  const submit = () => {
-    const e = validate();
-    if (Object.keys(e).length > 0) { setErrors(e); return; }
-
-    onSubmit({
-      name: form.name.trim(),
-      role: form.role,
-      email: form.email.trim(),
-      password: form.password,
-    });
-  };
-
-  if (!isOpen) return null;
-
-  return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="staff-modal-title"
-      className="fixed inset-0 bg-black/50 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4"
-      onClick={(e) => { if (e.target === e.currentTarget && !isLoading) onClose(); }}
-    >
-      <div className="bg-white rounded-t-2xl sm:rounded-2xl shadow-2xl w-full max-w-md max-h-[95vh] sm:max-h-[90vh] flex flex-col">
-        <div className="flex justify-between items-center p-4 sm:p-5 border-b">
-          <h2 id="staff-modal-title" className="text-base sm:text-lg font-bold text-gray-900">Add Staff Account</h2>
-          <button onClick={onClose} disabled={isLoading} aria-label="Close" className="text-gray-400 hover:text-gray-600 disabled:opacity-40 text-xl leading-none p-1">✕</button>
-        </div>
-        {serverError && <div className="mx-4 sm:mx-5 mt-4 p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg text-sm">⚠️ {serverError}</div>}
-        <div className="p-4 sm:p-5 space-y-4 overflow-y-auto">
-          <Field label="Full Name" required error={errors.name}>
-            <input ref={nameRef} name="name" type="text" value={form.name} onChange={change} placeholder="e.g. Juan dela Cruz" autoComplete="name" maxLength={100} className={inputCls(errors.name)} />
-          </Field>
-
-          <Field label="Role" required error={errors.role}>
-            <select name="role" value={form.role} onChange={change} className={`${inputCls(errors.role)} bg-white`}>
-              <option value="">— Select a role —</option>
-              <option value="ADMIN">Admin</option>
-              <option value="DISPATCHER">Dispatcher</option>
-            </select>
-            <p className="text-xs text-blue-600 mt-1.5 font-medium">Drivers register themselves (and their van) and are approved from the Pending Driver Applications list above — they aren't created here.</p>
-          </Field>
-
-          <Field label="Email Address" required error={errors.email}>
-            <input name="email" type="email" value={form.email} onChange={change} placeholder="staff@terminal.gov.ph" autoComplete="email" className={inputCls(errors.email)} />
-          </Field>
-
-          <Field
-            label="PIN"
-            required
-            error={errors.password}
-            hint={`At least ${PASSWORD_MIN} characters. Use the generator for a quick, non-obvious PIN.`}
-            action={<GeneratePasswordButton onGenerate={handleGeneratePassword} />}
-          >
-            <PasswordInput
-              name="password"
-              value={form.password}
-              onChange={change}
-              placeholder="Enter a PIN"
-              autoComplete="new-password"
-              hasError={errors.password}
-              maxLength={128}
-              visible={passwordVisible}
-              onToggleVisible={() => setPasswordVisible((v) => !v)}
-            />
-          </Field>
-        </div>
-        <div className="flex flex-col-reverse sm:flex-row gap-2 sm:gap-3 p-4 sm:p-5 border-t bg-gray-50 rounded-b-2xl">
-          <button onClick={onClose} disabled={isLoading} className="flex-1 py-2.5 sm:py-2 border border-gray-300 rounded-lg text-sm font-semibold text-gray-700 hover:bg-gray-100 transition disabled:opacity-40">Cancel</button>
-          <button onClick={submit} disabled={isLoading} className="flex-1 py-2.5 sm:py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-bold transition disabled:opacity-70 disabled:cursor-not-allowed">
-            {isLoading ? 'Creating…' : 'Create Account'}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ─── QrOnlyModal ────────────────────────────────────────────────────────────
-
-function QrOnlyModal({ van, onClose }) {
-  useEffect(() => {
-    if (!van) return;
-    const fn = (e) => { if (e.key === 'Escape') onClose(); };
-    document.addEventListener('keydown', fn);
-    return () => document.removeEventListener('keydown', fn);
-  }, [van, onClose]);
-
-  if (!van) return null;
-
-  const qrToken = van.qrToken;
-
-  return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="qr-only-title"
-      className="fixed inset-0 bg-black/50 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4"
-    >
-      <div className="bg-white rounded-t-2xl sm:rounded-2xl shadow-2xl w-full max-w-sm max-h-[95vh] sm:max-h-[90vh] flex flex-col">
-        <div className="p-5 sm:p-6 space-y-4 text-center overflow-y-auto">
-          <div className="text-4xl" aria-hidden="true">📱</div>
-          <h2 id="qr-only-title" className="text-base sm:text-lg font-black text-gray-900">{van.plateNumber} — Scan QR</h2>
-
-          {!qrToken ? (
-            <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-sm text-amber-800">
-              No QR token was returned for this van by the server.
-            </div>
-          ) : (
-            <div className="bg-gray-50 border border-gray-200 rounded-xl p-3 sm:p-4 text-left space-y-3">
-              <div className="flex items-center gap-2">
-                <code className="flex-1 text-[11px] bg-white border border-gray-200 rounded px-2 py-1.5 break-all font-mono">
-                  {qrToken}
-                </code>
-                <CopyButton text={qrToken} label="Copy" />
-              </div>
-              <img
-                src={`https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(qrToken)}`}
-                alt="Van QR preview"
-                className="mx-auto rounded-lg border border-gray-200 max-w-full"
-              />
-              <p className="text-xs text-gray-400">
-                Reprint this if the sticker is lost or damaged — it's the same code every time.
-              </p>
-            </div>
-          )}
-        </div>
-        <div className="p-4 sm:p-5 border-t bg-gray-50 rounded-b-2xl">
-          <button onClick={onClose} className="w-full py-2.5 sm:py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-bold transition">
-            Close
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ─── LicensePhotoModal ──────────────────────────────────────────────────────
-
-function LicensePhotoModal({ driver, onClose }) {
-  useEffect(() => {
-    if (!driver) return;
-    const fn = (e) => { if (e.key === 'Escape') onClose(); };
-    document.addEventListener('keydown', fn);
-    return () => document.removeEventListener('keydown', fn);
-  }, [driver, onClose]);
-
-  if (!driver) return null;
-
-  return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="license-photo-title"
-      className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4"
-      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
-    >
-      <div className="bg-white rounded-2xl shadow-2xl max-w-lg w-full max-h-[90vh] flex flex-col overflow-hidden">
-        <div className="flex justify-between items-center p-4 border-b">
-          <h2 id="license-photo-title" className="text-sm font-bold text-gray-900">{driver.name} — Driver's License</h2>
-          <button onClick={onClose} aria-label="Close" className="text-gray-400 hover:text-gray-600 text-xl leading-none p-1">✕</button>
-        </div>
-        <div className="p-4 overflow-auto bg-gray-50">
-          <img src={driver.licensePhotoUrl} alt="Driver's license" className="w-full h-auto rounded-lg border" />
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ─── RejectDriverModal ──────────────────────────────────────────────────────
-
-function RejectDriverModal({ target, reason, onReasonChange, onClose, onConfirm, isLoading, serverError }) {
-  useEffect(() => {
-    if (!target) return;
-    const fn = (e) => { if (e.key === 'Escape' && !isLoading) onClose(); };
-    document.addEventListener('keydown', fn);
-    return () => document.removeEventListener('keydown', fn);
-  }, [target, isLoading, onClose]);
-
-  if (!target) return null;
-
-  return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="reject-modal-title"
-      className="fixed inset-0 bg-black/50 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4"
-      onClick={(e) => { if (e.target === e.currentTarget && !isLoading) onClose(); }}
-    >
-      <div className="bg-white rounded-t-2xl sm:rounded-2xl shadow-2xl w-full max-w-sm max-h-[95vh] sm:max-h-[90vh] flex flex-col">
-        <div className="p-5 sm:p-6 space-y-4">
-          <h2 id="reject-modal-title" className="text-base sm:text-lg font-black text-gray-900 text-center">Reject Application?</h2>
-          <p className="text-sm text-gray-500 text-center">
-            Rejecting <strong>{target.name}</strong>'s application. You can optionally add a reason.
-          </p>
-          <textarea
-            value={reason}
-            onChange={(e) => onReasonChange(e.target.value)}
-            placeholder="Reason (optional)"
-            rows={3}
-            className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-red-300 focus:border-red-300"
-          />
-          {serverError && <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700">⚠️ {serverError}</div>}
-        </div>
-        <div className="flex flex-col-reverse sm:flex-row gap-2 sm:gap-3 p-4 sm:p-5 border-t bg-gray-50 rounded-b-2xl">
-          <button onClick={onClose} disabled={isLoading} className="flex-1 py-2.5 sm:py-2 border border-gray-300 rounded-lg text-sm font-semibold text-gray-700 hover:bg-gray-100 transition disabled:opacity-40">Cancel</button>
-          <button onClick={onConfirm} disabled={isLoading} className="flex-1 py-2.5 sm:py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-sm font-black transition disabled:opacity-70 disabled:cursor-not-allowed">
-            {isLoading ? 'Rejecting…' : 'Confirm Reject'}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ─── ConfirmDeleteModal ───────────────────────────────────────────────────────
-
-function ConfirmDeleteModal({ target, onClose, onConfirm, isLoading, serverError }) {
-  const isAdminRole = target?.kind === 'user' && target?.role === 'ADMIN';
-  const isVan       = target?.kind === 'van';
-
-  useEffect(() => {
-    if (!target) return;
-    const fn = (e) => { if (e.key === 'Escape' && !isLoading) onClose(); };
-    document.addEventListener('keydown', fn);
-    return () => document.removeEventListener('keydown', fn);
-  }, [target, isLoading, onClose]);
-
-  if (!target) return null;
-
-  return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="delete-modal-title"
-      className="fixed inset-0 bg-black/50 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4"
-      onClick={(e) => { if (e.target === e.currentTarget && !isLoading) onClose(); }}
-    >
-      <div className="bg-white rounded-t-2xl sm:rounded-2xl shadow-2xl w-full max-w-sm max-h-[95vh] sm:max-h-[90vh] flex flex-col">
-        <div className="p-5 sm:p-6 space-y-4 text-center overflow-y-auto">
-          <div className="text-4xl" aria-hidden="true">⚠️</div>
-          <h2 id="delete-modal-title" className="text-base sm:text-lg font-black text-gray-900">{isVan ? 'Remove Van?' : 'Delete Account?'}</h2>
-          <p className="text-sm text-gray-500">You are about to {isVan ? 'permanently remove' : 'permanently delete'}:</p>
-          <div className="inline-block py-2 px-4 sm:px-5 bg-gray-50 border border-gray-200 rounded-xl text-left">
-            <p className="font-bold text-gray-900 break-all">{target.label}</p>
-            <div className="mt-1">{isVan ? <span className="text-xs text-gray-500">{target.sublabel}</span> : <RoleBadge role={target.role} />}</div>
-          </div>
-          {isAdminRole && <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-700 text-left"><strong>Admin account detected.</strong> Ensure at least one other admin remains in the system before proceeding.</div>}
-          <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-800 text-left">This action is <strong>permanent and cannot be undone.</strong> {isVan ? 'This van will no longer be assignable to trips.' : 'All data associated with this account will be removed.'}</div>
-          {serverError && <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700 text-left">⚠️ {serverError}</div>}
-        </div>
-        <div className="flex flex-col-reverse sm:flex-row gap-2 sm:gap-3 p-4 sm:p-5 border-t bg-gray-50 rounded-b-2xl">
-          <button onClick={onClose} disabled={isLoading} className="flex-1 py-2.5 sm:py-2 border border-gray-300 rounded-lg text-sm font-semibold text-gray-700 hover:bg-gray-100 transition disabled:opacity-40">Cancel</button>
-          <button onClick={onConfirm} disabled={isLoading} className="flex-1 py-2.5 sm:py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-sm font-black transition disabled:opacity-70 disabled:cursor-not-allowed">
-            {isLoading ? 'Deleting…' : `🗑 Yes, ${isVan ? 'Remove' : 'Delete'}`}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ─── Sub-components ───────────────────────────────────────────────────────────
-
-function RoleBadge({ role }) {
-  const styles = { ADMIN: 'bg-purple-100 text-purple-800', DISPATCHER: 'bg-blue-100 text-blue-800', DRIVER: 'bg-gray-100 text-gray-700' };
-  return <span className={`px-2 py-0.5 rounded text-xs font-bold ${styles[role] ?? 'bg-gray-100 text-gray-500'}`}>{role ?? 'UNKNOWN'}</span>;
-}
-
-function VanStatusBadge({ status }) {
-  const styles = { IDLE: 'bg-yellow-100 text-yellow-800', DISPATCHED: 'bg-green-100 text-green-800', MAINTENANCE: 'bg-orange-100 text-orange-800', OUT_OF_SERVICE: 'bg-red-100 text-red-800' };
-  return <span className={`px-2 py-1 rounded text-xs font-bold whitespace-nowrap ${styles[status] ?? 'bg-gray-100 text-gray-600'}`}>{(status ?? 'UNKNOWN').replace('_', ' ')}</span>;
-}
-
-function StatCard({ title, value, color, icon }) {
-  return (
-    <div className="bg-white p-3 sm:p-5 rounded-xl shadow-sm border border-gray-200 flex items-center gap-3 sm:gap-4">
-      {icon && (
-        <div className={`text-xl sm:text-2xl w-9 h-9 sm:w-11 sm:h-11 shrink-0 rounded-full bg-gray-50 flex items-center justify-center ${color}`} aria-hidden="true">
-          {icon}
-        </div>
-      )}
-      <div className="min-w-0 flex-1">
-        <div className="text-[10px] sm:text-xs text-gray-500 font-semibold uppercase tracking-wide truncate">{title}</div>
-        <div className={`text-lg sm:text-2xl font-black ${color}`}>{value ?? 0}</div>
-      </div>
-    </div>
-  );
-}
-
-function BreakdownCard({ title, entries }) {
-  const total = entries.reduce((sum, e) => sum + (e.count || 0), 0);
-  return (
-    <div className="bg-white p-3 sm:p-4 rounded-xl shadow-sm border border-gray-200">
-      <h3 className="text-xs font-bold text-gray-500 uppercase tracking-wide mb-3">{title}</h3>
-      <div className="space-y-2.5">
-        {entries.map((e) => {
-          const pct = total === 0 ? 0 : Math.round((e.count / total) * 100);
-          return (
-            <div key={e.label}>
-              <div className="flex justify-between text-xs mb-1">
-                <span className="font-semibold text-gray-600 capitalize">{e.label}</span>
-                <span className="text-gray-400">{e.count}</span>
-              </div>
-              <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden">
-                <div className={`h-full rounded-full ${e.colorClass}`} style={{ width: `${pct}%` }} />
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-function EmptyTableRow({ colSpan, message }) {
-  return <tr><td colSpan={colSpan} className="p-6 text-center text-sm text-gray-400 italic">{message}</td></tr>;
-}
-
-function PasswordInput({ name, value, onChange, placeholder, autoComplete, hasError, maxLength, inputRef, visible, onToggleVisible }) {
-  return (
-    <div className="relative">
-      <input
-        ref={inputRef}
-        name={name}
-        type={visible ? 'text' : 'password'}
-        value={value}
-        onChange={onChange}
-        placeholder={placeholder}
-        autoComplete={autoComplete}
-        maxLength={maxLength}
-        className={`${inputCls(hasError)} pr-11`}
-      />
-      <button
-        type="button"
-        onClick={onToggleVisible}
-        aria-label={visible ? 'Hide PIN' : 'Show PIN'}
-        title={visible ? 'Hide PIN' : 'Show PIN'}
-        className="absolute inset-y-0 right-0 px-3 flex items-center text-gray-400 hover:text-gray-700 transition"
-      >
-        {visible ? '🙈' : '👁'}
-      </button>
-    </div>
-  );
-}
-
-function GeneratePasswordButton({ onGenerate }) {
-  return (
-    <button
-      type="button"
-      onClick={onGenerate}
-      title="Generate a random 4–8 digit PIN that isn't an obvious pattern"
-      className="text-xs font-semibold text-blue-600 hover:text-blue-800 hover:underline transition inline-flex items-center gap-1 whitespace-nowrap"
-    >
-      🎲 Generate Random PIN
-    </button>
-  );
-}
-
-function CopyButton({ text, label = 'Copy', disabled }) {
-  const [copied, setCopied] = useState(false);
-
-  const handleCopy = async () => {
-    if (disabled) return;
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch { /* clipboard not available — fail silently */ }
-  };
-
-  return (
-    <button
-      type="button"
-      onClick={handleCopy}
-      disabled={disabled}
-      title={copied ? 'Copied!' : label}
-      className={`shrink-0 text-xs font-bold px-2 py-1.5 rounded border transition ${
-        copied
-          ? 'border-green-300 text-green-700 bg-green-50'
-          : 'border-blue-300 text-blue-700 bg-blue-50 hover:bg-blue-100'
-      } disabled:opacity-40 disabled:cursor-not-allowed`}
-    >
-      {copied ? '✓ Copied' : label}
-    </button>
-  );
-}
-
-function SearchInput({ value, onChange, placeholder, ariaLabel }) {
-  return (
-    <div className="relative">
-      <span className="absolute inset-y-0 left-0 pl-3 flex items-center text-gray-400 pointer-events-none" aria-hidden="true">🔍</span>
-      <input
-        type="text"
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        placeholder={placeholder}
-        aria-label={ariaLabel}
-        className="w-full pl-9 pr-9 py-2 border border-gray-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400"
-      />
-      {value && (
-        <button
-          type="button"
-          onClick={() => onChange('')}
-          aria-label="Clear search"
-          className="absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 hover:text-gray-700 text-xs"
-        >
-          ✕
-        </button>
-      )}
-    </div>
-  );
-}
-
-// ─── AuditTrailModal ──────────────────────────────────────────────────────────
-
-function AuditTrailModal({
-  isOpen, onClose, logs, totalCount, fullCount, loading, error, search, onSearchChange,
-  actionFilter, onActionFilterChange, actionOptions, dateFrom, onDateFromChange, dateTo, onDateToChange,
-  onClearFilters, lastSync, onRefresh, onLoadMore, onClearHistory, onExportCsv,
-}) {
-  const [expandedId, setExpandedId] = useState(null);
-
-  useEffect(() => {
-    if (!isOpen) return;
-    const fn = (e) => { if (e.key === 'Escape') onClose(); };
-    document.addEventListener('keydown', fn);
-    return () => document.removeEventListener('keydown', fn);
-  }, [isOpen, onClose]);
-
-  useEffect(() => { if (!isOpen) setExpandedId(null); }, [isOpen]);
-
-  if (!isOpen) return null;
-  const hasFilters = Boolean(search || actionFilter || dateFrom || dateTo);
-
-  return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="audit-modal-title"
-      className="fixed inset-0 bg-black/50 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4"
-      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
-    >
-      <div className="bg-white rounded-t-2xl sm:rounded-2xl shadow-2xl w-full max-w-4xl max-h-[95vh] sm:max-h-[90vh] flex flex-col">
-        <div className="flex flex-wrap justify-between items-center gap-3 p-4 sm:p-5 border-b">
-          <div className="min-w-0">
-            <h2 id="audit-modal-title" className="text-base sm:text-lg font-bold text-gray-900">Audit Trail</h2>
-            <p className="text-xs text-gray-400 mt-0.5">
-              {fullCount} {fullCount === 1 ? 'entry' : 'entries'} saved on this device
-              {lastSync && <> · Synced {formatAuditTimestamp(lastSync)}</>}
-            </p>
-          </div>
-          <button onClick={onClose} aria-label="Close audit trail" className="text-gray-400 hover:text-gray-600 text-xl leading-none p-1">✕</button>
-        </div>
-
-        <div className="p-3 sm:p-5 border-b space-y-3">
-          <div className="flex flex-col sm:flex-row sm:flex-wrap sm:items-center gap-2">
-            <input
-              type="text"
-              value={search}
-              onChange={(e) => onSearchChange(e.target.value)}
-              placeholder="Search actor, action, target…"
-              aria-label="Search audit trail"
-              className="px-3 py-2 sm:py-1.5 border border-gray-300 rounded-lg text-sm sm:text-xs flex-1 min-w-0 sm:min-w-[10rem] focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400"
-            />
-            <select
-              value={actionFilter}
-              onChange={(e) => onActionFilterChange(e.target.value)}
-              aria-label="Filter by action"
-              className="px-3 py-2 sm:py-1.5 border border-gray-300 rounded-lg text-sm sm:text-xs bg-white focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400"
-            >
-              <option value="">All actions</option>
-              {actionOptions.map((a) => <option key={a} value={a}>{a}</option>)}
-            </select>
-            <div className="flex items-center gap-2">
-              <input
-                type="date"
-                value={dateFrom}
-                onChange={(e) => onDateFromChange(e.target.value)}
-                title="From date"
-                aria-label="From date"
-                className="flex-1 px-3 py-2 sm:py-1.5 border border-gray-300 rounded-lg text-sm sm:text-xs focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400"
-              />
-              <span className="text-xs text-gray-400">to</span>
-              <input
-                type="date"
-                value={dateTo}
-                onChange={(e) => onDateToChange(e.target.value)}
-                title="To date"
-                aria-label="To date"
-                className="flex-1 px-3 py-2 sm:py-1.5 border border-gray-300 rounded-lg text-sm sm:text-xs focus:outline-none focus:ring-2 focus:ring-blue-400 focus:border-blue-400"
-              />
-            </div>
-            {hasFilters && (
-              <button onClick={onClearFilters} className="text-xs font-semibold px-3 py-2 sm:py-1.5 rounded-lg border border-gray-300 text-gray-500 hover:bg-gray-100 transition">Clear filters</button>
-            )}
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <button onClick={onRefresh} disabled={loading} title="Check for new audit entries now" className="text-xs font-semibold px-3 py-2 sm:py-1.5 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-100 transition disabled:opacity-50 flex-1 sm:flex-initial">
-              {loading ? 'Syncing…' : '🔄 Refresh'}
-            </button>
-            <button onClick={onExportCsv} title="Export filtered entries as CSV" className="text-xs font-semibold px-3 py-2 sm:py-1.5 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-100 transition flex-1 sm:flex-initial">⬇️ Export CSV</button>
-            <button onClick={onClearHistory} title="Clear locally saved history on this device" className="text-xs font-semibold px-3 py-2 sm:py-1.5 rounded-lg border border-red-200 text-red-600 hover:bg-red-50 transition w-full sm:w-auto sm:ml-auto">Clear local history</button>
-          </div>
-          {error && <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-800">⚠️ {error}</div>}
-        </div>
-
-        <div className="overflow-y-auto flex-1">
-          <table className="w-full text-sm text-left min-w-[560px]">
-            <thead className="bg-gray-50 text-gray-500 text-xs uppercase tracking-wide sticky top-0 z-10">
-              <tr>
-                <th className="p-3">Timestamp</th>
-                <th className="p-3">Actor</th>
-                <th className="p-3">Action</th>
-                <th className="p-3">Target</th>
-                <th className="p-3">Details</th>
-              </tr>
-            </thead>
-            <tbody>
-              {logs.length === 0 ? (
-                <EmptyTableRow colSpan={5} message={loading ? 'Loading audit history…' : 'No audit entries match these filters.'} />
-              ) : logs.map((entry) => {
-                const isExpanded = expandedId === entry.id;
-                const hasMeta = entry.metadata && typeof entry.metadata === 'object';
-                return (
-                  <tr
-                    key={entry.id}
-                    onClick={() => hasMeta && setExpandedId(isExpanded ? null : entry.id)}
-                    className={`border-b hover:bg-gray-50 align-top ${hasMeta ? 'cursor-pointer' : ''}`}
-                  >
-                    <td className="p-3 whitespace-nowrap text-gray-500 text-xs">{formatAuditTimestamp(entry.timestamp ?? entry.createdAt)}</td>
-                    <td className="p-3 font-semibold text-gray-800">{entry.actorName ?? entry.actor ?? 'System'}</td>
-                    <td className="p-3"><AuditActionBadge action={entry.action} /></td>
-                    <td className="p-3 text-gray-600">{entry.targetType ?? entry.target ?? '—'}</td>
-                    <td className="p-3 text-gray-500 text-xs max-w-xs">{entry.details ?? entry.description ?? '—'} {hasMeta && <span className="ml-1 text-blue-500">{isExpanded ? '▲' : '▼'}</span>}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-
-        {totalCount > logs.length && (
-          <div className="p-4 border-t text-center">
-            <button onClick={onLoadMore} className="text-xs font-semibold px-4 py-2 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-100 transition">Load more ({totalCount - logs.length} remaining)</button>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function AuditActionBadge({ action }) {
-  const key = (action ?? '').toUpperCase();
-  const styles = { CREATE: 'bg-green-100 text-green-800', UPDATE: 'bg-blue-100 text-blue-800', DELETE: 'bg-red-100 text-red-800', APPROVE: 'bg-green-100 text-green-800', REJECT: 'bg-red-100 text-red-800', DISABLE: 'bg-orange-100 text-orange-800', ENABLE: 'bg-green-100 text-green-800', LOGIN: 'bg-purple-100 text-purple-800', LOGOUT: 'bg-gray-100 text-gray-600' };
-  const matched = Object.keys(styles).find((k) => key.includes(k));
-  return <span className={`px-2 py-0.5 rounded text-xs font-bold whitespace-nowrap ${matched ? styles[matched] : 'bg-gray-100 text-gray-600'}`}>{action ?? 'UNKNOWN'}</span>;
-}
-
-function formatAuditTimestamp(value) {
-  if (!value) return '—';
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) return '—';
-  return d.toLocaleString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-}
-
-function PageState({ title, message, actionLabel, onAction, loading }) {
-  return (
-    <div className="min-h-screen bg-gray-100 flex items-center justify-center p-4 sm:p-6">
-      <div className="max-w-md w-full bg-white rounded-xl shadow-sm border p-6 text-center">
-        {loading && (
-          <div className="mx-auto mb-4 h-10 w-10 rounded-full border-4 border-blue-100 border-t-blue-600 animate-spin" aria-hidden="true" />
-        )}
-        <h1 className="text-lg sm:text-xl font-black text-gray-800">{title}</h1>
-        {message && <p className="mt-3 text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg p-3">{message}</p>}
-        {actionLabel && onAction && <button onClick={onAction} className="mt-4 w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 rounded-lg transition">{actionLabel}</button>}
-      </div>
-    </div>
-  );
-}
-
-function Field({ label, required, error, hint, action, children }) {
-  return (
-    <div>
-      <div className="flex flex-wrap items-baseline justify-between gap-x-2 gap-y-1 mb-1">
-        <label className="block text-sm font-semibold text-gray-700">
-          {label} {required && <span className="text-red-500 ml-0.5" aria-hidden="true">*</span>}
-        </label>
-        {action}
-      </div>
-      {children}
-      {hint && !error && <p className="text-xs text-gray-400 mt-1">{hint}</p>}
-      {error && <p role="alert" className="text-xs text-red-500 mt-1">{error}</p>}
-    </div>
+      <RejectDriverModal target={rejectTarget} reason={rejectReason} onReasonChange={setRejectReason} onClose={closeReject} onConfirm={handleConfirmReject} isLoading={rejectSubmitting} serverError={rejectError} />
+    </div>,
   );
 }
