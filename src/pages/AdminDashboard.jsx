@@ -908,7 +908,7 @@ function StatTile({ icon, label, value, tone }) {
 function OverviewTab({ data, pendingCount, fleetCounts, onGo, onAddStaff }) {
   return (
     <div className="space-y-4">
-      <PageTitle title="Overview" subtitle="Catanduanes terminal at a glance" />
+      <PageTitle title="Overview" subtitle="Provincial Integrated Transport Terminal and Business Complex" />
       <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
         <StatTile icon="van" label="Active trips" value={data.stats.activeTrips} tone="ok" />
         <StatTile icon="van" label="Registered vans" value={data.stats.totalVans} tone="info" />
