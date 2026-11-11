@@ -1023,10 +1023,7 @@ export default function DispatcherDashboard() {
             <p className="truncate text-base font-extrabold leading-tight tracking-tight">Terminalink</p>
             <p className="c-muted text-xs font-semibold leading-tight">Dispatcher</p>
           </div>
-          <Btn variant="primary" onClick={() => setIsScannerOpen(true)} className="hidden lg:inline-flex">
-            <Icon name="scan" /> Scan QR
-            {awaitingScanCount > 0 && <span className="num rounded-full px-2 text-xs" style={{ background: 'var(--on-primary)', color: 'var(--primary)' }}>{awaitingScanCount}</span>}
-          </Btn>
+          
           <Btn variant="ghost" size="icon" onClick={toggleTheme} aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}>
             <Icon name={theme === 'dark' ? 'sun' : 'moon'} />
           </Btn>
