@@ -16,6 +16,23 @@ import { VIRAC_HUB, getCoordinatesForDestination } from '../components/townCoord
 //   Desktop: sidebar + map side by side, van details docked at the right.
 // For notched phones, index.html should use:
 //   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+//
+// Terminal flow (matches trip.controller.js):
+//   1. CHECK-IN  — scan an OUTBOUND + DEPARTED (or legacy ARRIVING) van.
+//                  The van is now at the terminal and WAITING (status QUEUED,
+//                  queueCooperativeId = null). It does not join any queue yet.
+//   2. ASSIGN    — the dispatcher chooses which cooperative's queue the van
+//                  joins (PATCH /trips/:id/queue). Straight to BOARDING if that
+//                  queue's boarding slot is free, otherwise QUEUED behind the
+//                  vans already in it. One queue per cooperative; queues never
+//                  block each other.
+//   3. EXIT      — scan a RETURN + DEPARTING van → DEPARTED (van leaves).
+//
+// Everything else is driven by the driver's own buttons. The driver can NOT
+// move a RETURN trip to DEPARTED themselves (that is the exit scan), and
+// cannot COMPLETE an OUTBOUND trip (that is the check-in scan).
+//
+// GET /trips/terminal returns { lanes, pending, cooperatives }.
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -29,6 +46,9 @@ const MOVING_HEADING_KMH  = 4;
 const HOME_TERMINAL_NAME  = 'Provincial Integrated Transport Terminal and Business Complex';
 const HOME_TERMINAL_SHORT = 'Terminal';
 
+// Adjust if your router mounts createCooperative on a different path.
+const COOPERATIVES_ENDPOINT = '/trips/cooperatives';
+
 // Shared with the admin page so the theme choice carries across pages.
 const THEME_KEY = 'terminalink_admin_theme';
 
@@ -40,6 +60,7 @@ const STATUS_META = {
   QUEUED:    { label: 'In queue',  tone: 'violet', hex: '#7c3aed' },
   DELAYED:   { label: 'Delayed',   tone: 'warn',   hex: '#ea580c' },
 };
+const PENDING_META = { label: 'Needs queue', tone: 'warn', hex: '#d97706' };
 const statusMeta = (s) => STATUS_META[s] ?? STATUS_META.DEPARTED;
 const STATUS_PRIORITY = ['DEPARTED', 'ARRIVING', 'DEPARTING', 'DELAYED', 'BOARDING', 'QUEUED'];
 
@@ -98,10 +119,13 @@ const THEME_CSS = `
 @media (hover:hover){
   .b-default:hover:not(:disabled),.b-ghost:hover:not(:disabled){background:var(--surface-2)}
   .b-primary:hover:not(:disabled){filter:brightness(.92)}
-  .ui-row:hover{background:var(--surface-2)}
+  .ui-row:hover:not(:disabled){background:var(--surface-2)}
 }
 .ui-row{transition:background .12s}
-.ui-row:active{background:var(--surface-2)}
+.ui-row:active:not(:disabled){background:var(--surface-2)}
+.ui-row:disabled{opacity:.55;cursor:not-allowed}
+.ui-input{background:var(--surface);color:var(--text);border:1.5px solid var(--line);outline:none}
+.ui-input:focus{border-color:var(--primary)}
 
 .ui-header{background:var(--surface);border-bottom:1px solid var(--line);padding-top:env(safe-area-inset-top)}
 .ui-nav{background:var(--surface);border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom);box-shadow:0 -4px 14px rgba(16,24,40,.06)}
@@ -153,6 +177,8 @@ const ICONS = {
   phone:    'M5 4h4l2 5-2.5 1.5a11 11 0 005 5L15 13l5 2v4a2 2 0 01-2 2A16 16 0 013 6a2 2 0 012-2z',
   locate:   'M12 2v3M12 19v3M2 12h3M19 12h3M12 17a5 5 0 100-10 5 5 0 000 10z',
   signal:   'M5 19v-3M10 19v-7M15 19V9M20 19V5',
+  plus:     'M12 5v14M5 12h14',
+  swap:     'M7 4L3 8l4 4M3 8h14M17 20l4-4-4-4M21 16H7',
 };
 
 function Icon({ name, className = 'h-5 w-5' }) {
@@ -167,12 +193,12 @@ function Icon({ name, className = 'h-5 w-5' }) {
 // ─── Map icons: every marker is a van ─────────────────────────────────────────
 
 const markerCache = new Map();
-function getVanMarkerIcon(status, heading, selected) {
+function getVanMarkerIcon(status, heading, selected, pending = false) {
   const bucket = typeof heading === 'number' ? (Math.round(heading / 30) * 30) % 360 : null;
-  const key = `${status}|${bucket ?? 'n'}|${selected}`;
+  const key = `${status}|${bucket ?? 'n'}|${selected}|${pending}`;
   if (markerCache.has(key)) return markerCache.get(key);
 
-  const { hex } = statusMeta(status);
+  const { hex } = pending ? PENDING_META : statusMeta(status);
   const size = selected ? 44 : 36;
   const glyph = selected ? 24 : 20;
   const pointer = bucket === null ? '' : `
@@ -229,7 +255,6 @@ function relativeTime(ts) {
 }
 
 const originPlace = (trip) => trip.route?.origin ?? trip.route?.name?.split('→')[0]?.trim() ?? 'origin';
-const cooperativeName = (trip) => trip.van?.cooperative?.name ?? 'Unassigned';
 const legDestination = (trip) => (getDirection(trip) === 'RETURN' ? shortPlace(originPlace(trip)) : HOME_TERMINAL_SHORT);
 const tripRouteLabel = (trip) => {
   const o = shortPlace(originPlace(trip));
@@ -243,6 +268,35 @@ const isIncoming = (trip) =>
 // A return-leg van that tapped "Ready to depart" needs the exit scan.
 const isReadyToExit = (trip) => getDirection(trip) === 'RETURN' && trip.status === 'DEPARTING';
 const isAwaitingScan = (trip) => isIncoming(trip) || isReadyToExit(trip);
+// Scanned in at the terminal but not yet put into a cooperative's queue.
+const isPendingQueue = (trip) =>
+  getDirection(trip) === 'RETURN' && trip.status === 'QUEUED' && !trip.queueCooperativeId;
+// Waiting in a cooperative's line (can still be moved to another queue).
+const isInQueue = (trip) =>
+  getDirection(trip) === 'RETURN' && trip.status === 'QUEUED' && Boolean(trip.queueCooperativeId);
+
+const cooperativeName = (trip) =>
+  isPendingQueue(trip) ? 'No queue yet' : (trip.queueCooperative?.name ?? trip.van?.cooperative?.name ?? 'Unassigned');
+
+const metaFor = (trip) => (isPendingQueue(trip) ? PENDING_META : statusMeta(trip.status));
+
+// Builds the target the assign sheet works on, from a live trip.
+const assignTargetFromTrip = (trip) => ({
+  tripId: trip.id,
+  plate: trip.van?.plateNumber ?? 'Van',
+  driverName: trip.driver?.name ?? null,
+  homeCooperativeId: trip.van?.cooperativeId ?? null,
+  currentCooperativeId: trip.queueCooperativeId ?? null,
+});
+
+// Builds the target from a /trips/terminal entry.
+const assignTargetFromEntry = (entry) => ({
+  tripId: entry.trip?.id,
+  plate: entry.plateNumber ?? 'Van',
+  driverName: entry.driver?.name ?? null,
+  homeCooperativeId: entry.homeCooperativeId ?? null,
+  currentCooperativeId: null,
+});
 
 function seatsOf(trip) {
   const total = trip.seatInfo?.totalSeats ?? trip.totalSeats ?? trip.van?.capacity ?? null;
@@ -292,10 +346,13 @@ function resolvePosition(trip, fix) {
 function locationHint(trip, pos, fix) {
   if (pos.isLive) return formatSpeed(fix?.speed);
   if (trip.status === 'BOARDING') return getDirection(trip) === 'RETURN' ? 'Boarding at the terminal' : `Boarding at ${shortPlace(originPlace(trip))}`;
+  if (isPendingQueue(trip)) return 'At the terminal, waiting for a queue';
   if (trip.status === 'QUEUED') return 'Waiting in line at the terminal';
   if (isReadyToExit(trip)) return 'At the terminal, waiting for exit scan';
   return 'Waiting for GPS…';
 }
+
+const apiErrorMessage = (err, fallback) => err?.response?.data?.error ?? fallback;
 
 function useTheme() {
   const [theme, setTheme] = useState(() => {
@@ -395,8 +452,8 @@ function ListRow({ leading, title, subtitle, trailing, onClick, ariaLabel }) {
   );
 }
 
-function StatusChip({ status }) {
-  const m = statusMeta(status);
+function StatusChip({ status, pending = false }) {
+  const m = pending ? PENDING_META : statusMeta(status);
   return <Chip tone={m.tone}>{m.label}</Chip>;
 }
 
@@ -481,21 +538,34 @@ function Sheet({ open, onClose, title, subtitle, footer, dock = false, children 
 
 // ─── Trip sheet ───────────────────────────────────────────────────────────────
 
-function TripSheet({ trip, fix, eta, siblings, onClose, onShowOnMap, onOpenOther, onScan }) {
+function TripSheet({ trip, fix, eta, siblings, onClose, onShowOnMap, onOpenOther, onScan, onAssign }) {
   const pos = trip ? resolvePosition(trip, fix) : { position: null, isLive: false };
   const needsScan = Boolean(trip) && isAwaitingScan(trip);
+  const pending = Boolean(trip) && isPendingQueue(trip);
+  const movable = Boolean(trip) && isInQueue(trip);
+  const hasPrimary = needsScan || pending || movable;
 
   return (
     <Sheet open={Boolean(trip)} onClose={onClose} dock
       title={trip?.van?.plateNumber ?? ''} subtitle={trip ? (trip.driver?.name ?? 'No driver assigned') : ''}
       footer={trip && (
-        <div className={`grid gap-3 ${needsScan ? 'grid-cols-2' : 'grid-cols-1'}`}>
+        <div className={`grid gap-3 ${hasPrimary ? 'grid-cols-2' : 'grid-cols-1'}`}>
           {needsScan && (
             <Btn variant="primary" size="lg" onClick={onScan}>
               <Icon name="scan" /> {isReadyToExit(trip) ? 'Scan to release' : 'Scan to check in'}
             </Btn>
           )}
-          <Btn variant={needsScan ? 'default' : 'primary'} size="lg" onClick={() => onShowOnMap(trip)} disabled={!pos.position}>
+          {pending && (
+            <Btn variant="primary" size="lg" onClick={() => onAssign(assignTargetFromTrip(trip))}>
+              <Icon name="building" /> Assign to queue
+            </Btn>
+          )}
+          {movable && (
+            <Btn variant="default" size="lg" onClick={() => onAssign(assignTargetFromTrip(trip))}>
+              <Icon name="swap" /> Change queue
+            </Btn>
+          )}
+          <Btn variant={hasPrimary && !movable ? 'default' : 'primary'} size="lg" onClick={() => onShowOnMap(trip)} disabled={!pos.position}>
             <Icon name="locate" /> Show on map
           </Btn>
         </div>
@@ -503,12 +573,13 @@ function TripSheet({ trip, fix, eta, siblings, onClose, onShowOnMap, onOpenOther
       {trip && (
         <div className="space-y-4">
           <div className="flex flex-wrap items-center gap-2">
-            <StatusChip status={trip.status} />
+            <StatusChip status={trip.status} pending={pending} />
             <Chip tone={getDirection(trip) === 'RETURN' ? 'violet' : 'info'}>{getDirection(trip) === 'RETURN' ? 'Return leg' : 'Outbound'}</Chip>
             <Chip>{cooperativeName(trip)}</Chip>
           </div>
 
           {isIncoming(trip) && <Notice tone="info">On its way to the terminal. Scan its QR code when it arrives to check it in.</Notice>}
+          {pending && <Notice tone="warn">Checked in at the terminal. Choose which cooperative's queue it joins.</Notice>}
           {isReadyToExit(trip) && <Notice tone="warn">Ready to leave the terminal. Scan its QR code to release it.</Notice>}
 
           <div className="grid grid-cols-2 gap-3">
@@ -535,6 +606,7 @@ function TripSheet({ trip, fix, eta, siblings, onClose, onShowOnMap, onOpenOther
           <dl>
             <DetailRow label="Route">{tripRouteLabel(trip)}</DetailRow>
             <DetailRow label="Heading to">{legDestination(trip)}</DetailRow>
+            {getDirection(trip) === 'RETURN' && <DetailRow label="Queue">{cooperativeName(trip)}</DetailRow>}
             <DetailRow label="GPS">
               {pos.isLive
                 ? <span className="c-ok">Live · {relativeTime(fix?.lastSeen)}</span>
@@ -552,12 +624,106 @@ function TripSheet({ trip, fix, eta, siblings, onClose, onShowOnMap, onOpenOther
                   <li key={s.id}>
                     <button type="button" onClick={() => onOpenOther(s.id)} className="ui-row flex min-h-[52px] w-full items-center justify-between gap-3 px-4 py-2 text-left">
                       <span className="truncate text-sm font-bold">{tripRouteLabel(s)}</span>
-                      <StatusChip status={s.status} />
+                      <StatusChip status={s.status} pending={isPendingQueue(s)} />
                     </button>
                   </li>
                 ))}
               </ul>
             </div>
+          )}
+        </div>
+      )}
+    </Sheet>
+  );
+}
+
+// ─── Assign-to-queue sheet ────────────────────────────────────────────────────
+// The dispatcher picks which cooperative's queue a scanned-in van joins. Each
+// option says what will happen: board right away if that queue's slot is free,
+// otherwise the position the van would take in line.
+
+function AssignSheet({ target, cooperatives, lanes, busyId, error, onClose, onPick, onCreate, creating, createError }) {
+  const [adding, setAdding] = useState(false);
+  const [name, setName] = useState('');
+
+  useEffect(() => { if (!target) { setAdding(false); setName(''); } }, [target]);
+
+  const options = useMemo(() => cooperatives.map((c) => {
+    const lane = lanes.find((l) => l.cooperativeId === c.id);
+    const boarding = lane?.boarding?.length ?? 0;
+    const waiting = lane?.queued?.length ?? 0;
+    return { ...c, boarding, waiting };
+  }), [cooperatives, lanes]);
+
+  const busy = Boolean(busyId);
+  const moving = Boolean(target?.currentCooperativeId);
+
+  const submitNew = async (e) => {
+    e.preventDefault();
+    const trimmed = name.trim();
+    if (!trimmed || creating) return;
+    const ok = await onCreate(trimmed);
+    if (ok) { setName(''); setAdding(false); }
+  };
+
+  return (
+    <Sheet open={Boolean(target)} onClose={() => { if (!busy) onClose(); }}
+      title={moving ? 'Change queue' : 'Assign to queue'}
+      subtitle={target ? `${target.plate}${target.driverName ? ` · ${target.driverName}` : ''}` : ''}>
+      {target && (
+        <div className="space-y-3">
+          {error && <Notice>{error}</Notice>}
+
+          {options.length === 0 ? (
+            <EmptyState icon="building" title="No queues yet">Add a cooperative queue below to start assigning vans.</EmptyState>
+          ) : (
+            <ul className="ui-soft ui-divide overflow-hidden rounded-2xl">
+              {options.map((o) => {
+                const isCurrent = o.id === target.currentCooperativeId;
+                const isHome = o.id === target.homeCooperativeId;
+                const free = o.boarding === 0;
+                const detail = free
+                  ? 'Boarding slot free · boards now'
+                  : `${o.boarding} boarding · ${o.waiting} waiting · would be #${o.waiting + 1}`;
+                return (
+                  <li key={o.id}>
+                    <button type="button" disabled={busy || isCurrent} onClick={() => onPick(o.id)}
+                      className="ui-row flex min-h-[64px] w-full items-center gap-3 px-4 py-3 text-left">
+                      <span className={`${free ? 'chip-ok' : 'chip-violet'} flex h-10 w-10 shrink-0 items-center justify-center rounded-full`}>
+                        {busyId === o.id ? <Spinner /> : <Icon name={free ? 'van' : 'building'} className="h-5 w-5" />}
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="flex items-center gap-2">
+                          <span className="truncate font-bold">{o.name}</span>
+                          {isHome && <Chip tone="primary">Usual</Chip>}
+                          {isCurrent && <Chip tone="violet">Current</Chip>}
+                        </span>
+                        <span className="c-muted block truncate text-sm font-medium">{isCurrent ? 'Already waiting in this queue' : detail}</span>
+                      </span>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+
+          {adding ? (
+            <form onSubmit={submitNew} className="space-y-2">
+              <input value={name} onChange={(e) => setName(e.target.value)} maxLength={60} autoFocus
+                placeholder="Cooperative / queue name" aria-label="New queue name"
+                className="ui-input h-11 w-full rounded-xl px-3 text-sm font-semibold" />
+              {createError && <Notice>{createError}</Notice>}
+              <div className="grid grid-cols-2 gap-2">
+                <Btn variant="default" onClick={() => { setAdding(false); setName(''); }} disabled={creating}>Cancel</Btn>
+                <Btn type="submit" variant="primary" disabled={creating || name.trim().length < 2}>
+                  {creating ? <Spinner /> : <Icon name="check" className="h-4 w-4" />} Add queue
+                </Btn>
+              </div>
+            </form>
+          ) : (
+            <Btn variant="ghost" className="w-full" onClick={() => setAdding(true)} disabled={busy}>
+              <Icon name="plus" className="h-4 w-4" /> Add a new queue
+            </Btn>
           )}
         </div>
       )}
@@ -583,7 +749,7 @@ function MapInvalidator({ active }) {
 
 function MetricTile({ label, value, tone }) {
   return (
-    <div className="ui-card min-w-0 rounded-2xl px-2 py-3 text-center">
+    <div className="ui-card min-w-0 rounded-2xl px-1.5 py-3 text-center">
       <p className={`num text-2xl leading-none ${tone ? `c-${tone}` : ''}`}>{value}</p>
       <p className="c-muted mt-1.5 truncate text-[11px] font-bold">{label}</p>
     </div>
@@ -637,12 +803,32 @@ function CooperativeLane({ group, onOpen }) {
   );
 }
 
+// A van that was scanned in and is waiting for the dispatcher to pick its queue.
+function PendingEntry({ entry, onAssign }) {
+  const t = entry.trip ?? {};
+  const seatsTrip = { availableSeats: t.availableSeats, totalSeats: t.totalSeats, van: { capacity: entry.capacity } };
+  return (
+    <ListRow onClick={() => t.id && onAssign(assignTargetFromEntry(entry))} ariaLabel={`Assign ${entry.plateNumber} to a queue`}
+      leading={<Avatar tone="warn"><Icon name="van" /></Avatar>}
+      title={entry.plateNumber}
+      subtitle={`${entry.driver?.name ?? 'No driver on file'}${t.origin ? ` · to ${shortPlace(t.origin)}` : ''}${entry.checkedInAt ? ` · in ${fmtTime(entry.checkedInAt)}` : ''}`}
+      trailing={
+        <span className="flex flex-col items-end gap-1.5">
+          <Seats trip={seatsTrip} />
+          <Chip tone="warn">Assign queue</Chip>
+        </span>
+      } />
+  );
+}
+
 function TripRow({ trip, fix, eta, onOpen }) {
   const pos = resolvePosition(trip, fix);
   const awaiting = isAwaitingScan(trip);
+  const pending = isPendingQueue(trip);
+  const meta = metaFor(trip);
   return (
     <ListRow onClick={() => onOpen(trip.id)} ariaLabel={`Open ${trip.van?.plateNumber ?? 'van'}`}
-      leading={<Avatar tone={statusMeta(trip.status).tone}><Icon name="van" /></Avatar>}
+      leading={<Avatar tone={meta.tone}><Icon name="van" /></Avatar>}
       title={trip.van?.plateNumber ?? 'Unknown plate'}
       subtitle={`${trip.driver?.name ?? 'No driver'} · ${tripRouteLabel(trip)}`}
       trailing={
@@ -651,7 +837,11 @@ function TripRow({ trip, fix, eta, onOpen }) {
             {eta && isIncoming(trip) && <span className="num text-sm">{fmtTime(eta.eta)}</span>}
             <Seats trip={trip} />
           </span>
-          {awaiting ? <Chip tone="primary">Needs scan</Chip> : <Chip tone={statusMeta(trip.status).tone}>{pos.isLive ? formatSpeed(fix?.speed) : statusMeta(trip.status).label}</Chip>}
+          {awaiting
+            ? <Chip tone="primary">Needs scan</Chip>
+            : pending
+              ? <Chip tone="warn">Needs queue</Chip>
+              : <Chip tone={meta.tone}>{pos.isLive ? formatSpeed(fix?.speed) : meta.label}</Chip>}
         </span>
       } />
   );
@@ -702,9 +892,19 @@ export default function DispatcherDashboard() {
   const [reloadToken, setReloadToken]     = useState(0);
   const [, setTick]                       = useState(0);
 
-  const [terminalGroups, setTerminalGroups]   = useState([]);
-  const [terminalLoading, setTerminalLoading] = useState(true);
-  const [terminalError, setTerminalError]     = useState('');
+  // Terminal data: { lanes, pending, cooperatives } from GET /trips/terminal.
+  const [terminalLanes, setTerminalLanes]         = useState([]);
+  const [terminalPending, setTerminalPending]     = useState([]);
+  const [cooperatives, setCooperatives]           = useState([]);
+  const [terminalLoading, setTerminalLoading]     = useState(true);
+  const [terminalError, setTerminalError]         = useState('');
+
+  // Assign-to-queue sheet.
+  const [assignTarget, setAssignTarget]   = useState(null);
+  const [assignBusyId, setAssignBusyId]   = useState(null);
+  const [assignError, setAssignError]     = useState('');
+  const [creatingQueue, setCreatingQueue] = useState(false);
+  const [createQueueError, setCreateQueueError] = useState('');
 
   const [isScannerOpen, setIsScannerOpen] = useState(false);
   const [successMessage, setSuccessMessage] = useState('');
@@ -751,7 +951,17 @@ export default function DispatcherDashboard() {
   const fetchTerminalVans = useCallback(async (signal) => {
     try {
       const response = await apiClient.get('/trips/terminal', { signal });
-      setTerminalGroups(Array.isArray(response.data) ? response.data : []);
+      const data = response.data;
+      if (Array.isArray(data)) {
+        // Legacy shape: a plain array of lanes.
+        setTerminalLanes(data);
+        setTerminalPending([]);
+        setCooperatives(data.filter((g) => g.cooperativeId).map((g) => ({ id: g.cooperativeId, name: g.cooperativeName })));
+      } else {
+        setTerminalLanes(Array.isArray(data?.lanes) ? data.lanes : []);
+        setTerminalPending(Array.isArray(data?.pending) ? data.pending : []);
+        setCooperatives(Array.isArray(data?.cooperatives) ? data.cooperatives : []);
+      }
       setTerminalError('');
     } catch (err) {
       if (err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') return;
@@ -826,8 +1036,11 @@ export default function DispatcherDashboard() {
       if (finished) {
         dropTripState(tripId);
         setSheetTripId((cur) => (cur === tripId ? null : cur));
+        // If this van was open in the assign sheet, it can no longer be assigned.
+        setAssignTarget((cur) => (cur?.tripId === tripId ? null : cur));
       }
-      // Check-in scans, exit scans, departures from the boarding slot and queue promotions all change the line-up.
+      // Check-in scans, queue assignments, exit scans, departures from the boarding slot
+      // and queue promotions all change the line-up.
       scheduleTerminalRefresh();
     };
 
@@ -871,15 +1084,71 @@ export default function DispatcherDashboard() {
     successTimerRef.current = setTimeout(() => setSuccessMessage(''), SUCCESS_TOAST_TTL);
   }, []);
 
+  const openAssign = useCallback((target) => {
+    if (!target?.tripId) return;
+    setSheetTripId(null);
+    setSelectedTripId(null);
+    setAssignError('');
+    setCreateQueueError('');
+    setAssignTarget(target);
+  }, []);
+
+  const closeAssign = useCallback(() => {
+    setAssignTarget(null);
+    setAssignError('');
+    setCreateQueueError('');
+  }, []);
+
+  // PATCH /trips/:id/queue { cooperativeId } — boards immediately if the slot is free, otherwise queues.
+  const handleAssign = useCallback(async (cooperativeId) => {
+    if (!assignTarget?.tripId || assignBusyId) return;
+    setAssignBusyId(cooperativeId);
+    setAssignError('');
+    try {
+      const res = await apiClient.patch(`/trips/${assignTarget.tripId}/queue`, { cooperativeId });
+      showSuccess(res?.data?.message ?? `${assignTarget.plate} assigned.`);
+      setAssignTarget(null);
+      fetchActiveTrips();
+      fetchTerminalVans();
+    } catch (err) {
+      setAssignError(apiErrorMessage(err, 'Could not assign the van to that queue. Please try again.'));
+      // The line-up may have changed under us (e.g. van already boarding), so refresh it.
+      fetchTerminalVans();
+    } finally {
+      setAssignBusyId(null);
+    }
+  }, [assignTarget, assignBusyId, fetchActiveTrips, fetchTerminalVans, showSuccess]);
+
+  // POST a new cooperative queue. Returns true on success so the sheet can close its form.
+  const handleCreateQueue = useCallback(async (name) => {
+    setCreatingQueue(true);
+    setCreateQueueError('');
+    try {
+      await apiClient.post(COOPERATIVES_ENDPOINT, { name });
+      await fetchTerminalVans();
+      return true;
+    } catch (err) {
+      setCreateQueueError(apiErrorMessage(err, 'Could not add the queue.'));
+      return false;
+    } finally {
+      setCreatingQueue(false);
+    }
+  }, [fetchTerminalVans]);
+
   // After a scan the line-up has changed, so on a phone jump to the Terminal tab to show the result.
+  // A check-in scan returns { needsQueue: true, trip }: open the queue picker straight away.
   const handleScanSuccess = useCallback((result) => {
-    showSuccess(typeof result === 'string' ? result : 'QR scan successful.');
+    const message = typeof result === 'string' ? result : result?.message;
+    showSuccess(message || 'QR scan successful.');
     setSheetTripId(null);
     setSelectedTripId(null);
     fetchActiveTrips();
     fetchTerminalVans();
     if (!isDesktopViewport()) setActiveTab('terminal');
-  }, [fetchActiveTrips, fetchTerminalVans, showSuccess]);
+    if (result && typeof result === 'object' && result.needsQueue && result.trip?.id) {
+      openAssign(assignTargetFromTrip(result.trip));
+    }
+  }, [fetchActiveTrips, fetchTerminalVans, showSuccess, openAssign]);
 
   const openTrip = useCallback((tripId) => { setSheetTripId(tripId); setSelectedTripId(tripId); }, []);
   const closeSheet = useCallback(() => { setSheetTripId(null); setSelectedTripId(null); }, []);
@@ -903,19 +1172,24 @@ export default function DispatcherDashboard() {
   }, [navigate]);
 
   // ── Derived data ──
-  // Only cooperatives that actually have a scanned van in line (including vans waiting for their exit scan).
-  const lanes = useMemo(() => terminalGroups
-    .map((g) => ({
-      ...g,
-      departing: Array.isArray(g.departing) ? g.departing : [],
-      boarding: Array.isArray(g.boarding) ? g.boarding : [],
-      queued: Array.isArray(g.queued) ? g.queued : [],
-    }))
-    .filter((g) => g.departing.length + g.boarding.length + g.queued.length > 0), [terminalGroups]);
+  // Normalised lanes, including empty ones (the assign sheet needs them to describe each queue).
+  const allLanes = useMemo(() => terminalLanes.map((g) => ({
+    ...g,
+    departing: Array.isArray(g.departing) ? g.departing : [],
+    boarding: Array.isArray(g.boarding) ? g.boarding : [],
+    queued: Array.isArray(g.queued) ? g.queued : [],
+  })), [terminalLanes]);
+
+  // Only cooperatives that actually have a van in line (including vans waiting for their exit scan).
+  const lanes = useMemo(
+    () => allLanes.filter((g) => g.departing.length + g.boarding.length + g.queued.length > 0),
+    [allLanes],
+  );
 
   const boardingCount = lanes.reduce((n, g) => n + g.boarding.length, 0);
   const queuedCount   = lanes.reduce((n, g) => n + g.queued.length, 0);
   const lineUpCount   = lanes.reduce((n, g) => n + g.departing.length + g.boarding.length + g.queued.length, 0);
+  const pendingCount  = terminalPending.length;
 
   const incomingTrips = useMemo(() => activeTrips.filter(isIncoming).sort((a, b) => {
     const ea = liveEtas[a.id]?.eta ? new Date(liveEtas[a.id].eta).getTime() : Infinity;
@@ -1006,12 +1280,23 @@ export default function DispatcherDashboard() {
         </Card>
       </div>
 
+      {pendingCount > 0 && (
+        <div>
+          <SectionHeader title="Waiting for a queue" count={pendingCount} hint="Scanned in. Choose which cooperative's queue each van joins." />
+          <Card className="overflow-hidden">
+            <ul className="ui-divide">
+              {terminalPending.map((e) => <PendingEntry key={e.vanId} entry={e} onAssign={openAssign} />)}
+            </ul>
+          </Card>
+        </div>
+      )}
+
       <div>
-        <SectionHeader title="Terminal line-up" count={lineUpCount} hint="One lane per cooperative, in scan order." />
+        <SectionHeader title="Terminal line-up" count={lineUpCount} hint="One lane per cooperative, in the order vans were assigned." />
         {terminalLoading ? (
           <Card><p className="c-muted flex items-center justify-center gap-2 py-10 text-sm font-semibold"><Spinner /> Loading line-up…</p></Card>
         ) : lanes.length === 0 ? (
-          <Card><EmptyState icon="scan" title="No scanned vans yet">A van joins its cooperative's line when you scan its QR at the terminal, and leaves it when you scan it again.</EmptyState></Card>
+          <Card><EmptyState icon="scan" title="No vans in line">Scan a van's QR to check it in, then assign it to a cooperative's queue. Scan it again when it is ready to leave.</EmptyState></Card>
         ) : (
           <div className="space-y-3">
             {lanes.map((g) => <CooperativeLane key={g.cooperativeId ?? 'unassigned'} group={g} onOpen={openTrip} />)}
@@ -1069,9 +1354,10 @@ export default function DispatcherDashboard() {
         <aside className={`${activeTab === 'map' ? 'hidden' : 'flex'} ui-line min-w-0 flex-1 flex-col overflow-hidden lg:w-[26rem] lg:flex-none lg:border-r xl:w-[28rem]`}>
           <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain pb-44 lg:pb-6">
             <div className="ui-pad space-y-4 pt-4 lg:pr-4">
-              <div className="grid grid-cols-4 gap-2">
+              <div className="grid grid-cols-5 gap-1.5">
                 <MetricTile label="Active" value={activeTrips.length} />
                 <MetricTile label="Incoming" value={incomingTrips.length} tone="info" />
+                <MetricTile label="Waiting" value={pendingCount} tone="warn" />
                 <MetricTile label="Boarding" value={boardingCount} tone="ok" />
                 <MetricTile label="In line" value={queuedCount} tone="violet" />
               </div>
@@ -1097,8 +1383,9 @@ export default function DispatcherDashboard() {
               const moving = (mpsToKph(fix?.speed)) >= MOVING_HEADING_KMH;
               const heading = group.isLive && moving ? fix?.heading : null;
               const selected = group.trips.some((t) => t.id === selectedTripId);
+              const pending = !group.isLive && isPendingQueue(trip);
               return (
-                <Marker key={group.key} position={group.position} icon={getVanMarkerIcon(trip.status, heading, selected)}
+                <Marker key={group.key} position={group.position} icon={getVanMarkerIcon(trip.status, heading, selected, pending)}
                   zIndexOffset={selected ? 1000 : 0} eventHandlers={{ click: () => openTrip(trip.id) }} />
               );
             })}
@@ -1130,10 +1417,15 @@ export default function DispatcherDashboard() {
         {awaitingScanCount > 0 && <span className="num rounded-full px-2 text-sm" style={{ background: 'var(--on-primary)', color: 'var(--primary)' }}>{awaitingScanCount}</span>}
       </button>
 
-      <BottomNav tab={activeTab} onChange={setActiveTab} counts={{ terminal: lineUpCount, fleet: activeTrips.length, map: 0 }} />
+      <BottomNav tab={activeTab} onChange={setActiveTab}
+        counts={{ terminal: lineUpCount + pendingCount, fleet: activeTrips.length, map: 0 }} />
 
       <TripSheet trip={sheetTrip} fix={sheetTrip ? liveLocations[sheetTrip.id] : null} eta={sheetTrip ? liveEtas[sheetTrip.id] : null}
-        siblings={siblings} onClose={closeSheet} onShowOnMap={focusOnMap} onOpenOther={openTrip} onScan={openScanner} />
+        siblings={siblings} onClose={closeSheet} onShowOnMap={focusOnMap} onOpenOther={openTrip} onScan={openScanner} onAssign={openAssign} />
+
+      <AssignSheet target={assignTarget} cooperatives={cooperatives} lanes={allLanes}
+        busyId={assignBusyId} error={assignError} onClose={closeAssign} onPick={handleAssign}
+        onCreate={handleCreateQueue} creating={creatingQueue} createError={createQueueError} />
 
       <QRScannerModal isOpen={isScannerOpen} onClose={() => setIsScannerOpen(false)} onSuccess={handleScanSuccess} />
     </div>,
