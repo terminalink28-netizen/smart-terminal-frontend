@@ -1,23 +1,32 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { MapContainer, TileLayer, Marker, Popup, Circle, Polyline, useMap } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, ZoomControl, Circle, Polyline, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import apiClient from '../api/axios';
 import { socket } from '../api/socket';
 import { VIRAC_HUB, getCoordinatesForDestination } from '../components/townCoordinates';
 
-// ─── Trip model (what the public sees) ───────────────────────────────────────
+// ─── What commuters see ──────────────────────────────────────────────────────
 //
 // A trip is a round trip of two legs, tracked by `direction`:
 //   OUTBOUND  municipality → terminal
 //   RETURN    terminal → municipality (after the dispatcher's check-in scan)
 //
-// There is no "approaching" step any more: a departed OUTBOUND van is simply
-// "on the road to the terminal". ARRIVING is legacy and is shown as on the road.
-// QUEUED only exists on the RETURN leg, and the queue is per cooperative.
-// One driver can run several trips at once, so a van can appear in more than
-// one row. The map shows one marker per van and lists its trips in the popup.
+// Terminal flow:
+//   1. A van reaches the terminal and the dispatcher scans it in. It is now
+//      WAITING at the terminal (QUEUED, no queue yet): shown as "Just arrived".
+//   2. The dispatcher puts it in a cooperative's queue. It boards right away if
+//      that queue's boarding slot is free, otherwise it waits in line (QUEUED
+//      with a queue, shown with its position in that queue).
+//   3. It leaves the terminal and is on the road to its municipality.
+//
+// One driver can run several trips at once, so a van can appear in more than one
+// row. The map shows one marker per van and lists its trips in the details sheet.
+//
+// Design system is shared with the dispatcher page (same tokens, Plus Jakarta
+// Sans, bottom sheet, bottom navigation). Van colours show which town the van
+// is from (Gigmoto blue, Viga red, …) so commuters can spot their van at a glance.
 
 const MAP_CENTER = [13.5820477, 124.2192987];
 const REFETCH_INTERVAL_MS    = 30_000;
@@ -26,6 +35,9 @@ const OSRM_BASE_URL          = 'https://router.project-osrm.org/route/v1/driving
 
 const HOME_TERMINAL_NAME  = 'Provincial Integrated Transport Terminal and Business Complex';
 const HOME_TERMINAL_SHORT = 'Terminal';
+
+// Shared with the admin and dispatcher pages so the theme choice carries across.
+const THEME_KEY = 'terminalink_admin_theme';
 
 const BOARDING_STATUSES    = ['BOARDING'];
 const QUEUED_STATUSES      = ['QUEUED'];
@@ -42,98 +54,211 @@ const ROUTE_RECALC_DISTANCE_M  = 250;
 
 const EMPTY_ROUTE = { tripId: null, coords: [], loading: false, error: '', distanceMeters: null, durationSeconds: null };
 
-// ─── Design primitives (same as DriverDashboard — move to components/ui.jsx) ──
+const TABS = [
+  { id: 'vans', label: 'Vans', icon: 'list' },
+  { id: 'map',  label: 'Map',  icon: 'map' },
+];
+
+// ─── Van colour = the town the van is from ───────────────────────────────────
+
+const TOWN_COLORS = {
+  gigmoto:    '#2563eb', // blue
+  viga:       '#dc2626', // red
+  virac:      '#059669', // green
+  baras:      '#d97706', // amber
+  bato:       '#7c3aed', // violet
+  caramoran:  '#0891b2', // cyan
+  pandan:     '#db2777', // pink
+  panganiban: '#ea580c', // orange
+  'san andres': '#65a30d', // lime
+  'san miguel': '#0d9488', // teal
+  bagamanoc:  '#4f46e5', // indigo
+};
+const FALLBACK_COLORS = ['#be185d', '#0369a1', '#a16207', '#6d28d9', '#15803d', '#b91c1c'];
+const UNKNOWN_TOWN_COLOR = '#475467';
+
+function hashString(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i += 1) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  return h;
+}
+
+const normaliseTown = (name) =>
+  String(name ?? '').replace(/\s*terminal$/i, '').trim().toLowerCase();
+
+function townColor(key) {
+  if (!key) return UNKNOWN_TOWN_COLOR;
+  if (TOWN_COLORS[key]) return TOWN_COLORS[key];
+  const match = Object.keys(TOWN_COLORS).find((k) => key.startsWith(k) || k.startsWith(key));
+  if (match) return TOWN_COLORS[match];
+  return FALLBACK_COLORS[hashString(key) % FALLBACK_COLORS.length];
+}
+
+// ─── Status ──────────────────────────────────────────────────────────────────
+
+const STATUS_META = {
+  BOARDING:  { label: 'Boarding',    tone: 'ok',     hex: '#059669' },
+  DEPARTING: { label: 'Departing',   tone: 'warn',   hex: '#d97706' },
+  DEPARTED:  { label: 'On the road', tone: 'info',   hex: '#2563eb' },
+  ARRIVING:  { label: 'On the road', tone: 'info',   hex: '#2563eb' },
+  QUEUED:    { label: 'In queue',    tone: 'violet', hex: '#7c3aed' },
+  DELAYED:   { label: 'Delayed',     tone: 'warn',   hex: '#ea580c' },
+};
+const PENDING_META = { label: 'Just arrived', tone: 'warn', hex: '#d97706' };
+const statusMeta = (s) => STATUS_META[s] ?? STATUS_META.DEPARTED;
+
+// ─── Theme (identical tokens to the dispatcher page) ─────────────────────────
+
+const THEME_CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
+.ui-root{
+  --bg:#F2F4F7;--surface:#FFFFFF;--surface-2:#F6F8FA;--text:#0B1220;--muted:#475467;--line:#E4E7EC;
+  --primary:#00873D;--on-primary:#FFFFFF;--primary-bg:#E3F5EA;
+  --ok:#067647;--ok-bg:#E3F5EA;--warn:#B54708;--warn-bg:#FFF1DB;--bad:#B42318;--bad-bg:#FEE9E7;
+  --info:#175CD3;--info-bg:#E6EEFD;--violet:#5925DC;--violet-bg:#EEE9FE;--neutral-bg:#EAECF0;
+  --shadow:0 1px 2px rgba(16,24,40,.06),0 4px 14px rgba(16,24,40,.08);
+  --scrim:rgba(11,18,32,.5);
+  font-family:'Plus Jakarta Sans',Inter,system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;
+  background:var(--bg);color:var(--text);color-scheme:light;
+  -webkit-tap-highlight-color:transparent;-webkit-font-smoothing:antialiased;-webkit-text-size-adjust:100%;
+}
+.ui-root[data-theme="dark"]{
+  --bg:#0B0F14;--surface:#151B23;--surface-2:#1B232D;--text:#F4F6F8;--muted:#A9B3C1;--line:#2A3441;
+  --primary:#3DD879;--on-primary:#04210F;--primary-bg:#11301E;
+  --ok:#5EE09A;--ok-bg:#11301E;--warn:#FDB35C;--warn-bg:#3A2610;--bad:#FF8F85;--bad-bg:#3D1613;
+  --info:#8DB8FF;--info-bg:#14264A;--violet:#BDA8FF;--violet-bg:#2A1F55;--neutral-bg:#222B37;
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 4px 14px rgba(0,0,0,.35);
+  --scrim:rgba(0,0,0,.65);color-scheme:dark;
+}
+.ui-root *:focus-visible{outline:2px solid var(--primary);outline-offset:2px}
+.num{font-variant-numeric:tabular-nums;font-weight:800;letter-spacing:-.02em}
+
+.ui-card{background:var(--surface);box-shadow:var(--shadow)}
+.ui-soft{background:var(--surface-2)}
+.ui-line{border-color:var(--line)}
+.ui-divide>*+*{border-top:1px solid var(--line)}
+.c-muted{color:var(--muted)}.c-primary{color:var(--primary)}.c-ok{color:var(--ok)}.c-warn{color:var(--warn)}
+.c-bad{color:var(--bad)}.c-info{color:var(--info)}.c-violet{color:var(--violet)}
+.chip-ok{background:var(--ok-bg);color:var(--ok)}.chip-warn{background:var(--warn-bg);color:var(--warn)}
+.chip-bad{background:var(--bad-bg);color:var(--bad)}.chip-info{background:var(--info-bg);color:var(--info)}
+.chip-violet{background:var(--violet-bg);color:var(--violet)}.chip-muted{background:var(--neutral-bg);color:var(--muted)}
+.chip-primary{background:var(--primary-bg);color:var(--primary)}
+
+.ui-btn{border:1.5px solid transparent;transition:background .15s,filter .15s,transform .1s;touch-action:manipulation}
+.ui-btn:active:not(:disabled){transform:scale(.98)}
+.ui-btn:disabled{opacity:.5;cursor:not-allowed}
+.b-default{background:var(--surface);color:var(--text);border-color:var(--line)}
+.b-primary{background:var(--primary);color:var(--on-primary)}
+.b-ghost{background:transparent;color:var(--text)}
+@media (hover:hover){
+  .b-default:hover:not(:disabled),.b-ghost:hover:not(:disabled){background:var(--surface-2)}
+  .b-primary:hover:not(:disabled){filter:brightness(.92)}
+  .ui-row:hover{background:var(--surface-2)}
+}
+.ui-row{transition:background .12s}
+.ui-row:active{background:var(--surface-2)}
+
+.town-pill{border:1.5px solid var(--line);background:var(--surface);color:var(--text);transition:background .12s,border-color .12s;touch-action:manipulation}
+.town-pill[aria-pressed="true"]{background:var(--text);color:var(--surface);border-color:var(--text)}
+.no-scrollbar{scrollbar-width:none;-ms-overflow-style:none}
+.no-scrollbar::-webkit-scrollbar{display:none}
+
+.ui-header{background:var(--surface);border-bottom:1px solid var(--line);padding-top:env(safe-area-inset-top)}
+.ui-nav{background:var(--surface);border-top:1px solid var(--line);padding-bottom:env(safe-area-inset-bottom);box-shadow:0 -4px 14px rgba(16,24,40,.06)}
+.ui-pad{padding-left:max(1rem,env(safe-area-inset-left));padding-right:max(1rem,env(safe-area-inset-right))}
+.van-marker{transition:transform 1.2s linear}
+.ui-map-overlay{background:var(--surface);box-shadow:var(--shadow)}
+
+/* Bottom sheet: slides up on phones, centred dialog from 768px, docked panel from 1024px */
+@keyframes sheet-up{from{transform:translateY(100%)}to{transform:none}}
+@keyframes fade-in{from{opacity:0}to{opacity:1}}
+@keyframes pop-in{from{opacity:0;transform:scale(.97)}to{opacity:1;transform:none}}
+.sheet-scrim{background:var(--scrim);animation:fade-in .18s ease-out}
+.sheet-panel{background:var(--surface);box-shadow:0 -10px 40px rgba(16,24,40,.22);max-height:92vh;max-height:92dvh;animation:sheet-up .26s cubic-bezier(.2,.8,.2,1)}
+.sheet-handle{touch-action:none;cursor:grab}
+.sheet-bar{background:var(--line);filter:brightness(.85)}
+.sheet-safe{padding-bottom:calc(.75rem + env(safe-area-inset-bottom))}
+@media (min-width:768px){
+  .sheet-panel{box-shadow:0 24px 64px rgba(16,24,40,.28);max-height:88vh;max-height:88dvh;animation:pop-in .18s ease-out}
+  .sheet-safe{padding-bottom:1rem}
+}
+@media (min-width:1024px){
+  .sheet-dock-wrap{background:transparent!important;pointer-events:none;align-items:flex-start!important;justify-content:flex-end!important;padding:1rem!important}
+  .sheet-dock-wrap .sheet-panel{pointer-events:auto;max-width:24rem!important;margin-top:4.25rem;max-height:calc(100dvh - 7rem);box-shadow:0 12px 40px rgba(16,24,40,.22)}
+}
+@media (prefers-reduced-motion:reduce){
+  .sheet-scrim,.sheet-panel{animation:none}
+  .ui-btn,.van-marker{transition:none}
+}
+`;
+
+// ─── Icons ───────────────────────────────────────────────────────────────────
+
+const VAN_PATH = 'M3 16V7a1 1 0 011-1h9l5 5h2a1 1 0 011 1v4M3 16h2m12 0h-6M7 18a1.5 1.5 0 100-3 1.5 1.5 0 000 3zM17 18a1.5 1.5 0 100-3 1.5 1.5 0 000 3z';
 
 const ICONS = {
-  van:     'M3 16V7a1 1 0 011-1h9l5 5h2a1 1 0 011 1v4M3 16h2m12 0h-6M7 18a1.5 1.5 0 100-3 1.5 1.5 0 000 3zM17 18a1.5 1.5 0 100-3 1.5 1.5 0 000 3z',
-  pin:     'M12 21c4-4 7-7.2 7-11a7 7 0 10-14 0c0 3.8 3 7 7 11zM12 12.5a2.5 2.5 0 100-5 2.5 2.5 0 000 5z',
-  phone:   'M5 4h4l2 5-2.5 1.5a11 11 0 005 5L15 13l5 2v4a2 2 0 01-2 2A16 16 0 013 6a2 2 0 012-2z',
-  clock:   'M12 7v5l3 2M21 12a9 9 0 11-18 0 9 9 0 0118 0z',
-  x:       'M6 6l12 12M18 6L6 18',
-  signal:  'M5 19v-3M10 19v-7M15 19V9M20 19V5',
-  alert:   'M12 9v4M12 17h.01M10.3 4l-8 14a2 2 0 001.7 3h16a2 2 0 001.7-3l-8-14a2 2 0 00-3.4 0z',
-  refresh: 'M20 11a8 8 0 00-14.9-3M4 5v4h4M4 13a8 8 0 0014.9 3M20 19v-4h-4',
-  users:   'M16 20v-1a4 4 0 00-4-4H8a4 4 0 00-4 4v1M10 11a3.5 3.5 0 100-7 3.5 3.5 0 000 7zM20 20v-1a4 4 0 00-3-3.9M16 4.1a3.5 3.5 0 010 6.8',
-  building:'M4 21V5a1 1 0 011-1h8a1 1 0 011 1v16M14 9h5a1 1 0 011 1v11M3 21h18M8 8h2M8 12h2M8 16h2',
-  lock:    'M7 11V8a5 5 0 0110 0v3M6 11h12a1 1 0 011 1v7a1 1 0 01-1 1H6a1 1 0 01-1-1v-7a1 1 0 011-1z',
+  van:      VAN_PATH,
+  building: 'M4 21V5a1 1 0 011-1h8a1 1 0 011 1v16M14 9h5a1 1 0 011 1v11M3 21h18M8 8h2M8 12h2M8 16h2',
+  map:      'M9 4l-6 2v14l6-2 6 2 6-2V4l-6 2-6-2zM9 4v14M15 6v14',
+  list:     'M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01',
+  chevron:  'M9 6l6 6-6 6',
+  sun:      'M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6L7 7M17 17l1.4 1.4M5.6 18.4L7 17M17 7l1.4-1.4M12 16a4 4 0 100-8 4 4 0 000 8z',
+  moon:     'M20 14.5A8 8 0 019.5 4 8 8 0 1020 14.5z',
+  lock:     'M7 11V8a5 5 0 0110 0v3M6 11h12a1 1 0 011 1v7a1 1 0 01-1 1H6a1 1 0 01-1-1v-7a1 1 0 011-1z',
+  x:        'M6 6l12 12M18 6L6 18',
+  alert:    'M12 9v4M12 17h.01M10.3 4l-8 14a2 2 0 001.7 3h16a2 2 0 001.7-3l-8-14a2 2 0 00-3.4 0z',
+  phone:    'M5 4h4l2 5-2.5 1.5a11 11 0 005 5L15 13l5 2v4a2 2 0 01-2 2A16 16 0 013 6a2 2 0 012-2z',
+  locate:   'M12 2v3M12 19v3M2 12h3M19 12h3M12 17a5 5 0 100-10 5 5 0 000 10z',
+  signal:   'M5 19v-3M10 19v-7M15 19V9M20 19V5',
+  users:    'M16 20v-1a4 4 0 00-4-4H8a4 4 0 00-4 4v1M10 11a3.5 3.5 0 100-7 3.5 3.5 0 000 7zM20 20v-1a4 4 0 00-3-3.9M16 4.1a3.5 3.5 0 010 6.8',
 };
 
 function Icon({ name, className = 'h-5 w-5' }) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
       strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
       <path d={ICONS[name]} />
     </svg>
   );
 }
 
-const BTN_BASE =
-  'inline-flex items-center justify-center gap-2 rounded-xl text-sm font-semibold transition active:scale-[0.98] ' +
-  'focus:outline-none focus-visible:ring-2 focus-visible:ring-teal-600 focus-visible:ring-offset-2 ' +
-  'disabled:cursor-not-allowed disabled:opacity-50';
-const BTN = {
-  primary:   `${BTN_BASE} h-12 px-5 bg-teal-700 text-white shadow-sm hover:bg-teal-800`,
-  secondary: `${BTN_BASE} h-9 px-3 border border-slate-200 bg-white text-slate-700 hover:bg-slate-50`,
-  soft:      `${BTN_BASE} h-8 px-3 bg-slate-100 text-slate-700 hover:bg-slate-200`,
-};
+// ─── Map icons: every marker is a van, coloured by its town ──────────────────
 
-// Same colours as the driver app; wording is passenger-facing.
-const STATUS_META = {
-  BOARDING:  { label: 'Boarding',    hex: '#059669', pill: 'bg-emerald-50 text-emerald-700 ring-emerald-600/20', dot: 'bg-emerald-500' },
-  DEPARTING: { label: 'Departing',   hex: '#d97706', pill: 'bg-amber-50 text-amber-700 ring-amber-600/20',       dot: 'bg-amber-500' },
-  DEPARTED:  { label: 'On the road', hex: '#2563eb', pill: 'bg-blue-50 text-blue-700 ring-blue-600/20',          dot: 'bg-blue-500' },
-  ARRIVING:  { label: 'On the road', hex: '#2563eb', pill: 'bg-blue-50 text-blue-700 ring-blue-600/20',          dot: 'bg-blue-500' },
-  QUEUED:    { label: 'In queue',    hex: '#7c3aed', pill: 'bg-violet-50 text-violet-700 ring-violet-600/20',    dot: 'bg-violet-500' },
-  DELAYED:   { label: 'Delayed',     hex: '#ea580c', pill: 'bg-orange-50 text-orange-700 ring-orange-600/20',    dot: 'bg-orange-500' },
-};
-const statusMeta = (s) => STATUS_META[s] ?? STATUS_META.DEPARTED;
+const markerCache = new Map();
+function getVanMarkerIcon(color, statusHex, heading, selected) {
+  const bucket = typeof heading === 'number' ? (Math.round(heading / 30) * 30) % 360 : null;
+  const key = `${color}|${statusHex}|${bucket ?? 'n'}|${selected}`;
+  if (markerCache.has(key)) return markerCache.get(key);
 
-function Card({ className = '', children, ...rest }) {
-  return (
-    <section className={`rounded-2xl border border-slate-200/80 bg-white shadow-sm ${className}`} {...rest}>
-      {children}
-    </section>
-  );
+  const size = selected ? 44 : 36;
+  const glyph = selected ? 24 : 20;
+  const pointer = bucket === null ? '' : `
+    <div style="position:absolute;inset:-8px;transform:rotate(${bucket}deg)">
+      <div style="position:absolute;left:50%;top:-3px;margin-left:-6px;width:0;height:0;border-left:6px solid transparent;border-right:6px solid transparent;border-bottom:10px solid ${color}"></div>
+    </div>`;
+
+  const icon = L.divIcon({
+    className: 'van-marker',
+    html: `<div style="position:relative;width:${size}px;height:${size}px">${pointer}
+      <div style="width:100%;height:100%;border-radius:50%;background:${color};border:3px solid #fff;display:flex;align-items:center;justify-content:center;box-shadow:${selected ? `0 0 0 4px ${color}40,` : ''}0 3px 10px rgba(15,23,42,.4)">
+        <svg viewBox="0 0 24 24" width="${glyph}" height="${glyph}" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="${VAN_PATH}"/></svg>
+      </div>
+      <span style="position:absolute;right:-3px;bottom:-3px;width:13px;height:13px;border-radius:50%;background:${statusHex};border:2.5px solid #fff"></span>
+    </div>`,
+    iconSize: [size, size],
+    iconAnchor: [size / 2, size / 2],
+  });
+  markerCache.set(key, icon);
+  return icon;
 }
 
-function Spinner({ className = 'h-4 w-4' }) {
-  return <span className={`inline-block animate-spin rounded-full border-2 border-current border-t-transparent ${className}`} role="status" />;
-}
-
-function StatusPill({ status }) {
-  const m = statusMeta(status);
-  return (
-    <span className={`inline-flex items-center gap-1.5 whitespace-nowrap rounded-full px-2.5 py-0.5 text-xs font-medium ring-1 ring-inset ${m.pill}`}>
-      <span className={`h-1.5 w-1.5 rounded-full ${m.dot}`} />
-      {m.label}
-    </span>
-  );
-}
-
-function Notice({ tone = 'error', children, action }) {
-  const tones = {
-    error: 'border-rose-200 bg-rose-50 text-rose-800',
-    warn:  'border-amber-200 bg-amber-50 text-amber-800',
-    info:  'border-slate-200 bg-slate-50 text-slate-700',
-  };
-  return (
-    <div role={tone === 'error' ? 'alert' : undefined}
-      className={`flex items-start gap-2 rounded-xl border px-3 py-2.5 text-sm ${tones[tone]}`}>
-      <Icon name="alert" className="mt-0.5 h-4 w-4 shrink-0" />
-      <div className="min-w-0 flex-1 font-medium">{children}</div>
-      {action}
-    </div>
-  );
-}
-
-function Stat({ label, children }) {
-  return (
-    <div className="rounded-xl bg-slate-50 px-3 py-2.5">
-      <p className="text-xs text-slate-500">{label}</p>
-      <p className="mt-0.5 truncate text-sm font-semibold text-slate-900">{children}</p>
-    </div>
-  );
-}
+const hubIcon = L.divIcon({
+  className: '',
+  html: `<div style="width:34px;height:34px;border-radius:10px;background:#0B1220;border:3px solid #fff;display:flex;align-items:center;justify-content:center;box-shadow:0 3px 10px rgba(15,23,42,.4)">
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="${ICONS.building}"/></svg></div>`,
+  iconSize: [34, 34],
+  iconAnchor: [17, 17],
+});
 
 // ─── Pure helpers ────────────────────────────────────────────────────────────
 
@@ -214,9 +339,7 @@ function normaliseFix(input) {
   };
 }
 
-/**
- * Seat count priority: live socket value → persisted trip row → van capacity.
- */
+/** Seat count priority: live socket value → persisted trip row → van capacity. */
 function resolveSeatInfo(trip, liveEntry) {
   const liveAvailable = liveEntry?.availableSeats;
   const liveTotal     = liveEntry?.totalSeats;
@@ -236,8 +359,21 @@ function getDriverContacts(driver) {
   return [];
 }
 
-const cooperativeName = (trip) => trip?.van?.cooperative?.name ?? null;
-const getDirection    = (trip) => (trip?.direction === 'RETURN' ? 'RETURN' : 'OUTBOUND');
+const getDirection = (trip) => (trip?.direction === 'RETURN' ? 'RETURN' : 'OUTBOUND');
+
+// The queue a trip belongs to: the dispatcher's choice, else the van's own cooperative.
+const queueIdOf   = (trip) => trip?.queueCooperativeId ?? trip?.van?.cooperativeId ?? null;
+const queueNameOf = (trip) => trip?.queueCooperative?.name ?? trip?.van?.cooperative?.name ?? null;
+// Scanned in at the terminal but not yet put in a cooperative's queue.
+const isPendingQueue = (trip) =>
+  getDirection(trip) === 'RETURN' && trip?.status === 'QUEUED' && !trip?.queueCooperativeId;
+
+// The town a van is from (route origin). Colours and filters use this.
+function townOf(trip) {
+  const name = shortPlaceName(trip?.route?.origin);
+  const key = normaliseTown(name) || 'unknown';
+  return { key, name, color: townColor(key) };
+}
 
 // Direction-aware endpoints: OUTBOUND municipality → terminal, RETURN terminal → municipality.
 function getTripEndpoints(trip) {
@@ -262,7 +398,11 @@ const legDestination = (trip) =>
 function tripDirectionText(trip) {
   const o = shortPlaceName(trip.route?.origin);
   if (getDirection(trip) === 'RETURN') {
-    if (trip.status === 'QUEUED')   return 'Checked in at the terminal, waiting to board';
+    if (isPendingQueue(trip)) return 'Arrived at the terminal, waiting to be placed in a queue';
+    if (trip.status === 'QUEUED') {
+      const q = queueNameOf(trip);
+      return q ? `Waiting in the ${q} queue` : 'Waiting in the terminal queue';
+    }
     if (trip.status === 'BOARDING') return `Boarding at the terminal for ${o}`;
     if (trip.status === 'DEPARTING') return `Leaving the terminal for ${o}`;
     return `Heading to ${o}`;
@@ -272,93 +412,155 @@ function tripDirectionText(trip) {
   return 'Heading to the terminal';
 }
 
-// ─── Map icons ───────────────────────────────────────────────────────────────
-
-const markerCache = new Map();
-function getMarkerIcon(status, heading, selected) {
-  const bucket = typeof heading === 'number' ? (Math.round(heading / 30) * 30) % 360 : null;
-  const key = `${status}|${bucket ?? 'n'}|${selected}`;
-  if (markerCache.has(key)) return markerCache.get(key);
-
-  const { hex } = statusMeta(status);
-  const s = selected ? 24 : 18;
-  const pointer = bucket === null ? '' : `
-    <div style="position:absolute;inset:-7px;transform:rotate(${bucket}deg)">
-      <div style="position:absolute;left:50%;top:-2px;margin-left:-5px;width:0;height:0;border-left:5px solid transparent;border-right:5px solid transparent;border-bottom:9px solid ${hex}"></div>
-    </div>`;
-
-  const icon = L.divIcon({
-    className: 'van-marker',
-    html: `<div style="position:relative;width:${s}px;height:${s}px">${pointer}
-      <div style="width:100%;height:100%;border-radius:50%;background:${hex};border:3px solid #fff;box-shadow:${selected ? `0 0 0 4px ${hex}40,` : ''}0 2px 8px rgba(15,23,42,.35)"></div></div>`,
-    iconSize: [s, s],
-    iconAnchor: [s / 2, s / 2],
-    popupAnchor: [0, -s / 2 - 4],
-  });
-  markerCache.set(key, icon);
-  return icon;
+function useIsDesktop() {
+  const query = '(min-width: 1024px)';
+  const [matches, setMatches] = useState(() => typeof window !== 'undefined' && window.matchMedia(query).matches);
+  useEffect(() => {
+    const mq = window.matchMedia(query);
+    const onChange = (e) => setMatches(e.matches);
+    setMatches(mq.matches);
+    mq.addEventListener?.('change', onChange);
+    return () => mq.removeEventListener?.('change', onChange);
+  }, []);
+  return matches;
 }
 
-const hubIcon = L.divIcon({
-  className: '',
-  html: '<div style="width:26px;height:26px;border-radius:8px;background:#0f172a;border:3px solid #fff;box-shadow:0 2px 8px rgba(15,23,42,.4);display:flex;align-items:center;justify-content:center"><div style="width:8px;height:8px;border-radius:2px;background:#5eead4"></div></div>',
-  iconSize: [26, 26],
-  iconAnchor: [13, 13],
-  popupAnchor: [0, -16],
-});
-
-// ─── Map helpers ─────────────────────────────────────────────────────────────
-
-function MapBoundsFitter({ positions }) {
-  const map = useMap();
-  const fittedRef = useRef(false);
-  useEffect(() => {
-    if (fittedRef.current || !positions.length) return;
+function useTheme() {
+  const [theme, setTheme] = useState(() => {
     try {
-      map.fitBounds(L.latLngBounds([VIRAC_HUB, ...positions]), { padding: [50, 50], maxZoom: 13 });
-      fittedRef.current = true;
-    } catch { /* ignore malformed coords */ }
-  }, [map, positions]);
-  return null;
-}
-
-// On selection: pan to the van, then fit its road route once it has loaded.
-function SelectionFocus({ tripId, position, routeCoords }) {
-  const map = useMap();
-  const stateRef = useRef({ tripId: null, fitted: false });
+      const saved = localStorage.getItem(THEME_KEY);
+      if (saved === 'light' || saved === 'dark') return saved;
+    } catch { /* ignore */ }
+    return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  });
   useEffect(() => {
-    if (!tripId) { stateRef.current = { tripId: null, fitted: false }; return; }
-    if (stateRef.current.tripId !== tripId) {
-      stateRef.current = { tripId, fitted: false };
-      if (position) map.panTo(position, { animate: true, duration: 0.6 });
-    }
-    if (!stateRef.current.fitted && routeCoords.length > 1) {
-      try {
-        map.fitBounds(L.latLngBounds(routeCoords), { padding: [50, 50], maxZoom: 14, animate: true });
-        stateRef.current.fitted = true;
-      } catch { /* ignore */ }
-    }
-  }, [map, tripId, position, routeCoords]);
-  return null;
+    try { localStorage.setItem(THEME_KEY, theme); } catch { /* ignore */ }
+  }, [theme]);
+  const toggle = useCallback(() => setTheme((t) => (t === 'dark' ? 'light' : 'dark')), []);
+  return [theme, toggle];
 }
 
-async function fetchOsrmRoute(startCoords, endCoords, signal) {
-  const [startLat, startLng] = startCoords;
-  const [endLat, endLng] = endCoords;
-  const url = `${OSRM_BASE_URL}/${startLng},${startLat};${endLng},${endLat}?overview=full&geometries=geojson&steps=false`;
-  const res = await fetch(url, { signal });
-  if (!res.ok) throw new Error(`OSRM request failed (${res.status})`);
-  const data = await res.json();
-  const route = data?.routes?.[0];
-  if (!route?.geometry?.coordinates?.length) return null;
-  return {
-    coords: route.geometry.coordinates.map(([lng, lat]) => [lat, lng]),
-    distanceMeters: route.distance ?? null,
-    durationSeconds: route.duration ?? null,
-  };
+// ─── Primitives (same as the dispatcher page) ────────────────────────────────
+
+const BTN_BASE = 'ui-btn inline-flex items-center justify-center gap-2 rounded-xl text-sm font-bold';
+const BTN_SIZES = { md: 'h-11 px-4 sm:h-10', sm: 'h-10 px-3 text-xs sm:h-9', lg: 'h-12 px-5 text-base', icon: 'h-11 w-11 sm:h-10 sm:w-10' };
+const BTN_VARIANTS = { default: 'b-default', primary: 'b-primary', ghost: 'b-ghost' };
+
+function Btn({ variant = 'default', size = 'md', className = '', type = 'button', children, ...rest }) {
+  return <button type={type} className={`${BTN_BASE} ${BTN_SIZES[size]} ${BTN_VARIANTS[variant]} ${className}`} {...rest}>{children}</button>;
 }
 
-// ─── Small components ────────────────────────────────────────────────────────
+function Card({ className = '', children, ...rest }) {
+  return <section className={`ui-card rounded-2xl ${className}`} {...rest}>{children}</section>;
+}
+
+function Chip({ tone = 'muted', children }) {
+  return <span className={`chip-${tone} inline-flex items-center gap-1 whitespace-nowrap rounded-full px-2.5 py-1 text-xs font-bold`}>{children}</span>;
+}
+
+function Spinner({ className = 'h-4 w-4' }) {
+  return <span className={`inline-block animate-spin rounded-full border-2 border-current border-t-transparent ${className}`} role="status" aria-label="Loading" />;
+}
+
+function Notice({ tone = 'bad', children, action }) {
+  return (
+    <div role={tone === 'bad' ? 'alert' : undefined} className={`chip-${tone} flex items-start gap-2 rounded-xl px-3 py-2.5 text-sm font-semibold`}>
+      <Icon name="alert" className="mt-0.5 h-4 w-4 shrink-0" />
+      <div className="min-w-0 flex-1 break-words">{children}</div>
+      {action}
+    </div>
+  );
+}
+
+function EmptyState({ icon = 'van', title, children }) {
+  return (
+    <div className="flex flex-col items-center px-6 py-8 text-center">
+      <span className="chip-muted mb-3 flex h-14 w-14 items-center justify-center rounded-full"><Icon name={icon} className="h-6 w-6" /></span>
+      <p className="font-bold">{title}</p>
+      {children && <p className="c-muted mt-1 max-w-xs text-sm font-medium">{children}</p>}
+    </div>
+  );
+}
+
+function DetailRow({ label, children }) {
+  return (
+    <div className="ui-line flex items-start justify-between gap-4 border-b py-3 last:border-b-0">
+      <dt className="c-muted shrink-0 text-sm font-medium">{label}</dt>
+      <dd className="min-w-0 break-words text-right text-sm font-bold">{children}</dd>
+    </div>
+  );
+}
+
+function SectionHeader({ title, count, hint }) {
+  return (
+    <div className="mb-2 mt-1">
+      <div className="flex items-center justify-between gap-2">
+        <h2 className="text-lg font-extrabold tracking-tight">{title}</h2>
+        {count !== undefined && <Chip>{count}</Chip>}
+      </div>
+      {hint && <p className="c-muted text-xs font-medium">{hint}</p>}
+    </div>
+  );
+}
+
+function StatusChip({ status, pending = false }) {
+  const m = pending ? PENDING_META : statusMeta(status);
+  return <Chip tone={m.tone}>{m.label}</Chip>;
+}
+
+// "10/14": bold, tabular, readable at a glance. Turns red when the van is full.
+function Seats({ available, total, big = false }) {
+  if (available == null || total == null) return null;
+  return (
+    <span className={`num leading-none ${big ? 'text-4xl' : 'text-lg'} ${available === 0 ? 'c-bad' : ''}`}>
+      {available}<span className="c-muted font-bold">/{total}</span>
+    </span>
+  );
+}
+
+function MetricTile({ label, value, tone }) {
+  return (
+    <div className="ui-card min-w-0 rounded-2xl px-2 py-3 text-center">
+      <p className={`num text-2xl leading-none ${tone ? `c-${tone}` : ''}`}>{value}</p>
+      <p className="c-muted mt-1.5 truncate text-[11px] font-bold">{label}</p>
+    </div>
+  );
+}
+
+// Small coloured dot + town name, so a van's town is readable without the map.
+function TownTag({ town }) {
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: town.color }} />
+      <span>{town.name}</span>
+    </span>
+  );
+}
+
+// Round van avatar in the van's town colour (same van glyph as the map marker).
+function VanAvatar({ color }) {
+  return (
+    <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-white"
+      style={{ background: color, boxShadow: '0 0 0 3px var(--surface), 0 0 0 4.5px ' + color + '55' }}>
+      <Icon name="van" />
+    </span>
+  );
+}
+
+function DriverContacts({ driver }) {
+  const numbers = getDriverContacts(driver);
+  if (!numbers.length) return <span className="c-muted">None on file</span>;
+  return (
+    <span className="flex flex-wrap justify-end gap-1.5">
+      {numbers.map((n) => (
+        <a key={n} href={`tel:${n.replace(/\s/g, '')}`} onClick={(e) => e.stopPropagation()}
+          className="chip-info inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-bold tabular-nums">
+          <Icon name="phone" className="h-3 w-3" /> {n}
+        </a>
+      ))}
+    </span>
+  );
+}
 
 function EtaCountdown({ etaIso }) {
   const [label, setLabel] = useState('');
@@ -380,136 +582,224 @@ function EtaCountdown({ etaIso }) {
   return <span className="tabular-nums">{label}</span>;
 }
 
-function SeatPill({ available, total, isLive }) {
-  if (available === null || available === undefined) return null;
-  const full = available === 0;
-  return (
-    <span className={`inline-flex items-center gap-1.5 whitespace-nowrap rounded-full px-2.5 py-0.5 text-xs font-medium ring-1 ring-inset ${
-      full ? 'bg-slate-100 text-slate-500 ring-slate-300/60' : 'bg-emerald-50 text-emerald-700 ring-emerald-600/20'}`}>
-      {isLive && !full && (
-        <span className="relative flex h-1.5 w-1.5">
-          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-70" />
-          <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-500" />
-        </span>
-      )}
-      <Icon name="users" className="h-3 w-3" />
-      {full ? 'Full' : `${available}${total != null ? ` of ${total}` : ''} free`}
-    </span>
-  );
-}
-
-function DriverContacts({ driver }) {
-  const numbers = getDriverContacts(driver);
-  if (numbers.length === 0) return null;
-  return (
-    <div className="flex flex-wrap gap-1.5">
-      {numbers.map((n) => (
-        <a key={n} href={`tel:${n.replace(/\s/g, '')}`} onClick={(e) => e.stopPropagation()}
-          className="inline-flex items-center gap-1 rounded-lg bg-slate-100 px-2 py-1 text-xs font-medium tabular-nums text-slate-700 hover:bg-slate-200">
-          <Icon name="phone" className="h-3 w-3" /> {n}
-        </a>
-      ))}
-    </div>
-  );
-}
-
-function CooperativeTag({ trip }) {
-  const name = cooperativeName(trip);
-  if (!name) return null;
-  return (
-    <span className="inline-flex items-center gap-1 text-xs text-slate-500">
-      <Icon name="building" className="h-3 w-3" /> {name}
-    </span>
-  );
-}
-
-function EmptyState({ text }) {
-  return <p className="rounded-xl border border-dashed border-slate-200 px-4 py-5 text-center text-sm text-slate-400">{text}</p>;
-}
-
-function SectionHeader({ title, count, hint }) {
-  return (
-    <div className="mb-2">
-      <div className="flex items-center justify-between">
-        <h2 className="text-sm font-semibold text-slate-900">{title}</h2>
-        <span className="rounded-full bg-slate-200/70 px-2 py-0.5 text-xs font-medium tabular-nums text-slate-600">{count}</span>
-      </div>
-      {hint && <p className="mt-0.5 text-xs text-slate-500">{hint}</p>}
-    </div>
-  );
-}
-
 // One line describing the van's live GPS state.
 function GpsLine({ gps, data }) {
   if (gps.isLive) {
     const weak = typeof gps.accuracy === 'number' && gps.accuracy > LOW_ACCURACY_THRESHOLD_M;
     return (
-      <div className="flex items-center justify-between rounded-lg bg-slate-50 px-3 py-2 text-xs font-medium text-slate-700">
+      <div className="chip-ok flex items-center justify-between gap-2 rounded-xl px-3 py-2 text-xs font-bold">
         <span className="flex items-center gap-1.5">
-          <span className="relative flex h-1.5 w-1.5">
-            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-teal-500 opacity-70" />
-            <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-teal-600" />
+          <span className="relative flex h-2 w-2">
+            <span className="absolute inline-flex h-full w-full animate-ping rounded-full opacity-70" style={{ background: 'var(--ok)' }} />
+            <span className="relative inline-flex h-2 w-2 rounded-full" style={{ background: 'var(--ok)' }} />
           </span>
-          {speedLabel(data?.smoothedSpeed)}
-          {weak && <span className="font-normal text-amber-600">· weak GPS</span>}
+          Live · {speedLabel(data?.smoothedSpeed)}
+          {weak && <span className="c-warn font-semibold">· weak GPS</span>}
         </span>
-        {data?.lastSeen && <span className="font-normal text-slate-400">{relativeTime(data.lastSeen)}</span>}
+        {data?.lastSeen && <span className="font-semibold opacity-80">{relativeTime(data.lastSeen)}</span>}
       </div>
     );
   }
   if (gps.isStale) {
     return (
-      <div className="flex items-center gap-1.5 rounded-lg bg-amber-50 px-3 py-2 text-xs font-medium text-amber-700">
-        <Icon name="signal" className="h-3.5 w-3.5" /> GPS signal lost. Last seen {relativeTime(data?.lastSeen)}
+      <div className="chip-warn flex items-center gap-1.5 rounded-xl px-3 py-2 text-xs font-bold">
+        <Icon name="signal" className="h-3.5 w-3.5" /> GPS signal lost · last seen {relativeTime(data?.lastSeen)}
       </div>
     );
   }
   if (gps.hasFix && !gps.isTrusted) {
     return (
-      <div className="flex items-center gap-1.5 rounded-lg bg-amber-50 px-3 py-2 text-xs font-medium text-amber-700">
-        <Icon name="signal" className="h-3.5 w-3.5" /> GPS fix too weak to plot
+      <div className="chip-warn flex items-center gap-1.5 rounded-xl px-3 py-2 text-xs font-bold">
+        <Icon name="signal" className="h-3.5 w-3.5" /> GPS too weak to plot
         {typeof gps.accuracy === 'number' && ` (±${Math.round(gps.accuracy)} m)`}
       </div>
     );
   }
   return (
-    <div className="flex items-center gap-2 rounded-lg bg-slate-50 px-3 py-2 text-xs font-medium text-slate-500">
+    <div className="chip-muted flex items-center gap-2 rounded-xl px-3 py-2 text-xs font-bold">
       <Spinner className="h-3 w-3" /> Waiting for the driver's GPS…
     </div>
   );
 }
 
-function TripRow({ trip, selected, onSelect, trailing, footer }) {
+// ─── Bottom sheet (same behaviour as the dispatcher page) ────────────────────
+
+function Sheet({ open, onClose, title, subtitle, footer, dock = false, children }) {
+  const [dy, setDy] = useState(0);
+  const [dragging, setDragging] = useState(false);
+  const startY = useRef(0);
+
+  useEffect(() => { if (open) setDy(0); }, [open]);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const onKey = (e) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  const onPointerDown = (e) => {
+    startY.current = e.clientY;
+    setDragging(true);
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+  };
+  const onPointerMove = (e) => { if (dragging) setDy(Math.max(0, e.clientY - startY.current)); };
+  const onPointerUp = () => {
+    if (!dragging) return;
+    setDragging(false);
+    if (dy > 110) onClose(); else setDy(0);
+  };
+
   return (
-    <button type="button" onClick={onSelect} aria-pressed={selected}
-      className={`w-full rounded-xl border bg-white p-3 text-left shadow-sm transition focus:outline-none focus-visible:ring-2 focus-visible:ring-teal-600 ${
-        selected ? 'border-teal-700 ring-1 ring-teal-700' : 'border-slate-200/80 hover:border-slate-300'}`}>
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0 flex-1">
-          <p className={`truncate text-sm font-semibold ${trip.driver?.name ? 'text-slate-900' : 'italic text-slate-400'}`}>
-            {trip.driver?.name ?? 'No driver assigned'}
-          </p>
-          <p className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-slate-500">
-            <span className="font-semibold text-slate-700">{trip.van?.plateNumber ?? 'Unknown plate'}</span>
-            <CooperativeTag trip={trip} />
-          </p>
-          <p className="mt-1 text-xs text-slate-500">{tripDirectionText(trip)}</p>
+    <div role="dialog" aria-modal={!dock} aria-label={title}
+      className={`sheet-scrim fixed inset-0 z-50 flex items-end justify-center md:items-center md:p-4 ${dock ? 'sheet-dock-wrap' : ''}`}
+      onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      <div className="sheet-panel flex w-full min-w-0 flex-col rounded-t-2xl md:max-w-md md:rounded-2xl"
+        style={{ transform: dy ? `translateY(${dy}px)` : undefined, transition: dragging ? 'none' : 'transform .2s ease-out' }}>
+        <div className="sheet-handle flex justify-center py-3 md:hidden" onPointerDown={onPointerDown} onPointerMove={onPointerMove}
+          onPointerUp={onPointerUp} onPointerCancel={onPointerUp}>
+          <span className="sheet-bar h-1.5 w-10 rounded-full" />
         </div>
-        {trailing}
+        <div className="flex items-start justify-between gap-3 px-4 pb-3 md:p-5 md:pb-3">
+          <div className="min-w-0">
+            <h2 className="truncate text-xl font-extrabold tracking-tight">{title}</h2>
+            {subtitle && <div className="c-muted truncate text-sm font-medium">{subtitle}</div>}
+          </div>
+          <Btn variant="ghost" size="icon" onClick={onClose} aria-label="Close" className="-mr-2 shrink-0"><Icon name="x" /></Btn>
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 pb-4 md:px-5">{children}</div>
+        {footer && <div className="ui-line sheet-safe border-t px-4 pt-3 md:px-5">{footer}</div>}
       </div>
-      {footer && <div className="mt-2.5">{footer}</div>}
-    </button>
+    </div>
   );
 }
 
-function CountTile({ value, label, dot }) {
+// ─── List rows ───────────────────────────────────────────────────────────────
+
+function VanRow({ trip, onOpen, trailing, footer, subtitle }) {
+  const town = townOf(trip);
   return (
-    <div className="flex-1 rounded-xl bg-white px-3 py-2.5 shadow-sm ring-1 ring-slate-200/80">
-      <p className="text-2xl font-semibold tabular-nums tracking-tight text-slate-900">{value}</p>
-      <p className="mt-0.5 flex items-center gap-1.5 text-xs text-slate-500">
-        <span className={`h-1.5 w-1.5 rounded-full ${dot}`} /> {label}
-      </p>
-    </div>
+    <li>
+      <button type="button" onClick={() => onOpen(trip.id)} aria-label={`Open ${trip.van?.plateNumber ?? 'van'}`}
+        className="ui-row flex min-h-[68px] w-full items-center gap-3 px-4 py-3 text-left">
+        <VanAvatar color={town.color} />
+        <span className="min-w-0 flex-1">
+          <span className="block truncate font-bold">{trip.van?.plateNumber ?? 'Unknown plate'}</span>
+          <span className="c-muted block truncate text-sm font-medium">
+            <TownTag town={town} />
+            {queueNameOf(trip) && getDirection(trip) === 'RETURN' ? ` · ${queueNameOf(trip)}` : ''}
+          </span>
+          <span className="c-muted block truncate text-xs font-medium">{subtitle ?? tripDirectionText(trip)}</span>
+        </span>
+        {trailing}
+        <Icon name="chevron" className="c-muted h-4 w-4 shrink-0" />
+      </button>
+      {footer && <div className="px-4 pb-3">{footer}</div>}
+    </li>
+  );
+}
+
+// ─── Map helpers ─────────────────────────────────────────────────────────────
+// On phones the map is hidden while the list tab is active. Leaflet measures its
+// container on mount, so it must re-measure when the tab is revealed.
+
+function MapInvalidator({ active }) {
+  const map = useMap();
+  useEffect(() => {
+    if (!active) return undefined;
+    const t = setTimeout(() => map.invalidateSize(), 60);
+    return () => clearTimeout(t);
+  }, [active, map]);
+  return null;
+}
+
+function MapBoundsFitter({ positions, active }) {
+  const map = useMap();
+  const fittedRef = useRef(false);
+  useEffect(() => {
+    if (!active || fittedRef.current || !positions.length) return undefined;
+    const t = setTimeout(() => {
+      try {
+        map.invalidateSize();
+        map.fitBounds(L.latLngBounds([VIRAC_HUB, ...positions]), { padding: [50, 50], maxZoom: 13 });
+        fittedRef.current = true;
+      } catch { /* ignore malformed coords */ }
+    }, 100);
+    return () => clearTimeout(t);
+  }, [map, positions, active]);
+  return null;
+}
+
+// On selection: pan to the van, then fit its road route once it has loaded.
+function SelectionFocus({ tripId, position, routeCoords, active }) {
+  const map = useMap();
+  const stateRef = useRef({ tripId: null, fitted: false });
+  useEffect(() => {
+    if (!tripId) { stateRef.current = { tripId: null, fitted: false }; return undefined; }
+    if (!active) return undefined;
+    const t = setTimeout(() => {
+      if (stateRef.current.tripId !== tripId) {
+        stateRef.current = { tripId, fitted: false };
+        if (position) map.panTo(position, { animate: true, duration: 0.6 });
+      }
+      if (!stateRef.current.fitted && routeCoords.length > 1) {
+        try {
+          map.fitBounds(L.latLngBounds(routeCoords), { padding: [50, 50], maxZoom: 14, animate: true });
+          stateRef.current.fitted = true;
+        } catch { /* ignore */ }
+      }
+    }, 120);
+    return () => clearTimeout(t);
+  }, [map, tripId, position, routeCoords, active]);
+  return null;
+}
+
+async function fetchOsrmRoute(startCoords, endCoords, signal) {
+  const [startLat, startLng] = startCoords;
+  const [endLat, endLng] = endCoords;
+  const url = `${OSRM_BASE_URL}/${startLng},${startLat};${endLng},${endLat}?overview=full&geometries=geojson&steps=false`;
+  const res = await fetch(url, { signal });
+  if (!res.ok) throw new Error(`OSRM request failed (${res.status})`);
+  const data = await res.json();
+  const route = data?.routes?.[0];
+  if (!route?.geometry?.coordinates?.length) return null;
+  return {
+    coords: route.geometry.coordinates.map(([lng, lat]) => [lat, lng]),
+    distanceMeters: route.distance ?? null,
+    durationSeconds: route.duration ?? null,
+  };
+}
+
+// ─── Navigation ──────────────────────────────────────────────────────────────
+
+function BottomNav({ tab, onChange, counts }) {
+  return (
+    <nav className="ui-nav fixed inset-x-0 bottom-0 z-40 lg:hidden" aria-label="Public views">
+      <ul className="mx-auto grid max-w-lg grid-cols-2">
+        {TABS.map((t) => {
+          const on = tab === t.id;
+          const count = counts[t.id];
+          return (
+            <li key={t.id}>
+              <button type="button" onClick={() => onChange(t.id)} aria-current={on ? 'page' : undefined}
+                className={`relative flex min-h-[58px] w-full flex-col items-center justify-center gap-0.5 text-[11px] font-bold ${on ? 'c-primary' : 'c-muted'}`}>
+                {on && <span className="absolute top-0 h-[3px] w-10 rounded-b-full" style={{ background: 'var(--primary)' }} />}
+                <span className="relative">
+                  <Icon name={t.icon} className="h-6 w-6" />
+                  {count > 0 && (
+                    <span className="num absolute -right-3 -top-1.5 flex h-4 min-w-[1rem] items-center justify-center rounded-full px-1 text-[10px]"
+                      style={{ background: on ? 'var(--primary)' : 'var(--muted)', color: on ? 'var(--on-primary)' : 'var(--surface)' }}>{count}</span>
+                  )}
+                </span>
+                {t.label}
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    </nav>
   );
 }
 
@@ -517,6 +807,8 @@ function CountTile({ value, label, dot }) {
 
 export default function PublicTracking() {
   const navigate = useNavigate();
+  const [theme, toggleTheme] = useTheme();
+  const isDesktop = useIsDesktop();
 
   const [activeTrips, setActiveTrips]     = useState([]);
   const [liveData, setLiveData]           = useState({});
@@ -526,15 +818,22 @@ export default function PublicTracking() {
   const [socketStatus, setSocketStatus]   = useState('connecting');
   const [, setTick]                       = useState(0);
   const [liveEtas, setLiveEtas]           = useState({});
-  const [selectedTripId, setSelectedTripId] = useState(null);
   const [selectedRoute, setSelectedRoute] = useState(EMPTY_ROUTE);
+
+  const [activeTab, setActiveTab]           = useState('vans');
+  const [townFilter, setTownFilter]         = useState(null);
+  const [sheetTripId, setSheetTripId]       = useState(null);
+  const [selectedTripId, setSelectedTripId] = useState(null);
 
   const selectedTripIdRef = useRef(selectedTripId);
   const activeTripsRef    = useRef(activeTrips);
   const routeStartRef     = useRef({ tripId: null, direction: null, start: null });
   const routeAbortRef     = useRef(null);
+  const mapRef            = useRef(null);
   useEffect(() => { selectedTripIdRef.current = selectedTripId; }, [selectedTripId]);
   useEffect(() => { activeTripsRef.current = activeTrips; }, [activeTrips]);
+
+  const mapVisible = activeTab === 'map' || isDesktop;
 
   // ── HTTP fetch seeds liveData so markers appear without waiting for a socket push ──
   const fetchActiveTrips = useCallback(async (signal) => {
@@ -609,6 +908,7 @@ export default function PublicTracking() {
       setLiveData((prev) => { if (!(tripId in prev)) return prev; const n = { ...prev }; delete n[tripId]; return n; });
       setLiveEtas((prev) => { if (!(tripId in prev)) return prev; const n = { ...prev }; delete n[tripId]; return n; });
       if (selectedTripIdRef.current === tripId) setSelectedTripId(null);
+      setSheetTripId((cur) => (cur === tripId ? null : cur));
     };
 
     const onTripStatusChanged = ({ tripId, trip } = {}) => {
@@ -684,28 +984,63 @@ export default function PublicTracking() {
     return () => clearInterval(id);
   }, []);
 
-  // ── Derived lists ──
-  const boardingTrips = useMemo(() => activeTrips.filter((t) => BOARDING_STATUSES.includes(t.status)), [activeTrips]);
-  const drivingTrips  = useMemo(() => activeTrips.filter((t) => DRIVING_STATUSES.includes(t.status)), [activeTrips]);
-  const mapTrips      = useMemo(() => activeTrips.filter((t) => MAP_VISIBLE_STATUSES.includes(t.status)), [activeTrips]);
+  // ── Town filter ──
+  const townChips = useMemo(() => {
+    const map = new Map();
+    for (const trip of activeTrips) {
+      const t = townOf(trip);
+      if (!map.has(t.key)) map.set(t.key, { ...t, count: 0 });
+      map.get(t.key).count += 1;
+    }
+    return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
+  }, [activeTrips]);
 
-  const queuedTrips = useMemo(
-    () => activeTrips
-      .filter((t) => QUEUED_STATUSES.includes(t.status))
-      .sort((a, b) => new Date(a.actualArrival ?? a.scheduledTime ?? 0) - new Date(b.actualArrival ?? b.scheduledTime ?? 0)),
-    [activeTrips],
+  // If the filtered town has no vans any more, fall back to showing everything.
+  const effectiveFilter = townFilter && townChips.some((t) => t.key === townFilter) ? townFilter : null;
+
+  const visibleTrips = useMemo(
+    () => (effectiveFilter ? activeTrips.filter((t) => townOf(t).key === effectiveFilter) : activeTrips),
+    [activeTrips, effectiveFilter],
   );
 
-  // Each cooperative has its own boarding slot, so position in line is per cooperative.
-  const queueGroups = useMemo(() => {
-    const groups = new Map();
+  // ── Derived lists ──
+  const boardingTrips = useMemo(() => visibleTrips.filter((t) => BOARDING_STATUSES.includes(t.status)), [visibleTrips]);
+  const drivingTrips  = useMemo(() => visibleTrips.filter((t) => DRIVING_STATUSES.includes(t.status)), [visibleTrips]);
+  const mapTrips      = useMemo(() => visibleTrips.filter((t) => MAP_VISIBLE_STATUSES.includes(t.status)), [visibleTrips]);
+
+  const queuedTrips = useMemo(
+    () => visibleTrips
+      .filter((t) => QUEUED_STATUSES.includes(t.status))
+      .sort((a, b) => new Date(a.actualArrival ?? a.scheduledTime ?? 0) - new Date(b.actualArrival ?? b.scheduledTime ?? 0)),
+    [visibleTrips],
+  );
+
+  // Vans scanned in but not yet put in a queue, and the per-cooperative queues.
+  const pendingTrips = useMemo(() => queuedTrips.filter(isPendingQueue), [queuedTrips]);
+
+  const queueLanes = useMemo(() => {
+    const lanes = new Map();
     for (const trip of queuedTrips) {
-      const key = trip.van?.cooperativeId ?? 'unassigned';
-      if (!groups.has(key)) groups.set(key, { name: cooperativeName(trip) ?? 'Unassigned', trips: [] });
-      groups.get(key).trips.push(trip);
+      if (isPendingQueue(trip)) continue;
+      const key = queueIdOf(trip) ?? 'unassigned';
+      if (!lanes.has(key)) lanes.set(key, { key, name: queueNameOf(trip) ?? 'Terminal queue', trips: [], boardingNow: [] });
+      lanes.get(key).trips.push(trip);
     }
-    return Array.from(groups.values()).sort((a, b) => a.name.localeCompare(b.name));
-  }, [queuedTrips]);
+    // Who is boarding right now at each queue's terminal slot.
+    for (const trip of boardingTrips) {
+      if (getDirection(trip) !== 'RETURN') continue;
+      const lane = lanes.get(queueIdOf(trip) ?? 'unassigned');
+      if (lane) lane.boardingNow.push(trip);
+    }
+    return Array.from(lanes.values()).sort((a, b) => a.name.localeCompare(b.name));
+  }, [queuedTrips, boardingTrips]);
+
+  // tripId → { position, size } within its own queue.
+  const queuePositions = useMemo(() => {
+    const m = new Map();
+    for (const lane of queueLanes) lane.trips.forEach((t, i) => m.set(t.id, { position: i + 1, size: lane.trips.length }));
+    return m;
+  }, [queueLanes]);
 
   const resolveTripPosition = useCallback((trip) => {
     const data = liveData[trip.id];
@@ -726,6 +1061,7 @@ export default function PublicTracking() {
   }, [liveData]);
 
   // One marker per van that has a live fix (a driver's simultaneous trips share it).
+  // Vans waiting at the same known spot (e.g. the terminal) are fanned out so none hide another.
   const markerGroups = useMemo(() => {
     const groups = new Map();
     for (const trip of mapTrips) {
@@ -736,22 +1072,49 @@ export default function PublicTracking() {
       if (!groups.has(key)) groups.set(key, { key, position: r.position, isLive: r.isLive, trips: [] });
       groups.get(key).trips.push(trip);
     }
-    return Array.from(groups.values()).map((g) => {
+
+    const list = Array.from(groups.values()).map((g) => {
       const primary =
         g.trips.find((t) => t.id === selectedTripId) ??
         [...g.trips].sort((a, b) => STATUS_PRIORITY.indexOf(a.status) - STATUS_PRIORITY.indexOf(b.status))[0];
       return { ...g, primary };
     });
+
+    const stacks = new Map();
+    for (const g of list) {
+      if (g.isLive) continue;
+      const k = g.position.join(',');
+      if (!stacks.has(k)) stacks.set(k, []);
+      stacks.get(k).push(g);
+    }
+    for (const stack of stacks.values()) {
+      if (stack.length < 2) continue;
+      stack.sort((a, b) => String(a.primary.id).localeCompare(String(b.primary.id)));
+      stack.forEach((g, i) => {
+        const angle = (i / stack.length) * 2 * Math.PI;
+        const radius = 0.0007 * (1 + Math.floor(i / 8));
+        g.position = [g.position[0] + radius * Math.sin(angle), g.position[1] + radius * Math.cos(angle)];
+      });
+    }
+    return list;
   }, [mapTrips, resolveTripPosition, selectedTripId]);
 
   const activeVanPositions = useMemo(() => markerGroups.map((g) => g.position), [markerGroups]);
+  const liveCount = useMemo(
+    () => activeTrips.filter((t) => resolveTripPosition(t).isLive).length,
+    [activeTrips, resolveTripPosition],
+  );
 
+  const sheetTrip        = useMemo(() => activeTrips.find((t) => t.id === sheetTripId) ?? null, [activeTrips, sheetTripId]);
   const selectedTrip     = useMemo(() => activeTrips.find((t) => t.id === selectedTripId) ?? null, [activeTrips, selectedTripId]);
   const selectedLive     = selectedTripId ? liveData[selectedTripId] : null;
-  const selectedEta      = selectedTrip && ETA_STATUSES.includes(selectedTrip.status) ? liveEtas[selectedTripId] ?? null : null;
-  const selectedSeatInfo = selectedTrip ? resolveSeatInfo(selectedTrip, selectedLive) : null;
   const selectedGps      = useMemo(() => (selectedTrip ? resolveTripPosition(selectedTrip) : null), [selectedTrip, resolveTripPosition]);
   const selectedPosition = selectedGps?.position ?? null;
+  const selectedTown     = selectedTrip ? townOf(selectedTrip) : null;
+
+  const siblings = sheetTrip
+    ? activeTrips.filter((t) => t.id !== sheetTrip.id && (t.van?.id ?? t.vanId) === (sheetTrip.van?.id ?? sheetTrip.vanId))
+    : [];
 
   // ── Road route for the selected trip ──
   // Depends only on stable primitives, and the in-flight request is only aborted
@@ -820,97 +1183,277 @@ export default function PublicTracking() {
   const routeCoords = selectedRoute.tripId === selectedTripId ? selectedRoute.coords : [];
   const mapFocusPositions = routeCoords.length > 0 ? routeCoords : activeVanPositions;
 
-  // ── Loading / error screens ──
+  // ── Callbacks ──
+  const openTrip   = useCallback((tripId) => { setSheetTripId(tripId); setSelectedTripId(tripId); }, []);
+  const closeSheet = useCallback(() => { setSheetTripId(null); setSelectedTripId(null); }, []);
+
+  // "Show on map": on phones this switches to the Map tab and keeps the van highlighted with its route.
+  const focusOnMap = useCallback((trip) => {
+    const { position } = resolveTripPosition(trip);
+    setSelectedTripId(trip.id);
+    if (!isDesktop) { setSheetTripId(null); setActiveTab('map'); }
+    if (position) setTimeout(() => mapRef.current?.setView(position, 14, { animate: true }), isDesktop ? 0 : 200);
+  }, [resolveTripPosition, isDesktop]);
+
+  // ── Render states ──
+  const shell = (children) => (
+    <div className="ui-root" data-theme={theme} style={{ height: '100dvh' }}>
+      <style>{THEME_CSS}</style>
+      {children}
+    </div>
+  );
+
   if (loading) {
-    return (
-      <div className="flex h-screen items-center justify-center bg-slate-50">
-        <div className="flex flex-col items-center gap-3 text-slate-500">
-          <span className="flex h-11 w-11 items-center justify-center rounded-xl bg-teal-700 text-white"><Icon name="van" className="h-6 w-6" /></span>
-          <p className="flex items-center gap-2 text-sm font-medium"><Spinner className="h-4 w-4 text-teal-700" /> Loading live tracking…</p>
-        </div>
-      </div>
+    return shell(
+      <div className="flex h-full items-center justify-center p-6">
+        <Card className="flex items-center gap-3 px-5 py-4"><Spinner className="c-primary h-5 w-5" /><span className="font-bold">Loading live vans…</span></Card>
+      </div>,
     );
   }
 
   if (error && activeTrips.length === 0) {
-    return (
-      <div className="flex h-screen items-center justify-center bg-slate-50 p-4">
+    return shell(
+      <div className="flex h-full items-center justify-center p-6">
         <Card className="w-full max-w-md space-y-4 p-6 text-center">
-          <h1 className="text-lg font-semibold text-slate-900">Can't reach live tracking</h1>
+          <h1 className="text-xl font-extrabold">Can't reach live tracking</h1>
           <Notice>{error}</Notice>
-          <button className={`${BTN.primary} w-full`} onClick={() => setReloadToken((n) => n + 1)}>Try again</button>
+          <Btn variant="primary" size="lg" className="w-full" onClick={() => setReloadToken((n) => n + 1)}>Try again</Btn>
         </Card>
-      </div>
+      </div>,
     );
   }
 
   const socketChip =
     socketStatus === 'connected'
-      ? { text: 'Live', cls: 'bg-emerald-50 text-emerald-700 ring-emerald-600/20', dot: 'bg-emerald-500', ping: true }
+      ? { text: 'Live', tone: 'ok', ping: true }
       : socketStatus === 'disconnected'
-      ? { text: 'Offline', cls: 'bg-rose-50 text-rose-700 ring-rose-600/20', dot: 'bg-rose-500', ping: false }
-      : { text: 'Connecting', cls: 'bg-amber-50 text-amber-700 ring-amber-600/20', dot: 'bg-amber-500', ping: false };
+      ? { text: 'Offline', tone: 'bad', ping: false }
+      : { text: 'Connecting', tone: 'warn', ping: false };
 
-  const etaTarget = selectedTrip ? legDestination(selectedTrip) : HOME_TERMINAL_SHORT;
+  // ── Sheet: selected van details ──
+  const sheetPending  = Boolean(sheetTrip) && isPendingQueue(sheetTrip);
+  const sheetTown     = sheetTrip ? townOf(sheetTrip) : null;
+  const sheetLive     = sheetTrip ? liveData[sheetTrip.id] : null;
+  const sheetGps      = sheetTrip ? resolveTripPosition(sheetTrip) : null;
+  const sheetSeats    = sheetTrip ? resolveSeatInfo(sheetTrip, sheetLive) : null;
+  const sheetEta      = sheetTrip && ETA_STATUSES.includes(sheetTrip.status) ? liveEtas[sheetTrip.id] ?? null : null;
+  const sheetQueuePos = sheetTrip ? queuePositions.get(sheetTrip.id) : null;
+  const sheetRoute    = sheetTrip && selectedRoute.tripId === sheetTrip.id ? selectedRoute : null;
+  const sheetRouteCoords = sheetRoute?.coords ?? [];
 
-  return (
-    <div className="flex h-screen flex-col bg-slate-50 font-sans text-slate-900 antialiased">
-      {/* Smooth marker glide between GPS updates; leaflet's own zoom animation still wins. */}
-      <style>{`.van-marker{transition:transform 1.2s linear}`}</style>
+  const vansSection = (
+    <div className="space-y-5">
+      <div className="grid grid-cols-3 gap-2">
+        <MetricTile label="Boarding" value={boardingTrips.length} tone="ok" />
+        <MetricTile label="In queue" value={queuedTrips.length} tone="violet" />
+        <MetricTile label="On the road" value={drivingTrips.length} tone="info" />
+      </div>
 
-      <header className="z-20 shrink-0 border-b border-slate-200/80 bg-white/85 backdrop-blur">
-        <div className="mx-auto flex max-w-7xl items-center justify-between gap-3 px-4 py-3">
-          <div className="flex min-w-0 items-center gap-3">
-            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-teal-700 text-white"><Icon name="van" /></span>
-            <div className="min-w-0">
-              <h1 className="text-base font-semibold leading-tight tracking-tight">Terminalink</h1>
-              <p className="truncate text-xs text-slate-500">Live van tracking from the driver's phone</p>
-            </div>
+      {/* Boarding */}
+      <section>
+        <SectionHeader title="Boarding now" count={boardingTrips.length} hint="Vans you can ride right now. The number is how many seats are free." />
+        <Card className="overflow-hidden">
+          {boardingTrips.length === 0 ? (
+            <EmptyState icon="van" title="No vans boarding">When a van opens for passengers it shows up here with its free seats.</EmptyState>
+          ) : (
+            <ul className="ui-divide">
+              {boardingTrips.map((trip) => {
+                const data = liveData[trip.id];
+                const seat = resolveSeatInfo(trip, data);
+                const full = seat.available === 0;
+                return (
+                  <VanRow key={trip.id} trip={trip} onOpen={openTrip}
+                    trailing={
+                      <span className="flex flex-col items-end gap-1.5">
+                        <Seats available={seat.available} total={seat.total} big />
+                        <Chip tone={full ? 'bad' : 'ok'}>{full ? 'Full' : 'seats free'}</Chip>
+                      </span>
+                    } />
+                );
+              })}
+            </ul>
+          )}
+        </Card>
+      </section>
+
+      {/* Queue */}
+      <section>
+        <SectionHeader title="Terminal queue" count={queuedTrips.length}
+          hint="Each cooperative has its own line. Vans board one at a time in the order shown." />
+        {queuedTrips.length === 0 ? (
+          <Card><EmptyState icon="building" title="No vans waiting">Nobody is queued at the terminal right now.</EmptyState></Card>
+        ) : (
+          <div className="space-y-3">
+            {pendingTrips.length > 0 && (
+              <Card className="overflow-hidden">
+                <div className="ui-line flex items-center justify-between gap-2 border-b px-4 py-3">
+                  <span className="flex min-w-0 items-center gap-2 font-extrabold">
+                    <Icon name="building" className="c-muted h-4 w-4 shrink-0" />
+                    <span className="truncate">Just arrived</span>
+                  </span>
+                  <span className="c-muted shrink-0 text-xs font-bold">being placed in a queue</span>
+                </div>
+                <ul className="ui-divide">
+                  {pendingTrips.map((trip) => {
+                    const seat = resolveSeatInfo(trip, liveData[trip.id]);
+                    return (
+                      <VanRow key={trip.id} trip={trip} onOpen={openTrip}
+                        trailing={
+                          <span className="flex flex-col items-end gap-1.5">
+                            <Seats available={seat.available} total={seat.total} />
+                            <Chip tone="warn">At terminal</Chip>
+                          </span>
+                        } />
+                    );
+                  })}
+                </ul>
+              </Card>
+            )}
+
+            {queueLanes.map((lane) => (
+              <Card key={lane.key} className="overflow-hidden">
+                <div className="ui-line border-b px-4 py-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="flex min-w-0 items-center gap-2 font-extrabold">
+                      <Icon name="building" className="c-muted h-4 w-4 shrink-0" />
+                      <span className="truncate">{lane.name}</span>
+                    </span>
+                    <span className="c-muted shrink-0 text-xs font-bold">
+                      <span className="num text-sm" style={{ color: 'var(--text)' }}>{lane.trips.length}</span> waiting
+                    </span>
+                  </div>
+                  {lane.boardingNow.length > 0 && (
+                    <p className="c-ok mt-1 truncate text-xs font-bold">
+                      Boarding now: {lane.boardingNow.map((t) => `${t.van?.plateNumber ?? 'van'} → ${legDestination(t)}`).join(', ')}
+                    </p>
+                  )}
+                </div>
+                <ul className="ui-divide">
+                  {lane.trips.map((trip, index) => (
+                    <VanRow key={trip.id} trip={trip} onOpen={openTrip}
+                      subtitle={index === 0 ? 'Next to board' : `${index} ${index === 1 ? 'van' : 'vans'} ahead`}
+                      trailing={
+                        <span className="chip-violet flex shrink-0 flex-col items-center rounded-xl px-3 py-1.5">
+                          <span className="num text-xl leading-none">#{index + 1}</span>
+                          <span className="mt-0.5 text-[11px] font-bold">in line</span>
+                        </span>
+                      } />
+                  ))}
+                </ul>
+              </Card>
+            ))}
           </div>
-          <div className="flex items-center gap-2">
-            <span className={`hidden items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ring-1 ring-inset sm:inline-flex ${socketChip.cls}`}>
-              <span className="relative flex h-1.5 w-1.5">
-                {socketChip.ping && <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-70" />}
-                <span className={`relative inline-flex h-1.5 w-1.5 rounded-full ${socketChip.dot}`} />
-              </span>
-              {socketChip.text}
+        )}
+      </section>
+
+      {/* On the road */}
+      <section>
+        <SectionHeader title="On the road" count={drivingTrips.length} hint="Vans that have left. Tap one to see where it is and when it arrives." />
+        <Card className="overflow-hidden">
+          {drivingTrips.length === 0 ? (
+            <EmptyState icon="van" title="No vans in transit">Vans on the move will appear here.</EmptyState>
+          ) : (
+            <ul className="ui-divide">
+              {drivingTrips.map((trip) => {
+                const data = liveData[trip.id];
+                const seat = resolveSeatInfo(trip, data);
+                const gps = resolveTripPosition(trip);
+                const eta = liveEtas[trip.id];
+                return (
+                  <VanRow key={trip.id} trip={trip} onOpen={openTrip}
+                    subtitle={`${tripRouteLabel(trip)}${eta ? ` · arrives ${formatTime(eta.eta)}` : ''}`}
+                    trailing={
+                      <span className="flex flex-col items-end gap-1.5">
+                        <Seats available={seat.available} total={seat.total} />
+                        <Chip tone={statusMeta(trip.status).tone}>{gps.isLive ? speedLabel(data?.smoothedSpeed) : statusMeta(trip.status).label}</Chip>
+                      </span>
+                    } />
+                );
+              })}
+            </ul>
+          )}
+        </Card>
+      </section>
+
+      <p className="c-muted px-1 pb-2 text-center text-xs font-medium">
+        Van colour shows the town it is from. Locations come live from each driver's phone.
+      </p>
+    </div>
+  );
+
+  return shell(
+    <div className="flex h-full flex-col overflow-hidden">
+      {/* Header */}
+      <header className="ui-header z-30 shrink-0">
+        <div className="ui-pad flex h-14 items-center gap-3 lg:h-16">
+          <span className="b-primary flex h-9 w-9 shrink-0 items-center justify-center rounded-xl"><Icon name="van" /></span>
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-base font-extrabold leading-tight tracking-tight">Terminalink</p>
+            <p className="c-muted truncate text-xs font-semibold leading-tight">Live van tracking</p>
+          </div>
+          <span className={`chip-${socketChip.tone} inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-bold`}>
+            <span className="relative flex h-2 w-2">
+              {socketChip.ping && <span className="absolute inline-flex h-full w-full animate-ping rounded-full opacity-70" style={{ background: 'currentColor' }} />}
+              <span className="relative inline-flex h-2 w-2 rounded-full" style={{ background: 'currentColor' }} />
             </span>
-            <button className={BTN.secondary} onClick={() => navigate('/login')}>
-              <Icon name="lock" className="h-4 w-4" /> Staff access
-            </button>
-          </div>
+            {socketChip.text}
+          </span>
+          <Btn variant="ghost" size="icon" onClick={toggleTheme} aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}>
+            <Icon name={theme === 'dark' ? 'sun' : 'moon'} />
+          </Btn>
+          <Btn onClick={() => navigate('/login')} aria-label="Staff access">
+            <Icon name="lock" className="h-[18px] w-[18px]" /> <span className="hidden sm:inline">Staff</span>
+          </Btn>
         </div>
+
+        {/* Town filter: pick where the van is from */}
+        {townChips.length > 1 && (
+          <div className="ui-pad no-scrollbar flex gap-2 overflow-x-auto pb-3" role="group" aria-label="Filter vans by town">
+            <button type="button" className="town-pill inline-flex h-9 shrink-0 items-center gap-1.5 rounded-full px-3.5 text-sm font-bold"
+              aria-pressed={effectiveFilter === null} onClick={() => setTownFilter(null)}>
+              All towns <span className="num text-xs opacity-70">{activeTrips.length}</span>
+            </button>
+            {townChips.map((t) => (
+              <button key={t.key} type="button" className="town-pill inline-flex h-9 shrink-0 items-center gap-1.5 rounded-full px-3.5 text-sm font-bold"
+                aria-pressed={effectiveFilter === t.key} onClick={() => setTownFilter(effectiveFilter === t.key ? null : t.key)}>
+                <span className="h-2.5 w-2.5 rounded-full" style={{ background: t.color }} />
+                {t.name} <span className="num text-xs opacity-70">{t.count}</span>
+              </button>
+            ))}
+          </div>
+        )}
       </header>
 
       {socketStatus === 'disconnected' && (
-        <div className="z-10 shrink-0 border-b border-amber-200 bg-amber-50 px-4 py-2 text-center text-sm font-medium text-amber-800">
+        <div className="chip-warn z-10 shrink-0 px-4 py-2 text-center text-sm font-bold">
           Live updates paused. Reconnecting…{' '}
-          <button onClick={() => setReloadToken((n) => n + 1)} className="ml-1 font-semibold underline underline-offset-2">Reload</button>
+          <button onClick={() => setReloadToken((n) => n + 1)} className="ml-1 font-extrabold underline underline-offset-2">Reload</button>
         </div>
       )}
       {error && activeTrips.length > 0 && (
-        <div className="z-10 shrink-0 border-b border-rose-200 bg-rose-50 px-4 py-2 text-center text-sm font-medium text-rose-700">{error}</div>
+        <div className="chip-bad z-10 shrink-0 px-4 py-2 text-center text-sm font-bold">{error}</div>
       )}
 
-      <div className="relative z-0 flex flex-1 flex-col overflow-hidden md:flex-row">
-        {/* ── Map ── */}
-        <div className="relative z-0 h-[42vh] shrink-0 md:h-auto md:flex-1">
-          <MapContainer center={MAP_CENTER} zoom={11} className="h-full w-full">
+      {/* Body */}
+      <div className="relative z-0 flex min-h-0 flex-1 overflow-hidden">
+        {/* Van lists (phones: the "Vans" tab; desktop: always beside the map) */}
+        <aside className={`${activeTab === 'map' ? 'hidden lg:flex' : 'flex'} ui-line min-w-0 flex-1 flex-col overflow-hidden lg:w-[26rem] lg:flex-none lg:border-r xl:w-[28rem]`}>
+          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain pb-28 lg:pb-6">
+            <div className="ui-pad pt-4 lg:pr-4">{vansSection}</div>
+          </div>
+        </aside>
+
+        {/* Map (phones: its own tab) */}
+        <main className={`${activeTab === 'map' ? 'block' : 'hidden'} relative z-0 flex-1 lg:block`} style={{ background: 'var(--surface-2)' }}>
+          <MapContainer center={MAP_CENTER} zoom={11} className="h-full w-full" ref={mapRef} zoomControl={false}>
+            <MapInvalidator active={mapVisible} />
+            <ZoomControl position="topright" />
             <TileLayer attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
               url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
-            <MapBoundsFitter positions={mapFocusPositions} />
-            <SelectionFocus tripId={selectedTripId} position={selectedPosition} routeCoords={routeCoords} />
+            <MapBoundsFitter positions={mapFocusPositions} active={mapVisible} />
+            <SelectionFocus tripId={selectedTripId} position={selectedPosition} routeCoords={routeCoords} active={mapVisible} />
 
-            <Marker position={VIRAC_HUB} icon={hubIcon}>
-              <Popup>
-                <div className="min-w-[180px] space-y-1">
-                  <p className="text-sm font-semibold leading-snug text-slate-900">{HOME_TERMINAL_NAME}</p>
-                  <p className="text-xs text-slate-500">
-                    {boardingTrips.length} boarding · {queuedTrips.length} in queue · {drivingTrips.length} on the road
-                  </p>
-                </div>
-              </Popup>
-            </Marker>
+            <Marker position={VIRAC_HUB} icon={hubIcon} />
 
             {selectedTrip && selectedGps?.isLive && typeof selectedGps.accuracy === 'number' && selectedGps.accuracy > 0 && (
               <Circle center={selectedPosition} radius={selectedGps.accuracy}
@@ -919,7 +1462,7 @@ export default function PublicTracking() {
 
             {routeCoords.length > 1 && (
               <Polyline positions={routeCoords}
-                pathOptions={{ color: '#0f766e', weight: 5, opacity: 0.85, lineCap: 'round', lineJoin: 'round' }} />
+                pathOptions={{ color: selectedTown?.color ?? '#0f766e', weight: 5, opacity: 0.85, lineCap: 'round', lineJoin: 'round' }} />
             )}
 
             {markerGroups.map((group) => {
@@ -928,219 +1471,168 @@ export default function PublicTracking() {
               const moving = (msToKmh(data?.smoothedSpeed) ?? 0) >= MOVING_HEADING_KMH;
               const heading = group.isLive && moving && typeof data?.heading === 'number' ? data.heading : null;
               const isSelected = group.trips.some((t) => t.id === selectedTripId);
+              const town = townOf(trip);
+              const statusHex = (isPendingQueue(trip) ? PENDING_META : statusMeta(trip.status)).hex;
 
               return (
-                <Marker key={group.key} position={group.position} icon={getMarkerIcon(trip.status, heading, isSelected)}
-                  eventHandlers={{ click: () => setSelectedTripId(trip.id) }}>
-                  <Popup minWidth={230}>
-                    <div className="space-y-2 py-0.5">
-                      <div>
-                        <p className="text-sm font-semibold leading-snug text-slate-900">{trip.driver?.name || 'Assigned driver'}</p>
-                        <p className="mt-0.5 text-xs text-slate-500">
-                          <span className="font-semibold text-slate-700">{trip.van?.plateNumber ?? '—'}</span>
-                          {cooperativeName(trip) && <> · {cooperativeName(trip)}</>}
-                        </p>
-                      </div>
-                      <DriverContacts driver={trip.driver} />
-                      {group.isLive && (
-                        <p className="text-xs font-medium text-slate-700">
-                          {speedLabel(data?.smoothedSpeed)}
-                          <span className="font-normal text-slate-400"> · updated {relativeTime(data?.lastSeen) ?? 'just now'}</span>
-                        </p>
-                      )}
-                      <ul className="space-y-1.5 border-t border-slate-100 pt-2">
-                        {group.trips.map((t) => {
-                          const seat = resolveSeatInfo(t, liveData[t.id]);
-                          return (
-                            <li key={t.id} className="flex items-center justify-between gap-2">
-                              <div className="min-w-0">
-                                <p className="truncate text-xs font-semibold text-slate-800">{tripRouteLabel(t)}</p>
-                                <div className="mt-1 flex flex-wrap items-center gap-1">
-                                  <StatusPill status={t.status} />
-                                  <SeatPill available={seat.available} total={seat.total} isLive={seat.isLive} />
-                                </div>
-                              </div>
-                              <button type="button" onClick={() => setSelectedTripId(t.id)}
-                                className={`${BTN.soft} shrink-0 ${t.id === selectedTripId ? 'bg-teal-700 text-white hover:bg-teal-800' : ''}`}>
-                                {t.id === selectedTripId ? 'Selected' : 'Details'}
-                              </button>
-                            </li>
-                          );
-                        })}
-                      </ul>
-                    </div>
-                  </Popup>
-                </Marker>
+                <Marker key={group.key} position={group.position} icon={getVanMarkerIcon(town.color, statusHex, heading, isSelected)}
+                  zIndexOffset={isSelected ? 1000 : 0} eventHandlers={{ click: () => openTrip(trip.id) }} />
               );
             })}
           </MapContainer>
-        </div>
 
-        {/* ── Side panel ── */}
-        <aside className="z-10 flex-1 space-y-5 overflow-y-auto border-t border-slate-200 bg-slate-50 p-4 md:w-[26rem] md:flex-none md:border-l md:border-t-0">
-          <div className="flex gap-2">
-            <CountTile value={boardingTrips.length} label="Boarding" dot="bg-emerald-500" />
-            <CountTile value={queuedTrips.length} label="In queue" dot="bg-violet-500" />
-            <CountTile value={drivingTrips.length} label="On the road" dot="bg-blue-500" />
+          {/* Live count + current selection */}
+          <div className="pointer-events-none absolute left-3 top-3 z-[1000] flex max-w-[calc(100%-5rem)] flex-col items-start gap-2">
+            <span className="ui-map-overlay inline-flex items-center gap-2 rounded-full px-3 py-2 text-xs font-bold">
+              <span className="relative flex h-2 w-2">
+                {liveCount > 0 && <span className="absolute inline-flex h-full w-full animate-ping rounded-full opacity-70" style={{ background: 'var(--primary)' }} />}
+                <span className="relative inline-flex h-2 w-2 rounded-full" style={{ background: liveCount > 0 ? 'var(--primary)' : 'var(--muted)' }} />
+              </span>
+              <span className="num">{liveCount}</span> {liveCount === 1 ? 'van' : 'vans'} live
+            </span>
+
+            {selectedTrip && !sheetTripId && (
+              <span className="ui-map-overlay pointer-events-auto inline-flex max-w-full items-center gap-2 rounded-full py-1.5 pl-3 pr-1.5 text-xs font-bold">
+                <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: selectedTown?.color }} />
+                <span className="min-w-0 truncate">{selectedTrip.van?.plateNumber ?? 'Van'} · {tripRouteLabel(selectedTrip)}</span>
+                <button type="button" onClick={() => setSheetTripId(selectedTrip.id)}
+                  className="b-primary ui-btn h-7 shrink-0 rounded-full px-3 text-xs font-bold">Details</button>
+                <button type="button" onClick={closeSheet} aria-label="Stop following"
+                  className="chip-muted flex h-7 w-7 shrink-0 items-center justify-center rounded-full"><Icon name="x" className="h-3.5 w-3.5" /></button>
+              </span>
+            )}
           </div>
 
-          {/* Selected van */}
-          {selectedTrip && (
-            <Card aria-label="Selected van">
-              <div className="flex items-start justify-between gap-3 px-4 pt-4">
-                <div className="min-w-0">
-                  <h2 className="truncate text-base font-semibold tracking-tight text-slate-900">{selectedTrip.driver?.name || 'Assigned driver'}</h2>
-                  <p className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-slate-500">
-                    <span className="font-semibold text-slate-700">{selectedTrip.van?.plateNumber ?? 'Unknown plate'}</span>
-                    <CooperativeTag trip={selectedTrip} />
-                  </p>
-                </div>
-                <button onClick={() => setSelectedTripId(null)} aria-label="Clear selection"
-                  className="rounded-lg p-1 text-slate-400 hover:bg-slate-100 hover:text-slate-700">
-                  <Icon name="x" className="h-4 w-4" />
-                </button>
-              </div>
-
-              <div className="space-y-3 p-4">
-                <div className="flex flex-wrap items-center gap-2">
-                  <StatusPill status={selectedTrip.status} />
-                  <SeatPill available={selectedSeatInfo.available} total={selectedSeatInfo.total} isLive={selectedSeatInfo.isLive} />
-                </div>
-
-                <div className="grid grid-cols-2 gap-2">
-                  <Stat label="Route">{tripRouteLabel(selectedTrip)}</Stat>
-                  <Stat label="Speed">{selectedGps?.isLive ? speedLabel(selectedLive?.smoothedSpeed) : '—'}</Stat>
-                  {typeof selectedLive?.accuracy === 'number' && (
-                    <Stat label="GPS accuracy">
-                      ±{Math.round(selectedLive.accuracy)} m
-                      {selectedLive.accuracy > LOW_ACCURACY_THRESHOLD_M && <span className="ml-1 text-xs font-medium text-amber-600">weak</span>}
-                    </Stat>
-                  )}
-                  {formatTime(selectedTrip.scheduledTime) && <Stat label="Trip started">{formatTime(selectedTrip.scheduledTime)}</Stat>}
-                </div>
-
-                <p className="text-xs text-slate-500">{tripDirectionText(selectedTrip)}</p>
-
-                <GpsLine gps={selectedGps} data={selectedLive} />
-
-                {selectedEta && (
-                  <div className="flex items-end justify-between rounded-xl bg-teal-50 px-4 py-3">
-                    <div>
-                      <p className="text-xs text-teal-800">Estimated arrival at {etaTarget}</p>
-                      <p className="mt-0.5 text-2xl font-semibold tabular-nums tracking-tight text-teal-900">{formatTime(selectedEta.eta)}</p>
-                    </div>
-                    <div className="text-right text-xs font-medium text-teal-800">
-                      <EtaCountdown etaIso={selectedEta.eta} />
-                      {selectedEta.delayMinutes > 0 && <p className="text-amber-600">+{selectedEta.delayMinutes} min delay</p>}
-                    </div>
-                  </div>
-                )}
-
-                {getDriverContacts(selectedTrip.driver).length > 0 && (
-                  <div>
-                    <p className="mb-1.5 text-xs text-slate-500">Call the driver</p>
-                    <DriverContacts driver={selectedTrip.driver} />
-                  </div>
-                )}
-
-                {selectedRoute.tripId === selectedTripId && selectedRoute.loading && (
-                  <p className="flex items-center gap-2 text-xs text-slate-500"><Spinner className="h-3 w-3" /> Building road route…</p>
-                )}
-                {selectedRoute.tripId === selectedTripId && selectedRoute.error && !selectedRoute.loading && (
-                  <Notice tone="warn">{selectedRoute.error}</Notice>
-                )}
-                {routeCoords.length > 1 && selectedRoute.distanceMeters != null && selectedRoute.durationSeconds != null && (
-                  <p className="text-xs text-slate-500">
-                    Road route: {Math.round(selectedRoute.distanceMeters / 1000)} km, about {formatDuration(selectedRoute.durationSeconds)}
-                  </p>
-                )}
-              </div>
-            </Card>
+          {/* Legend: which colour is which town */}
+          {townChips.length > 0 && (
+            <div className="ui-map-overlay pointer-events-none absolute left-3 z-[1000] max-w-[calc(100%-1.5rem)] rounded-2xl px-3 py-2 lg:bottom-4"
+              style={{ bottom: 'calc(env(safe-area-inset-bottom, 0px) + 4.5rem)' }}>
+              <p className="c-muted mb-1 text-[10px] font-extrabold uppercase tracking-wider">Vans from</p>
+              <ul className="flex flex-wrap gap-x-3 gap-y-1">
+                {townChips.map((t) => (
+                  <li key={t.key} className="flex items-center gap-1.5 text-xs font-bold">
+                    <span className="h-2.5 w-2.5 rounded-full" style={{ background: t.color }} />{t.name}
+                  </li>
+                ))}
+              </ul>
+            </div>
           )}
 
-          {/* Boarding */}
-          <section>
-            <SectionHeader title="Boarding now" count={boardingTrips.length} />
-            {boardingTrips.length === 0 ? (
-              <EmptyState text="No vans are boarding right now." />
-            ) : (
-              <div className="space-y-2">
-                {boardingTrips.map((trip) => {
-                  const data = liveData[trip.id];
-                  const seat = resolveSeatInfo(trip, data);
-                  const full = seat.available === 0;
-                  return (
-                    <TripRow key={trip.id} trip={trip} selected={selectedTripId === trip.id}
-                      onSelect={() => setSelectedTripId(trip.id)}
-                      trailing={
-                        <div className={`shrink-0 rounded-xl px-3 py-1.5 text-center ${full ? 'bg-slate-100 text-slate-500' : 'bg-emerald-50 text-emerald-700'}`}>
-                          <p className="text-xl font-semibold leading-none tabular-nums">{seat.available ?? '—'}</p>
-                          <p className="mt-0.5 text-[11px]">{full ? 'Full' : 'seats free'}</p>
-                        </div>
-                      }
-                      footer={<GpsLine gps={resolveTripPosition(trip)} data={data} />} />
-                  );
-                })}
-              </div>
-            )}
-          </section>
-
-          {/* Queue */}
-          <section>
-            <SectionHeader title="Queued at the terminal" count={queuedTrips.length}
-              hint="Each cooperative has its own boarding line, so a position only counts vans from the same cooperative." />
-            {queuedTrips.length === 0 ? (
-              <EmptyState text="No vans are waiting in the terminal queue." />
-            ) : (
-              <div className="space-y-4">
-                {queueGroups.map((group) => (
-                  <div key={group.name} className="space-y-2">
-                    <p className="flex items-center gap-1.5 text-xs font-medium text-slate-500">
-                      <Icon name="building" className="h-3.5 w-3.5" /> {group.name}
-                    </p>
-                    {group.trips.map((trip, index) => (
-                      <TripRow key={trip.id} trip={trip} selected={selectedTripId === trip.id}
-                        onSelect={() => setSelectedTripId(trip.id)}
-                        trailing={
-                          <div className="shrink-0 rounded-xl bg-violet-50 px-3 py-1.5 text-center text-violet-700">
-                            <p className="text-xl font-semibold leading-none tabular-nums">#{index + 1}</p>
-                            <p className="mt-0.5 text-[11px]">in line</p>
-                          </div>
-                        } />
-                    ))}
-                  </div>
-                ))}
-              </div>
-            )}
-          </section>
-
-          {/* On the road */}
-          <section>
-            <SectionHeader title="On the road" count={drivingTrips.length} />
-            {drivingTrips.length === 0 ? (
-              <EmptyState text="No vans are in transit right now." />
-            ) : (
-              <div className="space-y-2">
-                {drivingTrips.map((trip) => {
-                  const data = liveData[trip.id];
-                  const seat = resolveSeatInfo(trip, data);
-                  return (
-                    <TripRow key={trip.id} trip={trip} selected={selectedTripId === trip.id}
-                      onSelect={() => setSelectedTripId(trip.id)}
-                      trailing={<StatusPill status={trip.status} />}
-                      footer={
-                        <div className="space-y-2">
-                          <SeatPill available={seat.available} total={seat.total} isLive={seat.isLive} />
-                          <GpsLine gps={resolveTripPosition(trip)} data={data} />
-                        </div>
-                      } />
-                  );
-                })}
-              </div>
-            )}
-          </section>
-        </aside>
+          {activeTrips.length > 0 && liveCount === 0 && (
+            <div className="ui-map-overlay pointer-events-none absolute left-1/2 top-16 z-[1000] flex w-[calc(100%-2rem)] max-w-sm -translate-x-1/2 items-center justify-center gap-2 rounded-2xl px-4 py-3 text-center text-xs font-bold">
+              <Spinner className="h-4 w-4" /> Waiting for drivers to share their GPS…
+            </div>
+          )}
+        </main>
       </div>
-    </div>
+
+      <BottomNav tab={activeTab} onChange={setActiveTab} counts={{ vans: visibleTrips.length, map: 0 }} />
+
+      {/* Van details */}
+      <Sheet open={Boolean(sheetTrip)} onClose={closeSheet} dock
+        title={sheetTrip?.van?.plateNumber ?? ''}
+        subtitle={sheetTrip ? (
+          <span className="inline-flex items-center gap-2">
+            <TownTag town={sheetTown} />
+            <span>·</span>
+            <span className="truncate">{sheetTrip.driver?.name ?? 'No driver assigned'}</span>
+          </span>
+        ) : ''}
+        footer={sheetTrip && (
+          <Btn variant="primary" size="lg" className="w-full" onClick={() => focusOnMap(sheetTrip)} disabled={!sheetGps?.position}>
+            <Icon name="locate" /> Show on map
+          </Btn>
+        )}>
+        {sheetTrip && (
+          <div className="space-y-4">
+            <div className="flex flex-wrap items-center gap-2">
+              <StatusChip status={sheetTrip.status} pending={sheetPending} />
+              <Chip tone={getDirection(sheetTrip) === 'RETURN' ? 'violet' : 'info'}>
+                {getDirection(sheetTrip) === 'RETURN' ? 'Leaving the terminal' : 'Coming to the terminal'}
+              </Chip>
+              {queueNameOf(sheetTrip) && getDirection(sheetTrip) === 'RETURN' && !sheetPending && <Chip>{queueNameOf(sheetTrip)}</Chip>}
+            </div>
+
+            <p className="c-muted text-sm font-semibold">{tripDirectionText(sheetTrip)}</p>
+
+            {sheetPending && <Notice tone="warn">A dispatcher will place this van in a queue shortly. Check back for its position in line.</Notice>}
+
+            <div className="grid grid-cols-2 gap-3">
+              <div className="ui-soft rounded-2xl p-4">
+                <Seats available={sheetSeats.available} total={sheetSeats.total} big />
+                <p className="c-muted mt-1 flex items-center gap-1.5 text-sm font-semibold">
+                  <Icon name="users" className="h-3.5 w-3.5" /> seats free
+                </p>
+              </div>
+              {sheetQueuePos ? (
+                <div className="ui-soft rounded-2xl p-4">
+                  <p className="num c-violet text-4xl leading-none">#{sheetQueuePos.position}</p>
+                  <p className="c-muted mt-1 text-sm font-semibold">of {sheetQueuePos.size} in line</p>
+                </div>
+              ) : (
+                <div className="ui-soft rounded-2xl p-4">
+                  <p className="num text-3xl leading-none">{sheetGps?.isLive ? speedLabel(sheetLive?.smoothedSpeed) : '—'}</p>
+                  <p className="c-muted mt-1 text-sm font-semibold">speed</p>
+                </div>
+              )}
+            </div>
+
+            {sheetEta && (
+              <div className="chip-primary flex items-end justify-between rounded-2xl px-4 py-3">
+                <div>
+                  <p className="text-xs font-bold">Estimated arrival at {legDestination(sheetTrip)}</p>
+                  <p className="num mt-0.5 text-3xl leading-none">{formatTime(sheetEta.eta)}</p>
+                </div>
+                <div className="text-right text-xs font-bold">
+                  <EtaCountdown etaIso={sheetEta.eta} />
+                  {sheetEta.delayMinutes > 0 && <p className="mt-1"><Chip tone="warn">+{sheetEta.delayMinutes} min delay</Chip></p>}
+                </div>
+              </div>
+            )}
+
+            <GpsLine gps={sheetGps} data={sheetLive} />
+
+            <dl>
+              <DetailRow label="Route">{tripRouteLabel(sheetTrip)}</DetailRow>
+              <DetailRow label="Heading to">{legDestination(sheetTrip)}</DetailRow>
+              {formatTime(sheetTrip.scheduledTime) && <DetailRow label="Trip started">{formatTime(sheetTrip.scheduledTime)}</DetailRow>}
+              {sheetGps?.isLive && typeof sheetLive?.accuracy === 'number' && (
+                <DetailRow label="GPS accuracy">
+                  <span className="num">±{Math.round(sheetLive.accuracy)} m</span>
+                  {sheetLive.accuracy > LOW_ACCURACY_THRESHOLD_M && <span className="c-warn ml-1 text-xs">weak</span>}
+                </DetailRow>
+              )}
+              <DetailRow label="Call the driver"><DriverContacts driver={sheetTrip.driver} /></DetailRow>
+            </dl>
+
+            {sheetRoute?.loading && (
+              <p className="c-muted flex items-center gap-2 text-xs font-semibold"><Spinner className="h-3 w-3" /> Building road route…</p>
+            )}
+            {sheetRoute?.error && !sheetRoute.loading && <Notice tone="warn">{sheetRoute.error}</Notice>}
+            {sheetRouteCoords.length > 1 && sheetRoute?.distanceMeters != null && sheetRoute?.durationSeconds != null && (
+              <p className="c-muted text-xs font-semibold">
+                Road route: {Math.round(sheetRoute.distanceMeters / 1000)} km, about {formatDuration(sheetRoute.durationSeconds)}
+              </p>
+            )}
+
+            {siblings.length > 0 && (
+              <div>
+                <p className="c-muted mb-2 text-sm font-semibold">Other trips on this van</p>
+                <ul className="ui-soft ui-divide overflow-hidden rounded-2xl">
+                  {siblings.map((s) => (
+                    <li key={s.id}>
+                      <button type="button" onClick={() => openTrip(s.id)} className="ui-row flex min-h-[52px] w-full items-center justify-between gap-3 px-4 py-2 text-left">
+                        <span className="truncate text-sm font-bold">{tripRouteLabel(s)}</span>
+                        <StatusChip status={s.status} pending={isPendingQueue(s)} />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        )}
+      </Sheet>
+    </div>,
   );
 }
